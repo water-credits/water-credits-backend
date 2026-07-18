@@ -13,6 +13,7 @@ import {
   scValToNative,
   Address,
 } from '@stellar/stellar-sdk';
+import { verifyStellarSignature } from '../modules/auth/stellar-auth.utils';
 import { BigNumber } from 'bignumber.js';
 
 @Injectable()
@@ -35,8 +36,7 @@ export class StellarService {
 
   async verifySignature(wallet: string, signature: string, challenge: string): Promise<boolean> {
     try {
-      const keypair = Keypair.fromPublicKey(wallet);
-      return keypair.verify(Buffer.from(challenge), Buffer.from(signature, 'base64'));
+      return verifyStellarSignature(wallet, signature, challenge);
     } catch (error) {
       this.logger.error(`Signature verification failed: ${(error as Error).message}`);
       return false;

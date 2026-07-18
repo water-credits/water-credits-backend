@@ -14,7 +14,8 @@ import { ConfigService } from '@nestjs/config';
 import * as crypto from 'crypto';
 import Redis from 'ioredis';
 import { User, UserRole } from '../users/entities/user.entity';
-import { Keypair } from '@stellar/stellar-sdk';
+import { ServiceUnavailableException } from '@nestjs/common';
+import { createStellarChallenge, verifyStellarSignature } from './stellar-auth.utils';
 
 const CHALLENGE_TTL_SECONDS = 5 * 60; // 5 minutes
 const CHALLENGE_KEY_PREFIX = 'auth:challenge:';
@@ -50,15 +51,17 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
 
   // ── Challenge ─────────────────────────────────────────────────────────────
 
-  generateChallenge(wallet: string): { challenge: string; expiresAt: Date } {
-    const challenge = crypto.randomBytes(32).toString('hex');
+  async generateChallenge(wallet: string): Promise<{ challenge: string; expiresAt: Date }> {
+    const challenge = createStellarChallenge();
     const expiresAt = new Date(Date.now() + CHALLENGE_TTL_SECONDS * 1000);
 
-    // Persist asynchronously — fire and forget (errors logged above)
     const key = `${CHALLENGE_KEY_PREFIX}${wallet.toLowerCase()}`;
-    this.redis
-      .set(key, challenge, 'EX', CHALLENGE_TTL_SECONDS)
-      .catch((err) => this.logger.error(`Failed to store challenge in Redis: ${err.message}`));
+    try {
+      await this.redis.set(key, challenge, 'EX', CHALLENGE_TTL_SECONDS);
+    } catch (err) {
+      this.logger.error(`Failed to store challenge in Redis: ${(err as Error).message}`);
+      throw new ServiceUnavailableException('Challenge storage unavailable');
+    }
 
     return { challenge, expiresAt };
   }
@@ -91,8 +94,7 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
     }
 
     try {
-      const keypair = Keypair.fromPublicKey(wallet);
-      const valid = keypair.verify(Buffer.from(challenge), Buffer.from(signature, 'hex'));
+      const valid = verifyStellarSignature(wallet, signature, challenge);
       if (!valid) {
         return null;
       }
@@ -154,8 +156,7 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
     }
 
     try {
-      const keypair = Keypair.fromPublicKey(wallet);
-      const valid = keypair.verify(Buffer.from(challenge), Buffer.from(signature, 'hex'));
+      const valid = verifyStellarSignature(wallet, signature, challenge);
       if (!valid) {
         throw new UnauthorizedException('Invalid signature');
       }

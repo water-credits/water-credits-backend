@@ -20,7 +20,7 @@ export class AuthController {
   @RateLimit(10, 60_000)
   @Post('challenge')
   @HttpCode(HttpStatus.OK)
-  challenge(@Body() dto: ChallengeRequestDto): ChallengeResponseDto {
+  async challenge(@Body() dto: ChallengeRequestDto): Promise<ChallengeResponseDto> {
     return this.authService.generateChallenge(dto.wallet);
   }
 

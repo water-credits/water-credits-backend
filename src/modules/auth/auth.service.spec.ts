@@ -1,5 +1,10 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { UnauthorizedException, ConflictException, BadRequestException } from '@nestjs/common';
+import {
+  UnauthorizedException,
+  ConflictException,
+  BadRequestException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
@@ -165,59 +170,44 @@ describe('AuthService', () => {
   // ── generateChallenge ────────────────────────────────────────────────────
 
   describe('generateChallenge', () => {
-    it('returns a non-empty challenge string and an expiresAt date in the future', () => {
+    it('returns a non-empty challenge string and an expiresAt date in the future', async () => {
       mockRedis.set.mockResolvedValue('OK');
 
       const before = Date.now();
-      const { challenge, expiresAt } = service.generateChallenge('GTEST123');
+      const { challenge, expiresAt } = await service.generateChallenge('GTEST123');
 
       expect(typeof challenge).toBe('string');
       expect(challenge.length).toBeGreaterThan(0);
       expect(expiresAt.getTime()).toBeGreaterThan(before);
     });
 
-    it('returns a different challenge on each call', () => {
+    it('returns a different challenge on each call', async () => {
       mockRedis.set.mockResolvedValue('OK');
 
-      const { challenge: c1 } = service.generateChallenge('GTEST123');
-      const { challenge: c2 } = service.generateChallenge('GTEST123');
+      const { challenge: c1 } = await service.generateChallenge('GTEST123');
+      const { challenge: c2 } = await service.generateChallenge('GTEST123');
 
       expect(c1).not.toBe(c2);
     });
 
-    it('stores the challenge in Redis with a TTL (fire-and-forget; no await required)', () => {
+    it('stores the challenge in Redis with a TTL', async () => {
       mockRedis.set.mockResolvedValue('OK');
-      service.generateChallenge('GTEST123');
-      // Allow the unhandled promise to settle before asserting.
-      return new Promise<void>((resolve) => {
-        setImmediate(() => {
-          expect(mockRedis.set).toHaveBeenCalledWith(
-            expect.stringContaining('auth:challenge:gtest123'),
-            expect.any(String),
-            'EX',
-            300, // 5 minutes = 300 seconds
-          );
-          resolve();
-        });
-      });
+      await service.generateChallenge('GTEST123');
+
+      expect(mockRedis.set).toHaveBeenCalledWith(
+        expect.stringContaining('auth:challenge:gtest123'),
+        expect.any(String),
+        'EX',
+        300,
+      );
     });
 
-    it('swallows Redis set errors silently (fire-and-forget error path)', () => {
-      // When redis.set rejects, the .catch() handler logs the error and does not
-      // propagate — generateChallenge must still return normally.
+    it('propagates Redis set errors as a 503 ServiceUnavailableException', async () => {
       mockRedis.set.mockRejectedValue(new Error('Redis write failure'));
 
-      let result: ReturnType<typeof service.generateChallenge> | undefined;
-      expect(() => {
-        result = service.generateChallenge('GTEST456');
-      }).not.toThrow();
-
-      expect(result).toBeDefined();
-      expect(typeof result!.challenge).toBe('string');
-
-      // Let the rejected promise settle so the .catch() handler fires and the
-      // unhandled rejection doesn't bleed into later tests.
-      return new Promise<void>((resolve) => setImmediate(resolve));
+      await expect(service.generateChallenge('GTEST456')).rejects.toThrow(
+        ServiceUnavailableException,
+      );
     });
   });
 
@@ -227,9 +217,8 @@ describe('AuthService', () => {
     const CHALLENGE = 'test-challenge-hex-string-32bytes';
 
     function buildSignature(keypair: Keypair, challenge: string): string {
-      // AuthService verifies with: keypair.verify(Buffer.from(challenge), Buffer.from(sig, 'hex'))
       const sigBytes = keypair.sign(Buffer.from(challenge));
-      return Buffer.from(sigBytes).toString('hex');
+      return Buffer.from(sigBytes).toString('base64');
     }
 
     it('returns the matching User when the signature is valid and the challenge matches', async () => {
@@ -280,18 +269,13 @@ describe('AuthService', () => {
       expect(result).toBeNull();
     });
 
-    it('returns null for a malformed signature string', async () => {
+    it('returns null for a hex-encoded signature string', async () => {
       const realWallet = testKeypair.publicKey();
 
       mockRedis.getdel.mockResolvedValue(CHALLENGE);
 
-      // 'not-hex-at-all' is not valid hex and will cause Buffer.from to produce
-      // unexpected bytes, resulting in a failed verification.
-      const result = await service.validateStellarSignature(
-        realWallet,
-        'not-hex-at-all',
-        CHALLENGE,
-      );
+      const hexSignature = Buffer.from(testKeypair.sign(Buffer.from(CHALLENGE))).toString('hex');
+      const result = await service.validateStellarSignature(realWallet, hexSignature, CHALLENGE);
 
       expect(result).toBeNull();
     });
@@ -372,7 +356,7 @@ describe('AuthService', () => {
     const CHALLENGE = 'login-challenge-string-32bytes-xx';
 
     function buildSignature(keypair: Keypair, challenge: string): string {
-      return Buffer.from(keypair.sign(Buffer.from(challenge))).toString('hex');
+      return Buffer.from(keypair.sign(Buffer.from(challenge))).toString('base64');
     }
 
     it('returns tokens and user on successful login', async () => {
@@ -406,7 +390,7 @@ describe('AuthService', () => {
     const CHALLENGE = 'register-challenge-32bytes-xxxxxx';
 
     function buildSignature(keypair: Keypair, challenge: string): string {
-      return Buffer.from(keypair.sign(Buffer.from(challenge))).toString('hex');
+      return Buffer.from(keypair.sign(Buffer.from(challenge))).toString('base64');
     }
 
     it('creates a new user and returns tokens on first registration', async () => {
@@ -453,7 +437,7 @@ describe('AuthService', () => {
     const CHALLENGE = 'deactivated-challenge-32bytes-xx';
 
     function buildSignature(keypair: Keypair, challenge: string): string {
-      return Buffer.from(keypair.sign(Buffer.from(challenge))).toString('hex');
+      return Buffer.from(keypair.sign(Buffer.from(challenge))).toString('base64');
     }
 
     it('throws UnauthorizedException when the matched user has isActive=false', async () => {
@@ -489,7 +473,7 @@ describe('AuthService', () => {
       const realWallet = testKeypair.publicKey();
       // Sign with a different keypair so verify() returns false (not throw).
       const wrongKeypair = Keypair.random();
-      const badSignature = Buffer.from(wrongKeypair.sign(Buffer.from(CHALLENGE))).toString('hex');
+      const badSignature = Buffer.from(wrongKeypair.sign(Buffer.from(CHALLENGE))).toString('base64');
 
       mockRedis.getdel.mockResolvedValue(CHALLENGE);
       userRepo.findOne.mockResolvedValue(null);
@@ -516,7 +500,7 @@ describe('AuthService', () => {
 
     it('falls back to GET+DEL and proceeds with registration when getdel throws', async () => {
       const realWallet = testKeypair.publicKey();
-      const signature = Buffer.from(testKeypair.sign(Buffer.from(CHALLENGE))).toString('hex');
+      const signature = Buffer.from(testKeypair.sign(Buffer.from(CHALLENGE))).toString('base64');
       const newUser = makeUser({ wallet: realWallet });
 
       mockRedis.getdel.mockRejectedValue(new Error('ERR unknown command'));
