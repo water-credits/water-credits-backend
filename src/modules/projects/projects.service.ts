@@ -15,6 +15,11 @@ const VALID_TRANSITIONS: Record<ProjectStatus, ProjectStatus[]> = {
   [ProjectStatus.DRAFT]: [ProjectStatus.REGISTERED],
   [ProjectStatus.REGISTERED]: [ProjectStatus.BASELINE],
   [ProjectStatus.BASELINE]: [ProjectStatus.ACTIVE],
+  // ACTIVE -> CLOSED is intentional: it covers early termination or
+  // cancellation of a project without passing through COMPLETED (e.g. the
+  // developer withdraws, or the site is decommissioned). ACTIVE -> COMPLETED
+  // -> CLOSED remains the normal full-lifecycle path. Resolves the ambiguity
+  // in issue #16.
   [ProjectStatus.ACTIVE]: [ProjectStatus.COMPLETED, ProjectStatus.CLOSED],
   [ProjectStatus.COMPLETED]: [ProjectStatus.CLOSED],
   [ProjectStatus.CLOSED]: [],
@@ -129,19 +134,22 @@ export class ProjectsService {
       );
     }
 
-    if (query.lat !== undefined && query.lng !== undefined && query.radius !== undefined) {
-      const kmPerDegree = 111.32;
-      const latDelta = query.radius / kmPerDegree;
-      const lngDelta = query.radius / (kmPerDegree * Math.cos((query.lat * Math.PI) / 180));
-      qb.andWhere('project.latitude BETWEEN :latMin AND :latMax', {
-        latMin: query.lat - latDelta,
-        latMax: query.lat + latDelta,
-      });
-      qb.andWhere('project.longitude BETWEEN :lngMin AND :lngMax', {
-        lngMin: query.lng - lngDelta,
-        lngMax: query.lng + lngDelta,
-      });
-    }
+   if (filter.lat !== undefined && filter.lon !== undefined && filter.radius !== undefined) {
+  const { lat, lon, radius } = filter; // radius in km
+  const radiusMeters = radius * 1000;
+
+  qb.addSelect(
+    `earth_distance(ll_to_earth(:lat, :lon), ll_to_earth(project.latitude, project.longitude))`,
+    'distance_m',
+  )
+    .andWhere(
+      `earth_box(ll_to_earth(:lat, :lon), :radiusMeters) @> ll_to_earth(project.latitude, project.longitude)`,
+    )
+    .andWhere(
+      `earth_distance(ll_to_earth(:lat, :lon), ll_to_earth(project.latitude, project.longitude)) <= :radiusMeters`,
+    )
+    .setParameters({ lat, lon, radiusMeters });
+}
 
     this.applySorting(qb, query.sortBy, query.sortOrder);
 
@@ -151,24 +159,25 @@ export class ProjectsService {
     return { data, total, page: query.page ?? 1, limit: query.limit ?? 20 };
   }
 
+  private static readonly SORT_FIELD_MAP: Record<string, string> = {
+    name: 'project.name',
+    status: 'project.status',
+    methodology: 'project.methodology',
+    areaHectares: 'project.areaHectares',
+    createdAt: 'project.createdAt',
+    updatedAt: 'project.updatedAt',
+    latitude: 'project.latitude',
+    longitude: 'project.longitude',
+  };
+
   private applySorting(
     qb: SelectQueryBuilder<Project>,
     sortBy?: string,
     sortOrder?: SortOrder,
   ): void {
-    const allowedSortColumns = [
-      'name',
-      'status',
-      'methodology',
-      'area_hectares',
-      'created_at',
-      'updated_at',
-      'latitude',
-      'longitude',
-    ];
-    const column = sortBy && allowedSortColumns.includes(sortBy) ? sortBy : 'created_at';
+    const column = (sortBy && ProjectsService.SORT_FIELD_MAP[sortBy]) || 'project.createdAt';
     const order = sortOrder === SortOrder.ASC ? 'ASC' : 'DESC';
-    qb.orderBy(`project.${column}`, order);
+    qb.orderBy(column, order);
   }
 
   async countByOwner(ownerId: string): Promise<number> {
