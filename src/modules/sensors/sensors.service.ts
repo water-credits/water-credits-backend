@@ -8,6 +8,7 @@ import { ReadingBatch, BatchStatus } from './entities/reading-batch.entity';
 import { CreateReadingDto } from './dto/create-reading.dto';
 import { QueryReadingsDto } from './dto/query-readings.dto';
 import { RegisterDeviceDto } from './dto/register-device.dto';
+import { TimeSeriesQueryDto, SensorParameter } from './dto/time-series-query.dto';
 import { generateDeviceApiKey } from '../../common/utils/api-key.util';
 
 interface ParameterRange {
@@ -24,6 +25,18 @@ const PARAMETER_RANGES: Record<string, ParameterRange> = {
   phosphorus: { min: 0, max: Infinity },
   temperature: { min: -50, max: 100 },
 };
+
+const PARAMETER_COLUMN_MAP: Record<SensorParameter, string> = {
+  [SensorParameter.PH]: 'ph',
+  [SensorParameter.TURBIDITY]: 'turbidity',
+  [SensorParameter.DISSOLVED_OXYGEN]: 'dissolved_oxygen',
+  [SensorParameter.FLOW_RATE]: 'flow_rate',
+  [SensorParameter.NITROGEN]: 'nitrogen',
+  [SensorParameter.PHOSPHORUS]: 'phosphorus',
+  [SensorParameter.TEMPERATURE]: 'temperature',
+};
+
+const MAX_BUCKETS = 1000;
 
 const BATCH_WINDOW_MS = 15 * 60 * 1000;
 
@@ -297,6 +310,55 @@ export class SensorsService {
       avgPhosphorus: result?.avgPhosphorus ? parseFloat(result.avgPhosphorus) : null,
       avgTemperature: result?.avgTemperature ? parseFloat(result.avgTemperature) : null,
       totalReadings: result?.totalReadings ? parseInt(result.totalReadings, 10) : 0,
+    };
+  }
+
+  async getTimeSeriesData(
+    projectId: string,
+    dto: TimeSeriesQueryDto,
+  ): Promise<{
+    data: Array<{ bucket: string; avg: number; min: number; max: number; count: number }>;
+    truncated: boolean;
+    total: number;
+  }> {
+    const column = PARAMETER_COLUMN_MAP[dto.parameter];
+    if (!column) {
+      throw new BadRequestException(`Invalid parameter: ${dto.parameter}`);
+    }
+
+    const qb = this.readingRepo
+      .createQueryBuilder('reading')
+      .select(`DATE_TRUNC(:bucket, reading.timestamp)`, 'bucket')
+      .addSelect(`AVG(reading.${column})`, 'avg')
+      .addSelect(`MIN(reading.${column})`, 'min')
+      .addSelect(`MAX(reading.${column})`, 'max')
+      .addSelect(`COUNT(reading.id)`, 'count')
+      .where('reading.project_id = :projectId', { projectId })
+      .andWhere('reading.timestamp >= :startDate', { startDate: dto.startDate })
+      .andWhere('reading.timestamp <= :endDate', { endDate: dto.endDate })
+      .groupBy(`DATE_TRUNC(:bucket, reading.timestamp)`)
+      .orderBy('bucket', 'ASC')
+      .setParameter('bucket', dto.bucket);
+
+    const results = await qb.getRawMany();
+
+    // Apply row limit for large time ranges
+    const truncated = results.length > MAX_BUCKETS;
+    const data = truncated ? results.slice(0, MAX_BUCKETS) : results;
+
+    // Format the results
+    const formattedData = data.map((row: any) => ({
+      bucket: row.bucket,
+      avg: row.avg ? parseFloat(row.avg) : 0,
+      min: row.min ? parseFloat(row.min) : 0,
+      max: row.max ? parseFloat(row.max) : 0,
+      count: parseInt(row.count, 10),
+    }));
+
+    return {
+      data: formattedData,
+      truncated,
+      total: results.length,
     };
   }
 }

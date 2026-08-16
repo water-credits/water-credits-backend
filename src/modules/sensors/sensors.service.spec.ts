@@ -7,6 +7,7 @@ import { SensorDevice } from './entities/sensor-device.entity';
 import { SensorReading } from './entities/sensor-reading.entity';
 import { ReadingBatch, BatchStatus } from './entities/reading-batch.entity';
 import { CreateReadingDto } from './dto/create-reading.dto';
+import { TimeSeriesQueryDto, SensorParameter } from './dto/time-series-query.dto';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1003,5 +1004,195 @@ describe('SensorsService — validateParameters unknown key', () => {
     } as CreateReadingDto);
 
     expect(result).toBeDefined();
+  });
+});
+
+describe('SensorsService — getTimeSeriesData', () => {
+  let service: SensorsService;
+  let deviceRepo: MockRepo;
+  let readingRepo: MockRepo;
+  let batchRepo: MockRepo;
+
+  beforeEach(async () => {
+    deviceRepo = makeMockRepo();
+    readingRepo = makeMockRepo();
+    batchRepo = makeMockRepo();
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        SensorsService,
+        { provide: getRepositoryToken(SensorDevice), useValue: deviceRepo },
+        { provide: getRepositoryToken(SensorReading), useValue: readingRepo },
+        { provide: getRepositoryToken(ReadingBatch), useValue: batchRepo },
+      ],
+    }).compile();
+
+    service = module.get<SensorsService>(SensorsService);
+  });
+
+  it('should return time-series data with correct structure', async () => {
+    const mockResults = [
+      {
+        bucket: '2026-01-01T00:00:00.000Z',
+        avg: '7.5',
+        min: '7.0',
+        max: '8.0',
+        count: '10',
+      },
+      {
+        bucket: '2026-01-02T00:00:00.000Z',
+        avg: '7.8',
+        min: '7.2',
+        max: '8.5',
+        count: '15',
+      },
+    ];
+
+    const qb = {
+      select: jest.fn().mockReturnThis(),
+      addSelect: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      groupBy: jest.fn().mockReturnThis(),
+      orderBy: jest.fn().mockReturnThis(),
+      setParameter: jest.fn().mockReturnThis(),
+      getRawMany: jest.fn().mockResolvedValue(mockResults),
+    };
+    readingRepo.createQueryBuilder.mockReturnValue(qb);
+
+    const dto: TimeSeriesQueryDto = {
+      parameter: SensorParameter.PH,
+      bucket: 'day' as any,
+      startDate: '2026-01-01',
+      endDate: '2026-01-31',
+    };
+
+    const result = await service.getTimeSeriesData('proj-1', dto);
+
+    expect(result.data).toHaveLength(2);
+    expect(result.data[0]).toEqual({
+      bucket: '2026-01-01T00:00:00.000Z',
+      avg: 7.5,
+      min: 7.0,
+      max: 8.0,
+      count: 10,
+    });
+    expect(result.truncated).toBe(false);
+    expect(result.total).toBe(2);
+  });
+
+  it('should use parameterised bucket in DATE_TRUNC', async () => {
+    const qb = {
+      select: jest.fn().mockReturnThis(),
+      addSelect: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      groupBy: jest.fn().mockReturnThis(),
+      orderBy: jest.fn().mockReturnThis(),
+      setParameter: jest.fn().mockReturnThis(),
+      getRawMany: jest.fn().mockResolvedValue([]),
+    };
+    readingRepo.createQueryBuilder.mockReturnValue(qb);
+
+    const dto: TimeSeriesQueryDto = {
+      parameter: SensorParameter.PH,
+      bucket: 'day' as any,
+      startDate: '2026-01-01',
+      endDate: '2026-01-31',
+    };
+
+    await service.getTimeSeriesData('proj-1', dto);
+
+    expect(qb.setParameter).toHaveBeenCalledWith('bucket', 'day');
+    expect(qb.groupBy).toHaveBeenCalledWith(expect.stringContaining('DATE_TRUNC(:bucket'));
+  });
+
+  it('should map parameter enum to correct database column', async () => {
+    const qb = {
+      select: jest.fn().mockReturnThis(),
+      addSelect: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      groupBy: jest.fn().mockReturnThis(),
+      orderBy: jest.fn().mockReturnThis(),
+      setParameter: jest.fn().mockReturnThis(),
+      getRawMany: jest.fn().mockResolvedValue([]),
+    };
+    readingRepo.createQueryBuilder.mockReturnValue(qb);
+
+    const dto: TimeSeriesQueryDto = {
+      parameter: SensorParameter.DISSOLVED_OXYGEN,
+      bucket: 'day' as any,
+      startDate: '2026-01-01',
+      endDate: '2026-01-31',
+    };
+
+    await service.getTimeSeriesData('proj-1', dto);
+
+    expect(qb.addSelect).toHaveBeenCalledWith(expect.stringContaining('dissolved_oxygen'), 'avg');
+    expect(qb.addSelect).toHaveBeenCalledWith(expect.stringContaining('dissolved_oxygen'), 'min');
+    expect(qb.addSelect).toHaveBeenCalledWith(expect.stringContaining('dissolved_oxygen'), 'max');
+  });
+
+  it('should truncate results when exceeding MAX_BUCKETS', async () => {
+    const largeResults = Array.from({ length: 1500 }, (_, i) => ({
+      bucket: `2026-01-${String(i + 1).padStart(2, '0')}T00:00:00.000Z`,
+      avg: '7.0',
+      min: '6.5',
+      max: '7.5',
+      count: '10',
+    }));
+
+    const qb = {
+      select: jest.fn().mockReturnThis(),
+      addSelect: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      groupBy: jest.fn().mockReturnThis(),
+      orderBy: jest.fn().mockReturnThis(),
+      setParameter: jest.fn().mockReturnThis(),
+      getRawMany: jest.fn().mockResolvedValue(largeResults),
+    };
+    readingRepo.createQueryBuilder.mockReturnValue(qb);
+
+    const dto: TimeSeriesQueryDto = {
+      parameter: SensorParameter.PH,
+      bucket: 'hour' as any,
+      startDate: '2026-01-01',
+      endDate: '2026-12-31',
+    };
+
+    const result = await service.getTimeSeriesData('proj-1', dto);
+
+    expect(result.data).toHaveLength(1000);
+    expect(result.truncated).toBe(true);
+    expect(result.total).toBe(1500);
+  });
+
+  it('should filter by projectId and date range', async () => {
+    const qb = {
+      select: jest.fn().mockReturnThis(),
+      addSelect: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      groupBy: jest.fn().mockReturnThis(),
+      orderBy: jest.fn().mockReturnThis(),
+      setParameter: jest.fn().mockReturnThis(),
+      getRawMany: jest.fn().mockResolvedValue([]),
+    };
+    readingRepo.createQueryBuilder.mockReturnValue(qb);
+
+    const dto: TimeSeriesQueryDto = {
+      parameter: SensorParameter.PH,
+      bucket: 'day' as any,
+      startDate: '2026-01-01',
+      endDate: '2026-01-31',
+    };
+
+    await service.getTimeSeriesData('proj-123', dto);
+
+    expect(qb.where).toHaveBeenCalledWith('reading.project_id = :projectId', { projectId: 'proj-123' });
+    expect(qb.andWhere).toHaveBeenCalledWith('reading.timestamp >= :startDate', { startDate: '2026-01-01' });
+    expect(qb.andWhere).toHaveBeenCalledWith('reading.timestamp <= :endDate', { endDate: '2026-01-31' });
   });
 });
