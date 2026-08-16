@@ -25,7 +25,9 @@ describe('NotificationsGateway', () => {
   describe('handleConnection', () => {
     it('accepts a client with a valid token and derives userId from the sub claim', async () => {
       jwtService.verifyAsync.mockResolvedValue({ sub: 'user-42', wallet: 'G...', role: 'farmer' });
-      const client = mockSocket({ handshake: { auth: { token: 'valid.jwt' }, headers: {}, query: {} } as never });
+      const client = mockSocket({
+        handshake: { auth: { token: 'valid.jwt' }, headers: {}, query: {} } as never,
+      });
 
       await gateway.handleConnection(client);
 
@@ -35,7 +37,11 @@ describe('NotificationsGateway', () => {
     });
 
     it('ignores a client-supplied userId query param and trusts only the verified JWT', async () => {
-      jwtService.verifyAsync.mockResolvedValue({ sub: 'real-user', wallet: 'G...', role: 'farmer' });
+      jwtService.verifyAsync.mockResolvedValue({
+        sub: 'real-user',
+        wallet: 'G...',
+        role: 'farmer',
+      });
       const client = mockSocket({
         handshake: {
           auth: { token: 'valid.jwt' },
@@ -62,7 +68,9 @@ describe('NotificationsGateway', () => {
 
     it('disconnects a client whose token fails verification', async () => {
       jwtService.verifyAsync.mockRejectedValue(new Error('jwt expired'));
-      const client = mockSocket({ handshake: { auth: { token: 'bad.jwt' }, headers: {}, query: {} } as never });
+      const client = mockSocket({
+        handshake: { auth: { token: 'bad.jwt' }, headers: {}, query: {} } as never,
+      });
 
       await gateway.handleConnection(client);
 
@@ -74,7 +82,9 @@ describe('NotificationsGateway', () => {
   describe('handleDisconnect', () => {
     it('removes the socket mapping for the authenticated user', async () => {
       jwtService.verifyAsync.mockResolvedValue({ sub: 'user-7', wallet: 'G...', role: 'farmer' });
-      const client = mockSocket({ handshake: { auth: { token: 'valid.jwt' }, headers: {}, query: {} } as never });
+      const client = mockSocket({
+        handshake: { auth: { token: 'valid.jwt' }, headers: {}, query: {} } as never,
+      });
       await gateway.handleConnection(client);
 
       expect(() => gateway.handleDisconnect(client)).not.toThrow();

@@ -7,6 +7,11 @@ import { ConfigService } from '@nestjs/config';
 import { SorobanRpc } from '@stellar/stellar-sdk';
 import { OracleSubmission, SubmissionStatus } from './entities/oracle-submission.entity';
 import { StellarService } from '../stellar/stellar.service';
+import { In } from 'typeorm';
+import { CreditScoringService } from './credit-scoring.service';
+import { GovernanceConfig } from '../governance/entities/governance-config.entity';
+import { Project } from '../projects/entities/project.entity';
+import { ReadingBatch, BatchStatus } from '../sensors/entities/reading-batch.entity';
 
 export interface OracleSubmitJobData {
   submissionId: string;
@@ -43,8 +48,15 @@ export class OracleProcessor {
   constructor(
     @InjectRepository(OracleSubmission)
     private readonly submissionRepo: Repository<OracleSubmission>,
+    @InjectRepository(GovernanceConfig)
+    private readonly configRepo: Repository<GovernanceConfig>,
+    @InjectRepository(Project)
+    private readonly projectRepo: Repository<Project>,
+    @InjectRepository(ReadingBatch)
+    private readonly batchRepo: Repository<ReadingBatch>,
     private readonly stellarService: StellarService,
     private readonly configService: ConfigService,
+    private readonly creditScoringService: CreditScoringService,
   ) {}
 
   @Process({
@@ -126,6 +138,43 @@ export class OracleProcessor {
       await this.submissionRepo.save(submission);
 
       this.logger.log(`Oracle submission ${submissionId} confirmed on-chain (txHash: ${txHash})`);
+
+      // Calculate credits and update ReadingBatch
+      try {
+        const project = await this.projectRepo.findOne({ where: { id: projectId } });
+        const config = await this.configRepo.findOne({ order: { id: 'DESC' } });
+
+        if (project && config) {
+          const credits = this.creditScoringService.calculate(
+            submission.readingsSnapshot,
+            config,
+            Number(project.areaHectares),
+          );
+
+          // Find a pending/submitted batch to assign the credits to
+          const batch = await this.batchRepo.findOne({
+            where: {
+              projectId,
+              status: In([BatchStatus.PENDING, BatchStatus.SUBMITTED]),
+            },
+            order: { createdAt: 'DESC' },
+          });
+
+          if (batch) {
+            batch.status = BatchStatus.CONFIRMED;
+            batch.confirmedAt = new Date();
+            batch.creditsGenerated = credits.toNumber();
+            await this.batchRepo.save(batch);
+            this.logger.log(`Calculated ${batch.creditsGenerated} credits for batch ${batch.id}`);
+          } else {
+            this.logger.warn(`No pending batch found for project ${projectId} to assign credits`);
+          }
+        } else {
+          this.logger.warn(`Could not calculate credits: Project or Config missing`);
+        }
+      } catch (err) {
+        this.logger.error(`Error calculating credits for submission ${submissionId}`, err);
+      }
     } else {
       const message = `Unexpected terminal status from submitReading: ${txResponse.status}`;
       this.logger.error(message);

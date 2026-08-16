@@ -34,8 +34,14 @@ describe('SensorsGateway', () => {
 
   describe('handleConnection', () => {
     it('accepts a client with a valid token', async () => {
-      jwtService.verifyAsync.mockResolvedValue({ sub: 'user-1', wallet: 'G...', role: UserRole.FARMER });
-      const client = mockSocket({ handshake: { auth: { token: 'valid.jwt' }, headers: {}, query: {} } as never });
+      jwtService.verifyAsync.mockResolvedValue({
+        sub: 'user-1',
+        wallet: 'G...',
+        role: UserRole.FARMER,
+      });
+      const client = mockSocket({
+        handshake: { auth: { token: 'valid.jwt' }, headers: {}, query: {} } as never,
+      });
 
       await gateway.handleConnection(client);
 
@@ -53,7 +59,9 @@ describe('SensorsGateway', () => {
 
     it('disconnects a client with an invalid token', async () => {
       jwtService.verifyAsync.mockRejectedValue(new Error('invalid signature'));
-      const client = mockSocket({ handshake: { auth: { token: 'bad.jwt' }, headers: {}, query: {} } as never });
+      const client = mockSocket({
+        handshake: { auth: { token: 'bad.jwt' }, headers: {}, query: {} } as never,
+      });
 
       await gateway.handleConnection(client);
 
@@ -64,7 +72,9 @@ describe('SensorsGateway', () => {
   describe('handleSubscribeProject', () => {
     async function connectedClient(userId: string, role: string): Promise<Socket> {
       jwtService.verifyAsync.mockResolvedValue({ sub: userId, wallet: 'G...', role });
-      const client = mockSocket({ handshake: { auth: { token: 't' }, headers: {}, query: {} } as never });
+      const client = mockSocket({
+        handshake: { auth: { token: 't' }, headers: {}, query: {} } as never,
+      });
       await gateway.handleConnection(client);
       return client;
     }
@@ -86,7 +96,10 @@ describe('SensorsGateway', () => {
       await gateway.handleSubscribeProject(client, 'p1');
 
       expect(client.join).not.toHaveBeenCalled();
-      expect(client.emit).toHaveBeenCalledWith('error', expect.objectContaining({ message: expect.any(String) }));
+      expect(client.emit).toHaveBeenCalledWith(
+        'error',
+        expect.objectContaining({ message: expect.any(String) }),
+      );
     });
 
     it('allows privileged roles (admin/verifier/oracle) regardless of ownership', async () => {
