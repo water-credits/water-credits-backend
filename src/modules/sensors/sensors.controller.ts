@@ -13,6 +13,7 @@ import { SensorsService } from './sensors.service';
 import { CreateReadingDto } from './dto/create-reading.dto';
 import { QueryReadingsDto } from './dto/query-readings.dto';
 import { RegisterDeviceDto } from './dto/register-device.dto';
+import { TimeSeriesQueryDto } from './dto/time-series-query.dto';
 import { Public } from '../../common/decorators/public.decorator';
 import { ApiKeyAuth } from '../../common/decorators/api-key-auth.decorator';
 import { ApiKeyGuard } from '../../common/guards/api-key.guard';
@@ -82,5 +83,27 @@ export class SensorsController {
   @Get('devices/:id')
   async getDeviceById(@Param('id') id: string): Promise<SensorDevice> {
     return this.sensorsService.getDeviceById(id);
+  }
+
+  /**
+   * Get time-series aggregated sensor data for a project.
+   * 
+   * Returns bucketed aggregations (avg, min, max, count) for a specific parameter
+   * over a time range. Uses PostgreSQL DATE_TRUNC for efficient time-bucketing.
+   * 
+   * @param projectId - The project ID to filter readings
+   * @param query - Time series query parameters (parameter, bucket, startDate, endDate)
+   * @returns Object containing data array, truncated flag, and total count
+   */
+  @Get('projects/:projectId/time-series')
+  async getTimeSeries(
+    @Param('projectId') projectId: string,
+    @Query() query: TimeSeriesQueryDto,
+  ): Promise<{
+    data: Array<{ bucket: string; avg: number; min: number; max: number; count: number }>;
+    truncated: boolean;
+    total: number;
+  }> {
+    return this.sensorsService.getTimeSeriesData(projectId, query);
   }
 }
