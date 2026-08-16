@@ -7,6 +7,7 @@ import { DataSource } from 'typeorm';
 import { OracleService, AggregatedReading } from './oracle.service';
 import { OracleSubmission, SubmissionStatus } from './entities/oracle-submission.entity';
 import { StellarService } from '../stellar/stellar.service';
+import { SensorReading } from '../sensors/entities/sensor-reading.entity';
 
 // ── Typed mock factory ────────────────────────────────────────────────────────
 
@@ -75,6 +76,49 @@ function makeSubmissionRepo(): SubmissionRepoMock {
   };
 }
 
+type ReadingQbMock = {
+  select: jest.Mock;
+  addSelect: jest.Mock;
+  where: jest.Mock;
+  andWhere: jest.Mock;
+  getRawOne: jest.Mock;
+};
+
+type ReadingRepoMock = {
+  createQueryBuilder: jest.Mock;
+};
+
+function zeroAggregationRow() {
+  return {
+    medianPh: null,
+    medianTurbidity: null,
+    medianDissolvedOxygen: null,
+    medianFlowRate: null,
+    medianNitrogen: null,
+    medianPhosphorus: null,
+    medianTemperature: null,
+    oracleCount: '0',
+    startTime: null,
+    endTime: null,
+  };
+}
+
+function makeReadingQb(): ReadingQbMock {
+  return {
+    select: jest.fn().mockReturnThis(),
+    addSelect: jest.fn().mockReturnThis(),
+    where: jest.fn().mockReturnThis(),
+    andWhere: jest.fn().mockReturnThis(),
+    getRawOne: jest.fn().mockResolvedValue(zeroAggregationRow()),
+  };
+}
+
+function makeReadingRepo(): ReadingRepoMock {
+  return {
+    createQueryBuilder: jest.fn(),
+  };
+}
+
 function makeSubmission(overrides: Partial<OracleSubmission> = {}): OracleSubmission {
   return {
     id: 'sub-1',
@@ -101,6 +145,8 @@ describe('OracleService', () => {
   let oracleQueue: { add: jest.Mock };
   let dataSource: { createQueryRunner: jest.Mock };
   let stellarService: { getOracleNonce: jest.Mock; submitReading: jest.Mock };
+  let readingRepo: ReadingRepoMock;
+  let readingQb: ReadingQbMock;
 
   beforeEach(async () => {
     queryRunner = makeQueryRunner();
@@ -108,11 +154,15 @@ describe('OracleService', () => {
     oracleQueue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
     dataSource = { createQueryRunner: jest.fn().mockReturnValue(queryRunner) };
     stellarService = { getOracleNonce: jest.fn(), submitReading: jest.fn() };
+    readingQb = makeReadingQb();
+    readingRepo = makeReadingRepo();
+    readingRepo.createQueryBuilder.mockReturnValue(readingQb);
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         OracleService,
         { provide: getRepositoryToken(OracleSubmission), useValue: submissionRepo },
+        { provide: getRepositoryToken(SensorReading), useValue: readingRepo },
         { provide: getQueueToken('oracle-submit'), useValue: oracleQueue },
         { provide: ConfigService, useValue: { get: jest.fn() } },
         { provide: DataSource, useValue: dataSource },
@@ -418,35 +468,222 @@ describe('OracleService', () => {
     });
   });
 
-  describe('aggregateReadings — median calculation', () => {
-    function makeSubmission(snap: Record<string, number | undefined>): OracleSubmission {
+  describe('aggregateReadings — median aggregation over sensor_readings', () => {
+    function makeReading(overrides: Partial<SensorReading> = {}): SensorReading {
       return {
-        id: Math.random().toString(),
+        id: 'reading-1',
+        deviceId: 'dev-1',
         projectId: 'proj-1',
-        oracleAddress: 'GORACLE',
-        nonce: 1,
-        txHash: '',
-        status: SubmissionStatus.CONFIRMED,
-        readingsSnapshot: snap as Record<string, unknown>,
-        result: null,
+        timestamp: new Date('2026-01-01T00:00:00Z'),
+        ph: 7.0,
+        turbidity: 10,
+        dissolvedOxygen: 8.0,
+        flowRate: 1.5,
+        nitrogen: 2.0,
+        phosphorus: 0.1,
+        temperature: 18.0,
+        signature: 'sig',
+        isVerified: true,
+        batchId: null,
         createdAt: new Date('2026-01-01T00:00:00Z'),
-        updatedAt: new Date('2026-01-01T00:00:00Z'),
-      } as OracleSubmission;
+        ...overrides,
+      } as SensorReading;
     }
 
-    it('throws NotFoundException when no confirmed submissions exist', async () => {
-      submissionRepo.find.mockResolvedValue([]);
+    it('returns the correct median for every parameter from 5 verified sensor readings', async () => {
+      const readings = [
+        makeReading({
+          ph: 6.0,
+          turbidity: 10,
+          dissolvedOxygen: 6.0,
+          flowRate: 1.0,
+          nitrogen: 1.0,
+          phosphorus: 0.1,
+          temperature: 15.0,
+        }),
+        makeReading({
+          ph: 7.0,
+          turbidity: 20,
+          dissolvedOxygen: 7.0,
+          flowRate: 2.0,
+          nitrogen: 1.5,
+          phosphorus: 0.2,
+          temperature: 16.0,
+        }),
+        makeReading({
+          ph: 8.0,
+          turbidity: 30,
+          dissolvedOxygen: 8.0,
+          flowRate: 3.0,
+          nitrogen: 2.0,
+          phosphorus: 0.3,
+          temperature: 17.0,
+        }),
+        makeReading({
+          ph: 7.5,
+          turbidity: 40,
+          dissolvedOxygen: 9.0,
+          flowRate: 4.0,
+          nitrogen: 2.5,
+          phosphorus: 0.4,
+          temperature: 18.0,
+        }),
+        makeReading({
+          ph: 8.5,
+          turbidity: 50,
+          dissolvedOxygen: 10.0,
+          flowRate: 5.0,
+          nitrogen: 3.0,
+          phosphorus: 0.5,
+          temperature: 19.0,
+        }),
+      ];
+
+      // Medians of the 5 readings above:
+      // ph: [6.0, 7.0, 7.5, 8.0, 8.5] → 7.5
+      // turbidity: [10, 20, 30, 40, 50] → 30
+      // dissolvedOxygen: [6, 7, 8, 9, 10] → 8
+      // flowRate: [1, 2, 3, 4, 5] → 3
+      // nitrogen: [1.0, 1.5, 2.0, 2.5, 3.0] → 2
+      // phosphorus: [0.1, 0.2, 0.3, 0.4, 0.5] → 0.3
+      // temperature: [15, 16, 17, 18, 19] → 17
+      readingQb.getRawOne.mockResolvedValue({
+        medianPh: '7.5',
+        medianTurbidity: '30',
+        medianDissolvedOxygen: '8',
+        medianFlowRate: '3',
+        medianNitrogen: '2',
+        medianPhosphorus: '0.3',
+        medianTemperature: '17',
+        oracleCount: '5',
+        startTime: readings[0].timestamp,
+        endTime: readings[4].timestamp,
+      });
+
+      const result: AggregatedReading = await service.aggregateReadings('proj-1');
+
+      expect(result.medianPh).toBe(7.5);
+      expect(result.medianTurbidity).toBe(30);
+      expect(result.medianDissolvedOxygen).toBe(8);
+      expect(result.medianFlowRate).toBe(3);
+      expect(result.medianNitrogen).toBe(2);
+      expect(result.medianPhosphorus).toBe(0.3);
+      expect(result.medianTemperature).toBe(17);
+      expect(result.oracleCount).toBe(5);
+    });
+
+    it('aggregates verified sensor readings directly, not oracle submission snapshots', async () => {
+      readingQb.getRawOne.mockResolvedValue({
+        ...zeroAggregationRow(),
+        medianPh: '7.2',
+        oracleCount: '1',
+        startTime: new Date('2026-01-01T00:00:00Z'),
+        endTime: new Date('2026-01-01T00:00:00Z'),
+      });
+
+      await service.aggregateReadings('proj-1');
+
+      expect(readingRepo.createQueryBuilder).toHaveBeenCalledWith('reading');
+      expect(submissionRepo.find).not.toHaveBeenCalled();
+    });
+
+    it('computes medians with percentile_cont(0.5) for all 7 sensor parameters and counts readings', async () => {
+      readingQb.getRawOne.mockResolvedValue({
+        ...zeroAggregationRow(),
+        oracleCount: '3',
+        startTime: new Date('2026-01-01T00:00:00Z'),
+        endTime: new Date('2026-01-03T00:00:00Z'),
+      });
+
+      await service.aggregateReadings('proj-1');
+
+      const selectCalls = [...readingQb.select.mock.calls, ...readingQb.addSelect.mock.calls];
+      const medianSelects = selectCalls.filter(([sql]) =>
+        String(sql).includes('percentile_cont(0.5)'),
+      );
+
+      expect(medianSelects).toHaveLength(7);
+      for (const column of [
+        'reading.ph',
+        'reading.turbidity',
+        'reading.dissolved_oxygen',
+        'reading.flow_rate',
+        'reading.nitrogen',
+        'reading.phosphorus',
+        'reading.temperature',
+      ]) {
+        expect(medianSelects.some(([sql]) => String(sql).includes(column))).toBe(true);
+      }
+      expect(readingQb.addSelect).toHaveBeenCalledWith('COUNT(*)', 'oracleCount');
+    });
+
+    it('filters by project_id, is_verified = true, and the requested time range', async () => {
+      const startTime = new Date('2026-01-01T00:00:00Z');
+      const endTime = new Date('2026-01-31T23:59:59Z');
+      readingQb.getRawOne.mockResolvedValue({
+        ...zeroAggregationRow(),
+        medianPh: '7.2',
+        oracleCount: '3',
+        startTime,
+        endTime,
+      });
+
+      const result = await service.aggregateReadings('proj-1', startTime, endTime);
+
+      expect(result.oracleCount).toBe(3);
+      expect(readingQb.where).toHaveBeenCalledWith('reading.project_id = :projectId', {
+        projectId: 'proj-1',
+      });
+      expect(readingQb.andWhere).toHaveBeenCalledWith('reading.is_verified = true');
+      expect(readingQb.andWhere).toHaveBeenCalledWith(
+        'reading.timestamp BETWEEN :startTime AND :endTime',
+        { startTime, endTime },
+      );
+    });
+
+    it('skips the time-range filter when startTime or endTime is omitted', async () => {
+      readingQb.getRawOne.mockResolvedValue({
+        ...zeroAggregationRow(),
+        medianPh: '7.2',
+        oracleCount: '2',
+        startTime: new Date('2026-01-01T00:00:00Z'),
+        endTime: new Date('2026-01-02T00:00:00Z'),
+      });
+
+      await service.aggregateReadings('proj-1', new Date('2026-01-01T00:00:00Z'));
+
+      expect(readingQb.andWhere).toHaveBeenCalledWith('reading.is_verified = true');
+      expect(readingQb.andWhere).not.toHaveBeenCalledWith(
+        expect.stringContaining('timestamp BETWEEN'),
+        expect.anything(),
+      );
+    });
+
+    it('throws NotFoundException when no verified readings match the project and time range', async () => {
+      readingQb.getRawOne.mockResolvedValue(zeroAggregationRow());
 
       await expect(service.aggregateReadings('proj-empty')).rejects.toThrow(NotFoundException);
     });
 
-    it('returns null for all medians when submissions contain no readings (empty snapshots)', async () => {
-      submissionRepo.find.mockResolvedValue([makeSubmission({}), makeSubmission({})]);
+    it('maps NULL medians (readings without a value for a parameter) to null', async () => {
+      readingQb.getRawOne.mockResolvedValue({
+        ...zeroAggregationRow(),
+        medianPh: null,
+        medianTurbidity: '11',
+        medianDissolvedOxygen: null,
+        medianFlowRate: null,
+        medianNitrogen: null,
+        medianPhosphorus: null,
+        medianTemperature: null,
+        oracleCount: '3',
+        startTime: new Date('2026-01-01T00:00:00Z'),
+        endTime: new Date('2026-01-03T00:00:00Z'),
+      });
 
-      const result: AggregatedReading = await service.aggregateReadings('proj-1');
+      const result = await service.aggregateReadings('proj-1');
 
       expect(result.medianPh).toBeNull();
-      expect(result.medianTurbidity).toBeNull();
+      expect(result.medianTurbidity).toBe(11);
       expect(result.medianDissolvedOxygen).toBeNull();
       expect(result.medianFlowRate).toBeNull();
       expect(result.medianNitrogen).toBeNull();
@@ -454,130 +691,32 @@ describe('OracleService', () => {
       expect(result.medianTemperature).toBeNull();
     });
 
-    it('calculates the correct median for an odd number of values', async () => {
-      // Three ph values: 6, 7, 8 → median = 7
-      submissionRepo.find.mockResolvedValue([
-        makeSubmission({ ph: 6 }),
-        makeSubmission({ ph: 7 }),
-        makeSubmission({ ph: 8 }),
-      ]);
-
-      const result = await service.aggregateReadings('proj-1');
-
-      expect(result.medianPh).toBe(7);
-    });
-
-    it('calculates the correct median for an even number of values (average of two middle elements)', async () => {
-      // Four ph values: 6, 7, 8, 9 → sorted [6,7,8,9] → median = (7+8)/2 = 7.5
-      submissionRepo.find.mockResolvedValue([
-        makeSubmission({ ph: 9 }),
-        makeSubmission({ ph: 6 }),
-        makeSubmission({ ph: 7 }),
-        makeSubmission({ ph: 8 }),
-      ]);
+    it('maps decimal medians returned by PostgreSQL (numeric strings) to numbers', async () => {
+      readingQb.getRawOne.mockResolvedValue({
+        ...zeroAggregationRow(),
+        medianPh: '7.5',
+        medianPhosphorus: '0.125',
+        oracleCount: '4',
+        startTime: new Date('2026-01-01T00:00:00Z'),
+        endTime: new Date('2026-01-04T00:00:00Z'),
+      });
 
       const result = await service.aggregateReadings('proj-1');
 
       expect(result.medianPh).toBe(7.5);
+      expect(result.medianPhosphorus).toBe(0.125);
     });
 
-    it('handles a single submission (single-value median equals that value)', async () => {
-      submissionRepo.find.mockResolvedValue([makeSubmission({ ph: 7.2 })]);
-
-      const result = await service.aggregateReadings('proj-1');
-
-      expect(result.medianPh).toBe(7.2);
-    });
-
-    it('handles sparse readings: parameters missing from some snapshots are excluded from the median', async () => {
-      // Only two of three submissions have a turbidity reading.
-      // Median of [10, 20] = 15.
-      submissionRepo.find.mockResolvedValue([
-        makeSubmission({ turbidity: 10 }),
-        makeSubmission({ turbidity: 20 }),
-        makeSubmission({ ph: 7.0 }), // no turbidity
-      ]);
-
-      const result = await service.aggregateReadings('proj-1');
-
-      expect(result.medianTurbidity).toBe(15);
-      // ph only present in one submission
-      expect(result.medianPh).toBe(7.0);
-    });
-
-    it('calculates correct medians for all parameters when all are fully populated', async () => {
-      // Exercise every parameter push branch (dissolvedOxygen, flowRate, nitrogen,
-      // phosphorus, temperature) so each conditional in aggregateReadings is hit.
-      submissionRepo.find.mockResolvedValue([
-        makeSubmission({
-          ph: 7.0,
-          turbidity: 10,
-          dissolvedOxygen: 8.0,
-          flowRate: 1.5,
-          nitrogen: 2.0,
-          phosphorus: 0.1,
-          temperature: 18.0,
-        }),
-        makeSubmission({
-          ph: 7.4,
-          turbidity: 12,
-          dissolvedOxygen: 9.0,
-          flowRate: 2.0,
-          nitrogen: 3.0,
-          phosphorus: 0.2,
-          temperature: 20.0,
-        }),
-        makeSubmission({
-          ph: 7.2,
-          turbidity: 11,
-          dissolvedOxygen: 8.5,
-          flowRate: 1.8,
-          nitrogen: 2.5,
-          phosphorus: 0.15,
-          temperature: 19.0,
-        }),
-      ]);
-
-      const result = await service.aggregateReadings('proj-1');
-
-      // Median of [7.0, 7.2, 7.4] = 7.2
-      expect(result.medianPh).toBe(7.2);
-      // Median of [10, 11, 12] = 11
-      expect(result.medianTurbidity).toBe(11);
-      // Median of [8.0, 8.5, 9.0] = 8.5
-      expect(result.medianDissolvedOxygen).toBe(8.5);
-      // Median of [1.5, 1.8, 2.0] = 1.8
-      expect(result.medianFlowRate).toBe(1.8);
-      // Median of [2.0, 2.5, 3.0] = 2.5
-      expect(result.medianNitrogen).toBe(2.5);
-      // Median of [0.1, 0.15, 0.2] = 0.15
-      expect(result.medianPhosphorus).toBeCloseTo(0.15);
-      // Median of [18.0, 19.0, 20.0] = 19.0
-      expect(result.medianTemperature).toBe(19.0);
-    });
-
-    it('reports the number of submissions as oracleCount', async () => {
-      submissionRepo.find.mockResolvedValue([
-        makeSubmission({ ph: 7 }),
-        makeSubmission({ ph: 7 }),
-        makeSubmission({ ph: 7 }),
-      ]);
-
-      const result = await service.aggregateReadings('proj-1');
-
-      expect(result.oracleCount).toBe(3);
-    });
-
-    it('sets startTime and endTime from the first and last confirmed submission', async () => {
+    it('sets startTime and endTime from the earliest and latest verified reading timestamps', async () => {
       const t1 = new Date('2026-01-01T00:00:00Z');
-      const t2 = new Date('2026-01-02T00:00:00Z');
-
-      const sub1 = makeSubmission({ ph: 7 });
-      sub1.createdAt = t1;
-      const sub2 = makeSubmission({ ph: 7 });
-      sub2.createdAt = t2;
-
-      submissionRepo.find.mockResolvedValue([sub1, sub2]);
+      const t2 = new Date('2026-01-05T00:00:00Z');
+      readingQb.getRawOne.mockResolvedValue({
+        ...zeroAggregationRow(),
+        medianPh: '7.2',
+        oracleCount: '2',
+        startTime: t1,
+        endTime: t2,
+      });
 
       const result = await service.aggregateReadings('proj-1');
 

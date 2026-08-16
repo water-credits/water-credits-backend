@@ -1,4 +1,5 @@
 import { JwtService } from '@nestjs/jwt';
+import { ConfigService } from '@nestjs/config';
 import { Socket } from 'socket.io';
 import { NotificationsGateway } from './notifications.gateway';
 
@@ -16,10 +17,26 @@ function mockSocket(overrides: Partial<Socket> = {}): Socket {
 describe('NotificationsGateway', () => {
   let gateway: NotificationsGateway;
   let jwtService: { verifyAsync: jest.Mock };
+  let configService: { get: jest.Mock };
 
   beforeEach(() => {
     jwtService = { verifyAsync: jest.fn() };
-    gateway = new NotificationsGateway(jwtService as unknown as JwtService);
+    configService = {
+      get: jest.fn((key: string, defaultVal?: unknown) => {
+        const values: Record<string, unknown> = {
+          REDIS_HOST: 'localhost',
+          REDIS_PORT: 6379,
+          REDIS_PASSWORD: undefined,
+        };
+        return key in values ? values[key] : defaultVal;
+      }),
+    };
+    gateway = new NotificationsGateway(
+      jwtService as unknown as JwtService,
+      configService as unknown as ConfigService,
+    );
+    // afterInit is NOT called in unit tests — Redis clients are never created.
+    // Tests that exercise sendToUser / broadcast assign a minimal server mock.
   });
 
   describe('handleConnection', () => {
@@ -80,7 +97,7 @@ describe('NotificationsGateway', () => {
   });
 
   describe('handleDisconnect', () => {
-    it('removes the socket mapping for the authenticated user', async () => {
+    it('logs disconnection for an authenticated user without throwing', async () => {
       jwtService.verifyAsync.mockResolvedValue({ sub: 'user-7', wallet: 'G...', role: 'farmer' });
       const client = mockSocket({
         handshake: { auth: { token: 'valid.jwt' }, headers: {}, query: {} } as never,

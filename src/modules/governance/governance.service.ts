@@ -8,14 +8,18 @@ import {
   InternalServerErrorException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, DataSource, QueryFailedError } from 'typeorm';
+import { Repository, DataSource, QueryFailedError, LessThanOrEqual } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { Proposal, ProposalStatus } from './entities/proposal.entity';
 import { ProposalVote } from './entities/proposal-vote.entity';
 import { GovernanceConfig } from './entities/governance-config.entity';
+import { GovernanceConfigChange, ConfigChangeStatus } from './entities/governance-config-change.entity';
 import { CreateProposalDto } from './dto/create-proposal.dto';
 import { VoteDto } from './dto/vote.dto';
 import { GovernanceQueryDto } from './dto/governance-query.dto';
+import { UpdateGovernanceConfigDto } from './dto/update-governance-config.dto';
+import { PendingConfigChangeDto } from './dto/pending-config-change.dto';
 import { StellarService } from '../stellar/stellar.service';
 
 // PostgreSQL unique-violation error code
@@ -32,12 +36,14 @@ export class GovernanceService {
     private readonly voteRepo: Repository<ProposalVote>,
     @InjectRepository(GovernanceConfig)
     private readonly configRepo: Repository<GovernanceConfig>,
+    @InjectRepository(GovernanceConfigChange)
+    private readonly configChangeRepo: Repository<GovernanceConfigChange>,
     private readonly configService: ConfigService,
     private readonly dataSource: DataSource,
     private readonly stellarService: StellarService,
   ) {}
 
-  // ── Config ────────────────────────────────────────────────────────────────
+  // ── Config (read) ─────────────────────────────────────────────────────────
 
   async getConfig(): Promise<GovernanceConfig> {
     let config = await this.configRepo.findOne({ where: {} as Record<string, never> });
@@ -54,10 +60,245 @@ export class GovernanceService {
     return config;
   }
 
-  async updateConfig(updates: Partial<GovernanceConfig>): Promise<GovernanceConfig> {
+  // ── Config (timelocked write) ─────────────────────────────────────────────
+  //
+  // Creates a pending config-change record instead of writing to governance_config
+  // directly.  A scheduled job (applyDueConfigChanges) commits the values after
+  // effectiveAt has passed.
+
+  async proposeConfigChange(
+    proposedBy: string,
+    dto: UpdateGovernanceConfigDto,
+  ): Promise<PendingConfigChangeDto> {
+    const { reason, ...rawValues } = dto;
+
+    // Reject empty proposals early.
+    const proposedValues = Object.fromEntries(
+      Object.entries(rawValues).filter(([, v]) => v !== undefined),
+    ) as Partial<Omit<GovernanceConfig, 'id' | 'updatedAt' | 'updatedBy'>>;
+
+    if (Object.keys(proposedValues).length === 0) {
+      throw new BadRequestException('No config fields provided');
+    }
+
     const config = await this.getConfig();
-    Object.assign(config, updates);
-    return this.configRepo.save(config);
+
+    const effectiveAt = new Date(
+      Date.now() + config.timelockPeriod * 1_000,
+    );
+
+    const change = this.configChangeRepo.create({
+      configId: config.id,
+      proposedValues,
+      proposedBy,
+      effectiveAt,
+      status: ConfigChangeStatus.PENDING,
+      reason: reason ?? null,
+    });
+
+    const saved = await this.configChangeRepo.save(change);
+
+    // Write an audit event.
+    await this.writeGovernanceEvent('config_change_proposed', proposedBy, {
+      changeId: saved.id,
+      proposedValues,
+      effectiveAt,
+    });
+
+    this.logger.log(
+      `Config change ${saved.id} proposed by ${proposedBy}, effective at ${effectiveAt.toISOString()}`,
+    );
+
+    return PendingConfigChangeDto.fromEntity(saved);
+  }
+
+  // ── Pending-change list ───────────────────────────────────────────────────
+
+  async getPendingConfigChanges(): Promise<PendingConfigChangeDto[]> {
+    const changes = await this.configChangeRepo.find({
+      where: { status: ConfigChangeStatus.PENDING },
+      order: { effectiveAt: 'ASC' },
+    });
+    return changes.map(PendingConfigChangeDto.fromEntity);
+  }
+
+  // ── Cancellation ─────────────────────────────────────────────────────────
+
+  async cancelConfigChange(
+    changeId: string,
+    cancelledBy: string,
+  ): Promise<PendingConfigChangeDto> {
+    const change = await this.configChangeRepo.findOne({ where: { id: changeId } });
+
+    if (!change) {
+      throw new NotFoundException(`Config change ${changeId} not found`);
+    }
+    if (change.status !== ConfigChangeStatus.PENDING) {
+      throw new BadRequestException(
+        `Cannot cancel a config change with status '${change.status}'`,
+      );
+    }
+
+    change.status = ConfigChangeStatus.CANCELLED;
+    change.cancelledAt = new Date();
+    change.cancelledBy = cancelledBy;
+
+    const saved = await this.configChangeRepo.save(change);
+
+    await this.writeGovernanceEvent('config_change_cancelled', cancelledBy, {
+      changeId: saved.id,
+      proposedValues: saved.proposedValues,
+    });
+
+    this.logger.log(`Config change ${changeId} cancelled by ${cancelledBy}`);
+
+    return PendingConfigChangeDto.fromEntity(saved);
+  }
+
+  // ── Emergency override ────────────────────────────────────────────────────
+  //
+  // Bypasses the timelock entirely and writes directly to governance_config.
+  // Gated behind SUPER_ADMIN role (enforced in the controller).
+
+  async emergencyConfigUpdate(
+    actor: string,
+    dto: UpdateGovernanceConfigDto,
+  ): Promise<GovernanceConfig> {
+    const { reason, ...rawValues } = dto;
+
+    const updates = Object.fromEntries(
+      Object.entries(rawValues).filter(([, v]) => v !== undefined),
+    ) as Partial<Omit<GovernanceConfig, 'id' | 'updatedAt' | 'updatedBy'>>;
+
+    if (Object.keys(updates).length === 0) {
+      throw new BadRequestException('No config fields provided');
+    }
+
+    const config = await this.getConfig();
+
+    // Record a corresponding GovernanceConfigChange row for auditability,
+    // with status=EMERGENCY and effectiveAt=now.
+    const changeRecord = this.configChangeRepo.create({
+      configId: config.id,
+      proposedValues: updates,
+      proposedBy: actor,
+      effectiveAt: new Date(),
+      status: ConfigChangeStatus.EMERGENCY,
+      appliedAt: new Date(),
+      appliedBy: actor,
+      reason: reason ?? null,
+    });
+    const savedChange = await this.configChangeRepo.save(changeRecord);
+
+    // Write values directly to the live config row.
+    Object.assign(config, updates, { updatedBy: actor });
+    const updatedConfig = await this.configRepo.save(config);
+
+    await this.writeGovernanceEvent('config_emergency_updated', actor, {
+      changeId: savedChange.id,
+      appliedValues: updates,
+      reason: reason ?? null,
+    });
+
+    this.logger.warn(
+      `Emergency config update by ${actor}: ${JSON.stringify(updates)}`,
+    );
+
+    return updatedConfig;
+  }
+
+  // ── Scheduler: apply due changes ─────────────────────────────────────────
+  //
+  // Runs every minute.  For each pending change whose effectiveAt <= now, it
+  // applies the values to the live governance_config row inside a transaction.
+  // Each change is processed individually so a single failure does not block
+  // the others.
+
+  @Cron(CronExpression.EVERY_MINUTE)
+  async applyDueConfigChanges(): Promise<void> {
+    const due = await this.configChangeRepo.find({
+      where: {
+        status: ConfigChangeStatus.PENDING,
+        effectiveAt: LessThanOrEqual(new Date()),
+      },
+      order: { effectiveAt: 'ASC' },
+    });
+
+    if (due.length === 0) {
+      return;
+    }
+
+    this.logger.log(`Applying ${due.length} due config change(s)`);
+
+    for (const change of due) {
+      await this.applySingleChange(change);
+    }
+  }
+
+  private async applySingleChange(change: GovernanceConfigChange): Promise<void> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      // Re-fetch inside transaction to guard against concurrent applies.
+      const locked = await queryRunner.manager.findOne(GovernanceConfigChange, {
+        where: { id: change.id },
+        lock: { mode: 'pessimistic_write' },
+      });
+
+      if (!locked || locked.status !== ConfigChangeStatus.PENDING) {
+        // Another process already handled this change; skip it.
+        await queryRunner.rollbackTransaction();
+        return;
+      }
+
+      const config = await queryRunner.manager.findOne(GovernanceConfig, {
+        where: { id: locked.configId },
+      });
+
+      if (!config) {
+        this.logger.error(`Config row ${locked.configId} not found for change ${locked.id}`);
+        await queryRunner.rollbackTransaction();
+        return;
+      }
+
+      // Apply the proposed values.
+      Object.assign(config, locked.proposedValues, { updatedBy: locked.proposedBy });
+      await queryRunner.manager.save(GovernanceConfig, config);
+
+      // Mark the change as applied.
+      locked.status = ConfigChangeStatus.APPLIED;
+      locked.appliedAt = new Date();
+      locked.appliedBy = 'scheduler';
+      await queryRunner.manager.save(GovernanceConfigChange, locked);
+
+      // Append an audit event inside the same transaction.
+      await queryRunner.query(
+        `INSERT INTO governance_events (event_type, actor, payload)
+         VALUES ($1, $2, $3::jsonb)`,
+        [
+          'config_change_applied',
+          locked.proposedBy,
+          JSON.stringify({
+            changeId: locked.id,
+            appliedValues: locked.proposedValues,
+          }),
+        ],
+      );
+
+      await queryRunner.commitTransaction();
+
+      this.logger.log(`Config change ${locked.id} applied (proposed by ${locked.proposedBy})`);
+    } catch (err) {
+      await queryRunner.rollbackTransaction();
+      this.logger.error(
+        `Failed to apply config change ${change.id}: ${(err as Error).message}`,
+        (err as Error).stack,
+      );
+    } finally {
+      await queryRunner.release();
+    }
   }
 
   // ── Proposals ─────────────────────────────────────────────────────────────
@@ -321,13 +562,6 @@ export class GovernanceService {
         proposal.onChainProposalId,
       );
 
-      // stellarService.execute() delegates to invokeContract() which calls
-      // sendTx() (via StellarClient). sendTx returns a
-      // GetTransactionResponse on success and throws on failure.
-      // The hash is surfaced via sendTxWithHash; for execute we call the
-      // lower-level invokeContract path, so we extract what we can.
-      // If the result carries a hash field, use it; otherwise fall back to a
-      // placeholder so the record is still useful.
       txHash =
         (result as { txHash?: string } | null)?.txHash ??
         (result as { hash?: string } | null)?.hash ??
@@ -372,10 +606,6 @@ export class GovernanceService {
       return;
     }
     if (new Date() > new Date(proposal.deadline)) {
-      // Conditional UPDATE (not load + save) so that concurrent reads of the
-      // same expired proposal cannot each issue their own save() call; only
-      // the request whose UPDATE actually flips the row (status still
-      // 'active' at UPDATE time) reflects the transition back to the caller.
       const result = await this.proposalRepo
         .createQueryBuilder()
         .update(Proposal)
@@ -387,6 +617,29 @@ export class GovernanceService {
       if (result.affected) {
         proposal.status = ProposalStatus.EXPIRED;
       }
+    }
+  }
+
+  /**
+   * Appends a row to the governance_events table.
+   * Uses raw SQL so it works both inside and outside transactions.
+   */
+  private async writeGovernanceEvent(
+    eventType: string,
+    actor: string,
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      await this.dataSource.query(
+        `INSERT INTO governance_events (event_type, actor, payload)
+         VALUES ($1, $2, $3::jsonb)`,
+        [eventType, actor, JSON.stringify(payload)],
+      );
+    } catch (err) {
+      // Event writes are best-effort — never let them fail a business operation.
+      this.logger.warn(
+        `Failed to write governance event '${eventType}': ${(err as Error).message}`,
+      );
     }
   }
 }

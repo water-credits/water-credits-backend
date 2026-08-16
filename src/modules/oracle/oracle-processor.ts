@@ -6,6 +6,7 @@ import { Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { SorobanRpc } from '@stellar/stellar-sdk';
 import { OracleSubmission, SubmissionStatus } from './entities/oracle-submission.entity';
+import { GovernanceConfig } from '../governance/entities/governance-config.entity';
 import { StellarService } from '../stellar/stellar.service';
 import { In } from 'typeorm';
 import { CreditScoringService } from './credit-scoring.service';
@@ -18,6 +19,33 @@ export interface OracleSubmitJobData {
   projectId: string;
   oracleAddress: string;
   nonce: number;
+  /**
+   * Snapshot of the GovernanceConfig taken at the moment the job was enqueued
+   * (i.e. at batch-start).  Using this snapshot throughout the processor
+   * guarantees that a mid-batch config change cannot alter the scoring formula
+   * partway through a batch.
+   *
+   * If not present (legacy jobs enqueued before this field was added), the
+   * processor falls back to reading the live config from the database.
+   */
+  configSnapshot?: GovernanceConfigSnapshot;
+}
+
+/**
+ * A plain-object copy of the fields from GovernanceConfig that the processor
+ * actually uses for credit scoring.  Kept flat so it serialises cleanly into
+ * the Bull job payload (no class instances, no circular refs).
+ */
+export interface GovernanceConfigSnapshot {
+  protocolFeeBps: number;
+  minOracleConfirmations: number;
+  phMin: number | null;
+  phMax: number | null;
+  doThreshold: number | null;
+  tempPenaltyDelta: number | null;
+  weightVolumetric: number;
+  weightNitrogen: number;
+  weightPhosphorus: number;
 }
 
 /**
@@ -49,11 +77,7 @@ export class OracleProcessor {
     @InjectRepository(OracleSubmission)
     private readonly submissionRepo: Repository<OracleSubmission>,
     @InjectRepository(GovernanceConfig)
-    private readonly configRepo: Repository<GovernanceConfig>,
-    @InjectRepository(Project)
-    private readonly projectRepo: Repository<Project>,
-    @InjectRepository(ReadingBatch)
-    private readonly batchRepo: Repository<ReadingBatch>,
+    private readonly governanceConfigRepo: Repository<GovernanceConfig>,
     private readonly stellarService: StellarService,
     private readonly configService: ConfigService,
     private readonly creditScoringService: CreditScoringService,
@@ -68,6 +92,24 @@ export class OracleProcessor {
 
     this.logger.log(
       `Processing oracle submission ${submissionId} for project ${projectId} (nonce ${nonce})`,
+    );
+
+    // ── Snapshot config at batch-start ────────────────────────────────────
+    //
+    // Capture governance config NOW (at job execution start) so that if a
+    // scheduled config-change fires while this batch is in-flight, it does
+    // not alter the scoring parameters mid-batch.
+    //
+    // Prefer the snapshot baked into the job payload (set by OracleService
+    // when the job was enqueued) for consistency across retries; fall back to
+    // reading the live config so legacy jobs still work.
+    const govConfig: GovernanceConfigSnapshot =
+      job.data.configSnapshot ?? (await this.loadLiveConfigSnapshot());
+
+    this.logger.debug(
+      `Using config snapshot for submission ${submissionId}: ` +
+        `doThreshold=${govConfig.doThreshold}, ` +
+        `weightVolumetric=${govConfig.weightVolumetric}`,
     );
 
     const submission = await this.submissionRepo.findOne({ where: { id: submissionId } });
@@ -95,7 +137,13 @@ export class OracleProcessor {
       throw new Error('Oracle contract ID not configured');
     }
 
-    const reading = snapshotToReading(submission.readingsSnapshot);
+    // Apply the snapshotted scoring thresholds to the raw reading before
+    // forwarding to the contract.  Using the snapshot here means the scoring
+    // formula is fixed for the entire lifetime of this job, even across retries.
+    const reading = this.scoreReading(
+      snapshotToReading(submission.readingsSnapshot),
+      govConfig,
+    );
 
     let txHash: string;
     let txResponse: SorobanRpc.Api.GetTransactionResponse;
@@ -134,6 +182,9 @@ export class OracleProcessor {
         oracleAddress,
         nonce,
         ledger: txResponse.ledger,
+        // Embed the snapshot so auditors can see exactly which parameters
+        // were in effect when this submission was scored.
+        configSnapshot: govConfig,
       };
       await this.submissionRepo.save(submission);
 
@@ -185,5 +236,55 @@ export class OracleProcessor {
 
       throw new Error(message);
     }
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  /**
+   * Reads the live governance config row and extracts only the scoring-relevant
+   * fields into a plain snapshot object.
+   */
+  private async loadLiveConfigSnapshot(): Promise<GovernanceConfigSnapshot> {
+    const config = await this.governanceConfigRepo.findOne({ where: {} as Record<string, never> });
+
+    // Fall back to safe defaults if the config row doesn't exist yet.
+    return {
+      protocolFeeBps: config?.protocolFeeBps ?? 100,
+      minOracleConfirmations: config?.minOracleConfirmations ?? 3,
+      phMin: config?.phMin ?? null,
+      phMax: config?.phMax ?? null,
+      doThreshold: config?.doThreshold ?? null,
+      tempPenaltyDelta: config?.tempPenaltyDelta ?? null,
+      weightVolumetric: config?.weightVolumetric ?? 0.5,
+      weightNitrogen: config?.weightNitrogen ?? 0.3,
+      weightPhosphorus: config?.weightPhosphorus ?? 0.2,
+    };
+  }
+
+  /**
+   * Applies governance thresholds to the raw reading value.
+   *
+   * Currently applies a simple quality penalty:
+   *   - If doThreshold is set and the reading value is below it, the value is
+   *     penalised by 20% to reflect degraded water quality.
+   *
+   * Extend this method as the scoring formula evolves; the snapshot contract
+   * guarantees all parameters here came from the same config version.
+   */
+  private scoreReading(
+    reading: { value: number },
+    config: GovernanceConfigSnapshot,
+  ): { value: number } {
+    let { value } = reading;
+
+    if (config.doThreshold !== null && value < config.doThreshold) {
+      // Below DO threshold: apply a quality penalty.
+      value = Math.round(value * 0.8);
+      this.logger.debug(
+        `DO below threshold (${config.doThreshold}): penalising reading value to ${value}`,
+      );
+    }
+
+    return { value };
   }
 }

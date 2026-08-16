@@ -1,4 +1,5 @@
 import { JwtService } from '@nestjs/jwt';
+import { ConfigService } from '@nestjs/config';
 import { Socket } from 'socket.io';
 import { SensorsGateway } from './sensors.gateway';
 import { ProjectsService } from '../projects/projects.service';
@@ -22,14 +23,27 @@ describe('SensorsGateway', () => {
   let gateway: SensorsGateway;
   let jwtService: { verifyAsync: jest.Mock };
   let projectsService: { findById: jest.Mock };
+  let configService: { get: jest.Mock };
 
   beforeEach(() => {
     jwtService = { verifyAsync: jest.fn() };
     projectsService = { findById: jest.fn() };
+    configService = {
+      get: jest.fn((key: string, defaultVal?: unknown) => {
+        const values: Record<string, unknown> = {
+          REDIS_HOST: 'localhost',
+          REDIS_PORT: 6379,
+          REDIS_PASSWORD: undefined,
+        };
+        return key in values ? values[key] : defaultVal;
+      }),
+    };
     gateway = new SensorsGateway(
       jwtService as unknown as JwtService,
       projectsService as unknown as ProjectsService,
+      configService as unknown as ConfigService,
     );
+    // afterInit is NOT called in unit tests — Redis clients are never created.
   });
 
   describe('handleConnection', () => {

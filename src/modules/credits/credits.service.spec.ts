@@ -48,18 +48,24 @@ describe('CreditsService', () => {
   let retirementRepo: RetirementRepoMock;
   let retirementsQueue: { add: jest.Mock };
 
+  let projectRepo: { find: jest.Mock; findOne: jest.Mock; count: jest.Mock };
+
   beforeEach(async () => {
     retirementRepo = makeRetirementRepo();
     retirementsQueue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
+    // Default: project has a deployed token, so retire() proceeds past the
+    // tokenId lookup in tests that aren't specifically exercising it.
+    projectRepo = {
+      find: jest.fn(),
+      findOne: jest.fn().mockResolvedValue({ id: 'proj-1', creditTokenAddress: 'C-token-default' }),
+      count: jest.fn(),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         CreditsService,
         { provide: getRepositoryToken(Retirement), useValue: retirementRepo },
-        {
-          provide: getRepositoryToken(Project),
-          useValue: { find: jest.fn(), findOne: jest.fn(), count: jest.fn() },
-        },
+        { provide: getRepositoryToken(Project), useValue: projectRepo },
         { provide: getQueueToken('retirements'), useValue: retirementsQueue },
         { provide: ConfigService, useValue: { get: jest.fn() } },
         {
@@ -147,6 +153,10 @@ describe('CreditsService', () => {
 
       retirementRepo.create.mockReturnValue(saved as Retirement);
       retirementRepo.save.mockResolvedValue(saved as Retirement);
+      projectRepo.findOne.mockResolvedValue({
+        id: 'proj-abc',
+        creditTokenAddress: 'C-token-abc',
+      });
 
       const dto: RetireCreditsDto = {
         projectId: 'proj-abc',
@@ -163,6 +173,7 @@ describe('CreditsService', () => {
           retirementId: 'ret-uuid-42',
           userId: 'user-99',
           projectId: 'proj-abc',
+          tokenId: 'C-token-abc',
           amount: 5000,
           purpose: 'voluntary',
         },
@@ -192,6 +203,58 @@ describe('CreditsService', () => {
 
       const result = await service.retire('user-1', dto);
       expect(result.id).toBe('ret-uuid-1');
+    });
+  });
+
+  // ── retire — project credit token lookup ──────────────────────────────────
+
+  describe('retire — project credit token lookup', () => {
+    it('throws BadRequestException when the project has no creditTokenAddress', async () => {
+      projectRepo.findOne.mockResolvedValue({ id: 'proj-1', creditTokenAddress: null });
+
+      const dto: RetireCreditsDto = {
+        projectId: 'proj-1',
+        amount: 100,
+        purpose: 'compliance',
+      };
+
+      await expect(service.retire('user-1', dto)).rejects.toThrow(BadRequestException);
+      await expect(service.retire('user-1', dto)).rejects.toThrow(
+        'Project credit token not yet deployed',
+      );
+      expect(retirementsQueue.add).not.toHaveBeenCalled();
+    });
+
+    it('passes the resolved tokenId through to the queued job', async () => {
+      const saved: Partial<Retirement> = {
+        id: 'ret-uuid-9',
+        userId: 'user-1',
+        projectId: 'proj-9',
+        amount: 10,
+        purpose: 'compliance',
+        txHash: '',
+        retiredAt: new Date(),
+      };
+      retirementRepo.create.mockReturnValue(saved as Retirement);
+      retirementRepo.save.mockResolvedValue(saved as Retirement);
+      projectRepo.findOne.mockResolvedValue({
+        id: 'proj-9',
+        creditTokenAddress: 'C-token-9',
+      });
+
+      const dto: RetireCreditsDto = {
+        projectId: 'proj-9',
+        amount: 10,
+        purpose: 'compliance',
+      };
+
+      await service.retire('user-1', dto);
+
+      expect(retirementsQueue.add).toHaveBeenCalledWith(
+        'process-retirement',
+        expect.objectContaining({ tokenId: 'C-token-9' }),
+        expect.any(Object),
+      );
     });
   });
 

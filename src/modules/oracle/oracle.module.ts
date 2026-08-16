@@ -5,14 +5,15 @@ import { OracleController } from './oracle.controller';
 import { OracleService } from './oracle.service';
 import { OracleProcessor } from './oracle-processor';
 import { OracleSubmission } from './entities/oracle-submission.entity';
-import { CreditScoringService } from './credit-scoring.service';
 import { GovernanceConfig } from '../governance/entities/governance-config.entity';
-import { Project } from '../projects/entities/project.entity';
-import { ReadingBatch } from '../sensors/entities/reading-batch.entity';
+import { SensorReading } from '../sensors/entities/sensor-reading.entity';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([OracleSubmission, GovernanceConfig, Project, ReadingBatch]),
+    // GovernanceConfig is needed by OracleProcessor to snapshot config at
+    // batch-start (Issue #34).  GovernanceModule also registers it; TypeORM
+    // deduplicates the underlying repository provider.
+    TypeOrmModule.forFeature([OracleSubmission, GovernanceConfig, SensorReading]),
     BullModule.registerQueue({
       name: 'oracle-submit',
       defaultJobOptions: {

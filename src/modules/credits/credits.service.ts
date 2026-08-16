@@ -104,6 +104,15 @@ export class CreditsService {
       throw new BadRequestException('Amount must be positive');
     }
 
+    // The retirement job calls the Soroban contract directly by address, so
+    // a project without a deployed credit token would enqueue a job that is
+    // guaranteed to fail on-chain. Fail fast instead of burning retries.
+    const project = await this.projectRepo.findOne({ where: { id: dto.projectId } });
+    if (!project?.creditTokenAddress) {
+      throw new BadRequestException('Project credit token not yet deployed');
+    }
+    const tokenId = project.creditTokenAddress;
+
     const retirement = this.retirementRepo.create({
       userId,
       projectId: dto.projectId,
@@ -122,6 +131,7 @@ export class CreditsService {
         retirementId: saved.id,
         userId,
         projectId: dto.projectId,
+        tokenId,
         amount: dto.amount,
         purpose: dto.purpose,
       },

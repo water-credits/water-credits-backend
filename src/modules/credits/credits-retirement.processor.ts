@@ -54,6 +54,15 @@ export class CreditsRetirementProcessor {
       return;
     }
 
+    // Defensive guard: retire() should always resolve tokenId before
+    // enqueueing, so this is a backstop against a bad/legacy job payload
+    // rather than the primary fix — never call the SDK with no contract id.
+    if (!tokenId) {
+      const message = `Retirement ${retirementId} has no tokenId; refusing to call the contract`;
+      this.logger.error(message);
+      throw new Error(message);
+    }
+
     let txHash: string;
     let response: SorobanRpc.Api.GetTransactionResponse;
 

@@ -54,7 +54,8 @@ describe('GovernanceController', () => {
           provide: GovernanceService,
           useValue: {
             getConfig: jest.fn(),
-            updateConfig: jest.fn(),
+            proposeConfigChange: jest.fn(),
+            emergencyConfigUpdate: jest.fn(),
             getProposals: jest.fn(),
             getProposalById: jest.fn(),
             createProposal: jest.fn(),
@@ -85,15 +86,28 @@ describe('GovernanceController', () => {
   });
 
   describe('updateConfig', () => {
-    it('should update the governance config with the given body', async () => {
-      const updates: Partial<typeof mockConfig> = { protocolFeeBps: 200, quorum: 5 };
-      const updatedConfig = { ...mockConfig, ...updates };
-      service.updateConfig.mockResolvedValue(updatedConfig);
+    it('should propose a config change with the given body and actor', async () => {
+      const updates = { protocolFeeBps: 200, quorum: 5 };
+      const pendingChange = {
+        id: 'change-1',
+        configId: 1,
+        proposedValues: updates,
+        proposedBy: 'GADMIN',
+        effectiveAt: new Date(),
+        status: 'pending',
+        appliedAt: null,
+        appliedBy: null,
+        cancelledAt: null,
+        cancelledBy: null,
+        reason: null,
+        createdAt: new Date(),
+      };
+      service.proposeConfigChange.mockResolvedValue(pendingChange as any);
 
-      const result = await controller.updateConfig(updates);
+      const result = await controller.updateConfig(updates as any, 'GADMIN');
 
-      expect(service.updateConfig).toHaveBeenCalledWith(updates);
-      expect(result).toEqual(updatedConfig);
+      expect(service.proposeConfigChange).toHaveBeenCalledWith('GADMIN', updates);
+      expect(result).toEqual(pendingChange);
     });
   });
 

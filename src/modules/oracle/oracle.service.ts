@@ -2,12 +2,13 @@ import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
-import { Repository, Between, DataSource, MoreThan } from 'typeorm';
+import { Repository, DataSource, MoreThan } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { OracleSubmission, SubmissionStatus } from './entities/oracle-submission.entity';
 import { OracleQueryDto } from './dto/oracle-query.dto';
 import { TriggerSubmissionDto } from './dto/trigger-submission.dto';
 import { StellarService } from '../stellar/stellar.service';
+import { SensorReading } from '../sensors/entities/sensor-reading.entity';
 
 export interface AggregatedReading {
   medianPh: number | null;
@@ -17,9 +18,25 @@ export interface AggregatedReading {
   medianNitrogen: number | null;
   medianPhosphorus: number | null;
   medianTemperature: number | null;
+  /**
+   * Number of verified sensor readings included in the aggregation.
+   */
   oracleCount: number;
   startTime: Date;
   endTime: Date;
+}
+
+interface AggregationRow {
+  medianPh: string | null;
+  medianTurbidity: string | null;
+  medianDissolvedOxygen: string | null;
+  medianFlowRate: string | null;
+  medianNitrogen: string | null;
+  medianPhosphorus: string | null;
+  medianTemperature: string | null;
+  oracleCount: string;
+  startTime: Date | null;
+  endTime: Date | null;
 }
 
 @Injectable()
@@ -29,6 +46,8 @@ export class OracleService {
   constructor(
     @InjectRepository(OracleSubmission)
     private readonly submissionRepo: Repository<OracleSubmission>,
+    @InjectRepository(SensorReading)
+    private readonly readingRepo: Repository<SensorReading>,
     @InjectQueue('oracle-submit')
     private readonly oracleQueue: Queue,
     private readonly configService: ConfigService,
@@ -152,67 +171,66 @@ export class OracleService {
     return saved;
   }
 
+  /**
+   * Aggregates verified sensor readings for a project.
+   *
+   * Medians are calculated with PostgreSQL's `percentile_cont(0.5)` directly
+   * over the canonical `sensor_readings` table, filtered by project, time range
+   * and `is_verified = true`.
+   */
   async aggregateReadings(
     projectId: string,
     startTime?: Date,
     endTime?: Date,
   ): Promise<AggregatedReading> {
-    const submissions = await this.submissionRepo.find({
-      where: {
-        projectId,
-        status: SubmissionStatus.CONFIRMED,
-        ...(startTime && endTime ? { createdAt: Between(startTime, endTime) } : {}),
-      },
-    });
+    const qb = this.readingRepo.createQueryBuilder('reading');
 
-    if (submissions.length === 0) {
-      throw new NotFoundException('No confirmed submissions found for aggregation');
+    qb.select('percentile_cont(0.5) WITHIN GROUP (ORDER BY reading.ph)', 'medianPh')
+      .addSelect(
+        'percentile_cont(0.5) WITHIN GROUP (ORDER BY reading.turbidity)',
+        'medianTurbidity',
+      )
+      .addSelect(
+        'percentile_cont(0.5) WITHIN GROUP (ORDER BY reading.dissolved_oxygen)',
+        'medianDissolvedOxygen',
+      )
+      .addSelect('percentile_cont(0.5) WITHIN GROUP (ORDER BY reading.flow_rate)', 'medianFlowRate')
+      .addSelect('percentile_cont(0.5) WITHIN GROUP (ORDER BY reading.nitrogen)', 'medianNitrogen')
+      .addSelect(
+        'percentile_cont(0.5) WITHIN GROUP (ORDER BY reading.phosphorus)',
+        'medianPhosphorus',
+      )
+      .addSelect(
+        'percentile_cont(0.5) WITHIN GROUP (ORDER BY reading.temperature)',
+        'medianTemperature',
+      )
+      .addSelect('COUNT(*)', 'oracleCount')
+      .addSelect('MIN(reading.timestamp)', 'startTime')
+      .addSelect('MAX(reading.timestamp)', 'endTime')
+      .where('reading.project_id = :projectId', { projectId })
+      .andWhere('reading.is_verified = true');
+
+    if (startTime && endTime) {
+      qb.andWhere('reading.timestamp BETWEEN :startTime AND :endTime', { startTime, endTime });
     }
 
-    const phValues: number[] = [];
-    const turbidityValues: number[] = [];
-    const doValues: number[] = [];
-    const flowValues: number[] = [];
-    const nValues: number[] = [];
-    const pValues: number[] = [];
-    const tempValues: number[] = [];
+    const row = await qb.getRawOne<AggregationRow>();
 
-    for (const sub of submissions) {
-      const snap = sub.readingsSnapshot as Record<string, number | undefined>;
-      if (snap.ph !== undefined) {
-        phValues.push(snap.ph);
-      }
-      if (snap.turbidity !== undefined) {
-        turbidityValues.push(snap.turbidity);
-      }
-      if (snap.dissolvedOxygen !== undefined) {
-        doValues.push(snap.dissolvedOxygen);
-      }
-      if (snap.flowRate !== undefined) {
-        flowValues.push(snap.flowRate);
-      }
-      if (snap.nitrogen !== undefined) {
-        nValues.push(snap.nitrogen);
-      }
-      if (snap.phosphorus !== undefined) {
-        pValues.push(snap.phosphorus);
-      }
-      if (snap.temperature !== undefined) {
-        tempValues.push(snap.temperature);
-      }
+    if (!row || parseInt(row.oracleCount, 10) === 0) {
+      throw new NotFoundException('No verified sensor readings found for aggregation');
     }
 
     return {
-      medianPh: this.median(phValues),
-      medianTurbidity: this.median(turbidityValues),
-      medianDissolvedOxygen: this.median(doValues),
-      medianFlowRate: this.median(flowValues),
-      medianNitrogen: this.median(nValues),
-      medianPhosphorus: this.median(pValues),
-      medianTemperature: this.median(tempValues),
-      oracleCount: submissions.length,
-      startTime: submissions[0]?.createdAt ?? new Date(),
-      endTime: submissions[submissions.length - 1]?.createdAt ?? new Date(),
+      medianPh: this.nullableNumber(row.medianPh),
+      medianTurbidity: this.nullableNumber(row.medianTurbidity),
+      medianDissolvedOxygen: this.nullableNumber(row.medianDissolvedOxygen),
+      medianFlowRate: this.nullableNumber(row.medianFlowRate),
+      medianNitrogen: this.nullableNumber(row.medianNitrogen),
+      medianPhosphorus: this.nullableNumber(row.medianPhosphorus),
+      medianTemperature: this.nullableNumber(row.medianTemperature),
+      oracleCount: parseInt(row.oracleCount, 10),
+      startTime: row.startTime ?? new Date(),
+      endTime: row.endTime ?? new Date(),
     };
   }
 
@@ -272,12 +290,7 @@ export class OracleService {
     });
   }
 
-  private median(values: number[]): number | null {
-    if (values.length === 0) {
-      return null;
-    }
-    const sorted = [...values].sort((a, b) => a - b);
-    const mid = Math.floor(sorted.length / 2);
-    return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+  private nullableNumber(value: string | null): number | null {
+    return value === null ? null : parseFloat(value);
   }
 }
