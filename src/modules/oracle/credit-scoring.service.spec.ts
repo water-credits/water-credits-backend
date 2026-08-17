@@ -1,7 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { CreditScoringService } from './credit-scoring.service';
 import { GovernanceConfig } from '../governance/entities/governance-config.entity';
-import { BigNumber } from 'bignumber.js';
+// import { BigNumber } from 'bignumber.js';
 
 describe('CreditScoringService', () => {
   let service: CreditScoringService;

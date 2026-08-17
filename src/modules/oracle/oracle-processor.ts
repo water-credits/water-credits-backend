@@ -2,15 +2,13 @@ import { Process, Processor } from '@nestjs/bull';
 import { Job } from 'bull';
 import { Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { SorobanRpc } from '@stellar/stellar-sdk';
 import { OracleSubmission, SubmissionStatus } from './entities/oracle-submission.entity';
 import { GovernanceConfig } from '../governance/entities/governance-config.entity';
 import { StellarService } from '../stellar/stellar.service';
-import { In } from 'typeorm';
 import { CreditScoringService } from './credit-scoring.service';
-import { GovernanceConfig } from '../governance/entities/governance-config.entity';
 import { Project } from '../projects/entities/project.entity';
 import { ReadingBatch, BatchStatus } from '../sensors/entities/reading-batch.entity';
 
@@ -78,6 +76,10 @@ export class OracleProcessor {
     private readonly submissionRepo: Repository<OracleSubmission>,
     @InjectRepository(GovernanceConfig)
     private readonly governanceConfigRepo: Repository<GovernanceConfig>,
+    @InjectRepository(Project)
+    private readonly projectRepo: Repository<Project>,
+    @InjectRepository(ReadingBatch)
+    private readonly batchRepo: Repository<ReadingBatch>,
     private readonly stellarService: StellarService,
     private readonly configService: ConfigService,
     private readonly creditScoringService: CreditScoringService,
@@ -140,10 +142,7 @@ export class OracleProcessor {
     // Apply the snapshotted scoring thresholds to the raw reading before
     // forwarding to the contract.  Using the snapshot here means the scoring
     // formula is fixed for the entire lifetime of this job, even across retries.
-    const reading = this.scoreReading(
-      snapshotToReading(submission.readingsSnapshot),
-      govConfig,
-    );
+    const reading = this.scoreReading(snapshotToReading(submission.readingsSnapshot), govConfig);
 
     let txHash: string;
     let txResponse: SorobanRpc.Api.GetTransactionResponse;
@@ -193,7 +192,7 @@ export class OracleProcessor {
       // Calculate credits and update ReadingBatch
       try {
         const project = await this.projectRepo.findOne({ where: { id: projectId } });
-        const config = await this.configRepo.findOne({ order: { id: 'DESC' } });
+        const config = await this.governanceConfigRepo.findOne({ order: { id: 'DESC' } });
 
         if (project && config) {
           const credits = this.creditScoringService.calculate(

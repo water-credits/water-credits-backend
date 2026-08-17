@@ -57,14 +57,14 @@ export class CreditScoringService {
     const tempPenaltyFactor = 1.0; // Placeholder until defined in GovernanceConfig
 
     let phDeviation = 0;
-    if (config.phMin != null && ph < config.phMin) {
+    if (config.phMin !== null && ph < config.phMin) {
       phDeviation = config.phMin - ph;
-    } else if (config.phMax != null && ph > config.phMax) {
+    } else if (config.phMax !== null && ph > config.phMax) {
       phDeviation = ph - config.phMax;
     }
 
     let tempDeviation = 0;
-    if (config.tempPenaltyDelta != null && temperature > config.tempPenaltyDelta) {
+    if (config.tempPenaltyDelta !== null && temperature > config.tempPenaltyDelta) {
       // Assuming tempPenaltyDelta acts as a threshold or max allowed
       tempDeviation = temperature - config.tempPenaltyDelta;
     }

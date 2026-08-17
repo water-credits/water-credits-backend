@@ -6,10 +6,10 @@ import { OracleProcessor } from './oracle-processor';
 import { OracleSubmission, SubmissionStatus } from './entities/oracle-submission.entity';
 import { GovernanceConfig } from '../governance/entities/governance-config.entity';
 import { StellarService } from '../stellar/stellar.service';
-import { CreditScoringService } from './credit-scoring.service';
+// import { CreditScoringService } from './credit-scoring.service';
 import { GovernanceConfig } from '../governance/entities/governance-config.entity';
-import { Project } from '../projects/entities/project.entity';
-import { ReadingBatch } from '../sensors/entities/reading-batch.entity';
+// import { Project } from '../projects/entities/project.entity';
+// import { ReadingBatch } from '../sensors/entities/reading-batch.entity';
 
 // ---------------------------------------------------------------------------
 // Helpers
