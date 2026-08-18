@@ -10,6 +10,13 @@ import {
 } from 'typeorm';
 import { Project } from '../../projects/entities/project.entity';
 
+/**
+ * Length of the batch collection window.  A batch stays open for this long
+ * after creation; readings arriving inside the window join it, and the oracle
+ * scheduler only submits batches whose window has closed.
+ */
+export const BATCH_WINDOW_MS = 15 * 60 * 1000;
+
 export enum BatchStatus {
   PENDING = 'pending',
   SUBMITTED = 'submitted',

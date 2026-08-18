@@ -79,6 +79,10 @@ async function bootstrap() {
     SwaggerModule.setup('api/docs', app, document);
   }
 
+  // Required for OnApplicationShutdown to run on SIGTERM/SIGINT — without it
+  // the oracle submission cron would keep firing while a pod drains.
+  app.enableShutdownHooks();
+
   // The Socket.io Redis adapter is initialised per-gateway namespace inside each
   // gateway's afterInit() hook (NotificationsGateway, SensorsGateway).  This
   // guarantees the adapter is attached before the first client can connect and

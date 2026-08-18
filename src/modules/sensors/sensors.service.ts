@@ -4,7 +4,7 @@ import { Repository } from 'typeorm';
 import { Keypair } from '@stellar/stellar-sdk';
 import { SensorDevice } from './entities/sensor-device.entity';
 import { SensorReading } from './entities/sensor-reading.entity';
-import { ReadingBatch, BatchStatus } from './entities/reading-batch.entity';
+import { ReadingBatch, BatchStatus, BATCH_WINDOW_MS } from './entities/reading-batch.entity';
 import { CreateReadingDto } from './dto/create-reading.dto';
 import { QueryReadingsDto } from './dto/query-readings.dto';
 import { RegisterDeviceDto } from './dto/register-device.dto';
@@ -24,8 +24,6 @@ const PARAMETER_RANGES: Record<string, ParameterRange> = {
   phosphorus: { min: 0, max: Infinity },
   temperature: { min: -50, max: 100 },
 };
-
-const BATCH_WINDOW_MS = 15 * 60 * 1000;
 
 function buildReadingPayload(
   deviceId: string,

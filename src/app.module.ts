@@ -4,6 +4,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { BullModule } from '@nestjs/bull';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { ScheduleModule } from '@nestjs/schedule';
 import { AuthModule } from './modules/auth/auth.module';
 import { UsersModule } from './modules/users/users.module';
 import { ProjectsModule } from './modules/projects/projects.module';
@@ -66,6 +67,8 @@ import oracleConfig from './config/oracle.config';
       ],
       inject: [ConfigService],
     }),
+    // Drives the hourly oracle submission cycle (OracleSchedulerService).
+    ScheduleModule.forRoot(),
     AuthModule,
     UsersModule,
     ProjectsModule,

@@ -2,7 +2,7 @@ import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
-import { Repository, DataSource, MoreThan } from 'typeorm';
+import { Repository, DataSource, MoreThan, SelectQueryBuilder } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { OracleSubmission, SubmissionStatus } from './entities/oracle-submission.entity';
 import { OracleQueryDto } from './dto/oracle-query.dto';
@@ -183,6 +183,29 @@ export class OracleService {
     startTime?: Date,
     endTime?: Date,
   ): Promise<AggregatedReading> {
+    const qb = this.buildAggregationQuery(projectId);
+
+    if (startTime && endTime) {
+      qb.andWhere('reading.timestamp BETWEEN :startTime AND :endTime', { startTime, endTime });
+    }
+
+    return this.runAggregation(qb);
+  }
+
+  /**
+   * Aggregates the verified readings belonging to a single reading batch.
+   *
+   * Used by the scheduled submission cycle: selecting by `batch_id` (rather
+   * than by a time range over device-reported timestamps) guarantees the
+   * submission covers exactly the readings the batch collected.
+   */
+  async aggregateReadingsForBatch(projectId: string, batchId: string): Promise<AggregatedReading> {
+    const qb = this.buildAggregationQuery(projectId);
+    qb.andWhere('reading.batch_id = :batchId', { batchId });
+    return this.runAggregation(qb);
+  }
+
+  private buildAggregationQuery(projectId: string): SelectQueryBuilder<SensorReading> {
     const qb = this.readingRepo.createQueryBuilder('reading');
 
     qb.select('percentile_cont(0.5) WITHIN GROUP (ORDER BY reading.ph)', 'medianPh')
@@ -210,10 +233,10 @@ export class OracleService {
       .where('reading.project_id = :projectId', { projectId })
       .andWhere('reading.is_verified = true');
 
-    if (startTime && endTime) {
-      qb.andWhere('reading.timestamp BETWEEN :startTime AND :endTime', { startTime, endTime });
-    }
+    return qb;
+  }
 
+  private async runAggregation(qb: SelectQueryBuilder<SensorReading>): Promise<AggregatedReading> {
     const row = await qb.getRawOne<AggregationRow>();
 
     if (!row || parseInt(row.oracleCount, 10) === 0) {

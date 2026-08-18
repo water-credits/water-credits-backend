@@ -599,6 +599,59 @@ Manages the off-chain oracle node infrastructure that submits sensor data to Sor
 8. Emits WebSocket event on completion
 ```
 
+#### Scheduled Submission Cycle
+
+`OracleSchedulerService` (`src/modules/oracle/oracle-scheduler.service.ts`) drives
+step 2. It runs on `@Cron` under the name `oracle-submission-cycle`, and each
+tick:
+
+1. Loads every project in `ACTIVE` status.
+2. For each project — **sequentially**, because the oracle nonce is
+   per-`(project_id, oracle_address)` — selects its `PENDING` reading batches
+   that have `reading_count > 0` and whose 15-minute collection window has
+   already closed (`created_at < NOW() - 15min`). Batches still inside the
+   window are left alone so a partial window is never submitted.
+3. Claims each batch with a conditional `UPDATE … WHERE status = 'pending'`.
+   Only the caller that flips `pending → submitted` proceeds, so an overlapping
+   tick, a second replica, or a concurrent `POST /oracle/trigger` cannot submit
+   the same batch twice. A failed submission releases the claim for the next
+   cycle.
+4. Aggregates that batch's verified readings and calls
+   `OracleService.triggerSubmission()`, which allocates the nonce under a
+   PostgreSQL advisory lock and enqueues the `oracle-submit` job.
+5. Records `last_scheduled_at` in `oracle_schedule_state` (one `global` row plus
+   one row per project) so `GET /health` can report oracle freshness.
+
+The cron is stopped in `onApplicationShutdown`, and an in-flight cycle stops
+between batches, so a terminating pod does not fire spurious submissions while
+it drains.
+
+**Configuration** (see `.env.example`):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ORACLE_SUBMISSION_INTERVAL_CRON` | `0 * * * *` | Schedule expression. Accepts 5- or 6-field cron; testnet operators can use e.g. `*/5 * * * *`. A malformed value logs a warning and falls back to hourly. |
+| `ORACLE_ADDRESS` | *(empty)* | Address the scheduler submits as. Empty disables the scheduled cycle; manual `POST /oracle/trigger` is unaffected since it carries its own address. |
+| `ORACLE_SCHEDULER_ENABLED` | `true` | Set to `false` to keep the cron registered but inert. |
+| `ORACLE_STALENESS_THRESHOLD_S` | `7200` | Seconds without a completed cycle before `GET /health` marks the oracle `degraded`. |
+
+`GET /health` reports the result under `checks.oracle`:
+
+```json
+{
+  "checks": {
+    "oracle": {
+      "status": "ok",
+      "enabled": true,
+      "cron": "0 * * * *",
+      "last_scheduled_at": "2026-08-18T09:00:00.000Z",
+      "staleness_s": 42,
+      "last_submission_count": 3
+    }
+  }
+}
+```
+
 #### Oracle Queue (Bull)
 
 ```typescript
