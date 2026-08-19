@@ -3,8 +3,6 @@ import {
   UnauthorizedException,
   ConflictException,
   BadRequestException,
-  OnModuleInit,
-  OnModuleDestroy,
   Logger,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
@@ -15,37 +13,25 @@ import * as crypto from 'crypto';
 import Redis from 'ioredis';
 import { User, UserRole } from '../users/entities/user.entity';
 import { Keypair } from '@stellar/stellar-sdk';
+import { RedisService } from './redis.service';
 
 const CHALLENGE_TTL_SECONDS = 5 * 60; // 5 minutes
 const CHALLENGE_KEY_PREFIX = 'auth:challenge:';
 
 @Injectable()
-export class AuthService implements OnModuleInit, OnModuleDestroy {
+export class AuthService {
   private readonly logger = new Logger(AuthService.name);
-  private redis: Redis;
 
   constructor(
     @InjectRepository(User)
     private readonly userRepo: Repository<User>,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
+    private readonly redisService: RedisService,
   ) {}
 
-  onModuleInit(): void {
-    this.redis = new Redis({
-      host: this.configService.get<string>('queue.redisHost', 'localhost'),
-      port: this.configService.get<number>('queue.redisPort', 6379),
-      password: this.configService.get<string>('queue.redisPassword') || undefined,
-      // Isolated DB (default is 0) so challenge keys don't collide with queue data
-      db: this.configService.get<number>('REDIS_AUTH_DB', 1),
-      lazyConnect: true,
-      enableReadyCheck: false,
-    });
-    this.redis.on('error', (err) => this.logger.warn(`Redis auth client error: ${err.message}`));
-  }
-
-  async onModuleDestroy(): Promise<void> {
-    await this.redis.quit();
+  private get redis(): Redis {
+    return this.redisService.getClient();
   }
 
   // ── Challenge ─────────────────────────────────────────────────────────────

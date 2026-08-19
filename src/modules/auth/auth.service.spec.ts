@@ -6,13 +6,15 @@ import { ConfigService } from '@nestjs/config';
 import { Keypair } from '@stellar/stellar-sdk';
 import * as crypto from 'crypto';
 import { AuthService } from './auth.service';
+import { RedisService } from './redis.service';
 import { User, UserRole } from '../users/entities/user.entity';
 
 // ── Redis isolation strategy ──────────────────────────────────────────────────
 //
-// AuthService creates its own ioredis client inside onModuleInit() via:
+// RedisService (shared with RateLimitGuard) creates its own ioredis client
+// inside onModuleInit() via:
 //
-//   this.redis = new Redis({ ... })
+//   this.client = new Redis({ ... })
 //
 // To prevent tests from requiring a live Redis instance we module-mock the
 // entire 'ioredis' module before the service module is loaded.  This replaces
@@ -87,6 +89,7 @@ function makeUser(overrides: Partial<User> = {}): User {
 // ── Test suite ────────────────────────────────────────────────────────────────
 
 describe('AuthService', () => {
+  let module!: TestingModule;
   let service: AuthService;
   let userRepo: {
     findOne: jest.Mock;
@@ -130,9 +133,10 @@ describe('AuthService', () => {
       verify: jest.fn(),
     };
 
-    const module: TestingModule = await Test.createTestingModule({
+    module = await Test.createTestingModule({
       providers: [
         AuthService,
+        RedisService,
         { provide: getRepositoryToken(User), useValue: userRepo },
         { provide: JwtService, useValue: jwtService },
         {
@@ -604,8 +608,9 @@ describe('AuthService', () => {
     it('calls redis.quit() when the module is destroyed', async () => {
       mockRedis.quit.mockResolvedValue('OK');
 
-      // Access the private method via the NestJS lifecycle hook.
-      await (service as unknown as { onModuleDestroy: () => Promise<void> }).onModuleDestroy();
+      // Redis connection lifecycle now lives on the shared RedisService.
+      const redisService = module.get<RedisService>(RedisService);
+      await (redisService as unknown as { onModuleDestroy: () => Promise<void> }).onModuleDestroy();
 
       expect(mockRedis.quit).toHaveBeenCalled();
     });

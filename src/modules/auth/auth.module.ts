@@ -8,6 +8,7 @@ import { AuthService } from './auth.service';
 import { JwtStrategy } from './strategies/jwt.strategy';
 import { StellarWalletStrategy } from './strategies/stellar-wallet.strategy';
 import { RateLimitGuard } from './guards/rate-limit.guard';
+import { RedisService } from './redis.service';
 import { User } from '../users/entities/user.entity';
 import { UsersModule } from '../users/users.module';
 
@@ -26,7 +27,7 @@ import { UsersModule } from '../users/users.module';
     UsersModule,
   ],
   controllers: [AuthController],
-  providers: [AuthService, JwtStrategy, StellarWalletStrategy, RateLimitGuard],
+  providers: [AuthService, JwtStrategy, StellarWalletStrategy, RateLimitGuard, RedisService],
   exports: [AuthService, JwtModule],
 })
 export class AuthModule {}

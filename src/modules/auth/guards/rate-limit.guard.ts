@@ -5,27 +5,39 @@ import {
   HttpException,
   HttpStatus,
   SetMetadata,
+  Logger,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
+import { RedisService } from '../redis.service';
 
 export const RATE_LIMIT_KEY = 'rateLimit';
 export const RateLimit = (maxRequests: number, windowMs: number) =>
   SetMetadata(RATE_LIMIT_KEY, { maxRequests, windowMs });
 
-interface RateLimitEntry {
-  count: number;
-  resetAt: number;
-}
-
 @Injectable()
 export class RateLimitGuard implements CanActivate {
-  private store = new Map<string, RateLimitEntry>();
-  private lastCleanup = Date.now();
-  private static readonly CLEANUP_INTERVAL_MS = 60_000;
+  private readonly logger = new Logger(RateLimitGuard.name);
 
-  constructor(private readonly reflector: Reflector) {}
+  /**
+   * Atomic sliding-window counter. INCR is atomic, and PEXPIRE is only applied
+   * when the key is first created (counter === 1), so the window starts at the
+   * first request and the counter resets once the key expires. A single EVAL
+   * keeps the whole operation one round-trip with no TOCTOU race.
+   */
+  private static readonly SLIDING_WINDOW_SCRIPT = `
+    local current = redis.call('INCR', KEYS[1])
+    if current == 1 then
+      redis.call('PEXPIRE', KEYS[1], ARGV[1])
+    end
+    return current
+  `;
 
-  canActivate(context: ExecutionContext): boolean {
+  constructor(
+    private readonly reflector: Reflector,
+    private readonly redisService: RedisService,
+  ) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
     const limitMeta = this.reflector.getAllAndOverride<{ maxRequests: number; windowMs: number }>(
       RATE_LIMIT_KEY,
       [context.getHandler(), context.getClass()],
@@ -35,33 +47,24 @@ export class RateLimitGuard implements CanActivate {
     }
 
     const request = context.switchToHttp().getRequest();
-    const key = request.ip || 'anonymous';
-    const now = Date.now();
+    const key = `rl:${request.ip || 'anonymous'}:${context.getHandler().name}`;
 
-    if (now - this.lastCleanup > RateLimitGuard.CLEANUP_INTERVAL_MS) {
-      this.cleanup(now);
-    }
+    try {
+      const count = await this.redisService
+        .getClient()
+        .eval(RateLimitGuard.SLIDING_WINDOW_SCRIPT, 1, key, limitMeta.windowMs);
 
-    let entry = this.store.get(key);
-    if (!entry || entry.resetAt < now) {
-      entry = { count: 0, resetAt: now + limitMeta.windowMs };
-      this.store.set(key, entry);
-    }
-
-    entry.count++;
-    if (entry.count > limitMeta.maxRequests) {
-      throw new HttpException('Too many requests', HttpStatus.TOO_MANY_REQUESTS);
+      if (Number(count) > limitMeta.maxRequests) {
+        throw new HttpException('Too many requests', HttpStatus.TOO_MANY_REQUESTS);
+      }
+    } catch (err) {
+      if (err instanceof HttpException) {
+        throw err;
+      }
+      // Fail open: if Redis is unavailable the guard must not hard-fail auth traffic.
+      this.logger.warn(`Redis rate-limit unavailable, allowing request: ${(err as Error).message}`);
     }
 
     return true;
-  }
-
-  private cleanup(now: number): void {
-    for (const [key, entry] of this.store) {
-      if (entry.resetAt < now) {
-        this.store.delete(key);
-      }
-    }
-    this.lastCleanup = now;
   }
 }
