@@ -5,7 +5,7 @@ import { getRepositoryToken } from '@nestjs/typeorm';
 import { IndexerService, LEDGER_GAP_WARNING_THRESHOLD } from './indexer.service';
 import { IndexerCursor, MAIN_CURSOR_KEY } from './entities/indexer-cursor.entity';
 import { DecodedEvent } from './indexer.types';
-import { OracleSubmission, SubmissionStatus } from '../oracle/entities/oracle-submission.entity';
+import { OracleSubmission } from '../oracle/entities/oracle-submission.entity';
 import { ReadingBatch } from '../sensors/entities/reading-batch.entity';
 import { Retirement } from '../credits/entities/retirement.entity';
 import { Proposal } from '../governance/entities/proposal.entity';
@@ -27,22 +27,6 @@ function mockRepo(overrides: Partial<MockRepo> = {}): MockRepo {
     create: jest.fn(),
     update: jest.fn(),
     ...overrides,
-  };
-}
-
-function makeRawEvent(overrides: {
-  id?: string;
-  ledger?: number;
-  contractId?: string;
-  topic?: unknown[];
-  value?: unknown;
-}) {
-  return {
-    id: overrides.id ?? 'ev-001',
-    ledger: overrides.ledger ?? 100,
-    contractId: overrides.contractId ?? 'CONTRACT1',
-    topic: overrides.topic ?? ['mint', 'GADDR...'],
-    value: overrides.value ?? { amount: 5000n },
   };
 }
 
