@@ -67,13 +67,17 @@ export class StellarService {
     args: xdr.ScVal[] = [],
   ): Promise<unknown> {
     const contract = new Contract(contractId);
-    const tx = new TransactionBuilder(
-      new Account(this.stellarClient.getSimulationKeypair().publicKey(), '0'),
-      {
-        fee: '100',
-        networkPassphrase: (await this.getNetwork()).passphrase,
-      },
-    )
+    const networkPassphrase = (await this.getNetwork()).passphrase;
+    const account = new Account(this.stellarClient.getSimulationKeypair().publicKey(), '0');
+    
+    let tx = new TransactionBuilder(account, { fee: '100', networkPassphrase })
+      .addOperation(contract.call(method, ...args))
+      .setTimeout(0)
+      .build();
+
+    const fee = await this.stellarClient.estimateFee(tx);
+
+    tx = new TransactionBuilder(account, { fee, networkPassphrase })
       .addOperation(contract.call(method, ...args))
       .setTimeout(0)
       .build();
@@ -100,10 +104,14 @@ export class StellarService {
     const account = await this.buildAccount(keypair);
 
     const contract = new Contract(contractId);
-    let tx = new TransactionBuilder(account, {
-      fee: '100',
-      networkPassphrase: network.passphrase,
-    })
+    let tx = new TransactionBuilder(account, { fee: '100', networkPassphrase: network.passphrase })
+      .addOperation(contract.call(method, ...args))
+      .setTimeout(30)
+      .build();
+
+    const fee = await this.stellarClient.estimateFee(tx);
+
+    tx = new TransactionBuilder(account, { fee, networkPassphrase: network.passphrase })
       .addOperation(contract.call(method, ...args))
       .setTimeout(30)
       .build();
@@ -167,10 +175,21 @@ export class StellarService {
     const account = await this.buildAccount(keypair);
 
     const contract = new Contract(tokenId);
-    let tx = new TransactionBuilder(account, {
-      fee: '100',
-      networkPassphrase: network.passphrase,
-    })
+    let tx = new TransactionBuilder(account, { fee: '100', networkPassphrase: network.passphrase })
+      .addOperation(
+        contract.call(
+          'retire',
+          nativeToScVal(amount.toFixed(0), { type: 'i128' }),
+          nativeToScVal(purpose, { type: 'string' }),
+          nativeToScVal(metadataUri, { type: 'string' }),
+        ),
+      )
+      .setTimeout(30)
+      .build();
+
+    const fee = await this.stellarClient.estimateFee(tx);
+
+    tx = new TransactionBuilder(account, { fee, networkPassphrase: network.passphrase })
       .addOperation(
         contract.call(
           'retire',
@@ -220,10 +239,21 @@ export class StellarService {
     const account = await this.buildAccount(keypair);
 
     const contract = new Contract(oracleContractId);
-    let tx = new TransactionBuilder(account, {
-      fee: '100',
-      networkPassphrase: network.passphrase,
-    })
+    let tx = new TransactionBuilder(account, { fee: '100', networkPassphrase: network.passphrase })
+      .addOperation(
+        contract.call(
+          'submit_reading',
+          nativeToScVal(projectId, { type: 'string' }),
+          nativeToScVal(reading.value, { type: 'i128' }),
+          nativeToScVal(nonce, { type: 'u32' }),
+        ),
+      )
+      .setTimeout(30)
+      .build();
+
+    const fee = await this.stellarClient.estimateFee(tx);
+
+    tx = new TransactionBuilder(account, { fee, networkPassphrase: network.passphrase })
       .addOperation(
         contract.call(
           'submit_reading',
