@@ -5,6 +5,7 @@ import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
 import { ConfigService } from '@nestjs/config';
 import { StellarClient } from '../stellar/stellar.client';
+import { IndexerService } from '../indexer/indexer.service';
 import {
   GLOBAL_SCHEDULE_SCOPE,
   OracleScheduleState,
@@ -44,6 +45,13 @@ export interface OracleHealth {
   detail?: string;
 }
 
+export interface IndexerHealth {
+  status: 'ok' | 'behind' | 'stopped';
+  lastIndexedLedger: number | null;
+  chainTipLedger: number | null;
+  lag: number | null;
+}
+
 export interface HealthReport {
   status: 'ok' | 'degraded' | 'down';
   timestamp: string;
@@ -53,6 +61,7 @@ export interface HealthReport {
     redis: ComponentHealth;
     stellar: ComponentHealth;
     oracle: OracleHealth;
+    indexer: IndexerHealth;
     queues: Record<string, QueueHealth>;
   };
 }
@@ -75,14 +84,16 @@ export class HealthService {
     private readonly scheduleStateRepo: Repository<OracleScheduleState>,
     private readonly configService: ConfigService,
     private readonly stellarClient: StellarClient,
+    private readonly indexerService: IndexerService,
   ) {}
 
   async getHealth(): Promise<HealthReport> {
-    const [database, redis, stellar, oracle, queues] = await Promise.all([
+    const [database, redis, stellar, oracle, indexer, queues] = await Promise.all([
       this.checkDatabase(),
       this.checkRedis(),
       this.checkStellar(),
       this.checkOracleFreshness(),
+      this.indexerService.getIndexerStatus(),
       this.checkQueues(),
     ]);
 
@@ -96,12 +107,16 @@ export class HealthService {
     } else if (allStatuses.some((s) => s === 'degraded')) {
       overallStatus = 'degraded';
     }
+    // 'behind' and 'stopped' indexer status degrade the report.
+    if (indexer.status !== 'ok') {
+      overallStatus = overallStatus === 'down' ? 'down' : 'degraded';
+    }
 
     return {
       status: overallStatus,
       timestamp: new Date().toISOString(),
       uptime_s: Math.floor((Date.now() - this.startTime) / 1000),
-      checks: { database, redis, stellar, oracle, queues },
+      checks: { database, redis, stellar, oracle, indexer, queues },
     };
   }
 

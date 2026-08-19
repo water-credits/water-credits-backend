@@ -310,12 +310,11 @@ export class StellarService {
     return response.events;
   }
 
-  async streamEvents(
-    filter: { contractIds: string[]; topics?: string[][] },
-    _callback: (event: unknown) => void,
-  ): Promise<void> {
-    this.logger.log(`Streaming events for contracts: ${filter.contractIds.join(', ')}`);
-    // In a real app, this would be a long-running process or a subscription
-    // For now, we'll just log it
-  }
+  // NOTE: Event streaming / indexing is handled by IndexerService
+  // (src/modules/indexer/indexer.service.ts), which polls server.getEvents()
+  // on a configurable interval and dispatches typed events to the relevant DB
+  // and WebSocket handlers.  The former stub streamEvents() has been removed.
+  //
+  // getEvents() below remains available for one-off queries (e.g. the oracle
+  // controller's manual trigger path).
 }

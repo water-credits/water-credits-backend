@@ -30,6 +30,6 @@ import { ProjectsModule } from '../projects/projects.module';
   ],
   controllers: [SensorsController],
   providers: [SensorsService, SensorsGateway, SensorsIngestionProcessor, ApiKeyGuard],
-  exports: [SensorsService, TypeOrmModule],
+  exports: [SensorsService, SensorsGateway, TypeOrmModule],
 })
 export class SensorsModule {}

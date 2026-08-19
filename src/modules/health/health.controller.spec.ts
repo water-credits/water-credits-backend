@@ -23,6 +23,7 @@ import {
 } from '../sensors/entities/reading-batch.entity';
 import { SensorReading } from '../sensors/entities/sensor-reading.entity';
 import { StellarService } from '../stellar/stellar.service';
+import { IndexerService } from '../indexer/indexer.service';
 
 /**
  * Outside-in proof for Issue #44.
@@ -177,6 +178,19 @@ describe('GET /health (oracle freshness + scheduler-added jobs)', () => {
             get: jest.fn((key: string, fallback?: unknown) =>
               key in configValues ? configValues[key] : fallback,
             ),
+          },
+        },
+        {
+          provide: IndexerService,
+          useValue: {
+            getIndexerStatus: jest.fn().mockResolvedValue({
+              status: 'ok',
+              lastIndexedLedger: 4241,
+              chainTipLedger: 4242,
+              lag: 1,
+            }),
+            onModuleInit: jest.fn(),
+            onModuleDestroy: jest.fn(),
           },
         },
       ],
