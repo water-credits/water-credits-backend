@@ -85,25 +85,25 @@ describe('UsersController', () => {
   });
 
   describe('updateRole', () => {
-    it('should call service.updateRole with id and dto', async () => {
+    it('should call service.updateRole with actorUserId, id and dto', async () => {
       const dto: UpdateRoleDto = { role: UserRole.ADMIN };
       const updated = { ...mockUser, role: UserRole.ADMIN };
       service.updateRole.mockResolvedValue(updated);
 
-      const result = await controller.updateRole('user-1', dto);
+      const result = await controller.updateRole('actor-1', 'user-1', dto);
 
-      expect(service.updateRole).toHaveBeenCalledWith('user-1', dto);
+      expect(service.updateRole).toHaveBeenCalledWith('actor-1', 'user-1', dto);
       expect(result).toEqual(updated);
     });
   });
 
   describe('deactivate', () => {
-    it('should call service.softDelete with the user id', async () => {
+    it('should call service.softDelete with the actor and target user ids', async () => {
       service.softDelete.mockResolvedValue(undefined);
 
-      const result = await controller.deactivate('user-1');
+      const result = await controller.deactivate('actor-1', 'user-1');
 
-      expect(service.softDelete).toHaveBeenCalledWith('user-1');
+      expect(service.softDelete).toHaveBeenCalledWith('actor-1', 'user-1');
       expect(result).toBeUndefined();
     });
   });

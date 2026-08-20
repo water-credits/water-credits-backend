@@ -46,15 +46,19 @@ export class UsersController {
   @Roles(UserRole.ADMIN)
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Change a user role' })
-  async updateRole(@Param('id') id: string, @Body() dto: UpdateRoleDto): Promise<User> {
-    return this.usersService.updateRole(id, dto);
+  async updateRole(
+    @CurrentUser('id') actorUserId: string,
+    @Param('id') id: string,
+    @Body() dto: UpdateRoleDto,
+  ): Promise<User> {
+    return this.usersService.updateRole(actorUserId, id, dto);
   }
 
   @Patch(':id/deactivate')
   @Roles(UserRole.ADMIN)
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Soft-delete (deactivate) a user' })
-  async deactivate(@Param('id') id: string): Promise<void> {
-    return this.usersService.softDelete(id);
+  async deactivate(@CurrentUser('id') actorUserId: string, @Param('id') id: string): Promise<void> {
+    return this.usersService.softDelete(actorUserId, id);
   }
 }
