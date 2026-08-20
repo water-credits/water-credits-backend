@@ -133,8 +133,7 @@ export class StellarClient {
     }
     const bumpedFee = bumpedFeeBN.toFixed(0, BigNumber.ROUND_CEIL);
 
-    // Provide feeAccount. It doesn't use sequence number.
-    const feeAccount = new Account(this.getKeypair().publicKey(), '0');
+    const feeAccount = this.getKeypair().publicKey();
     const nextTx = TransactionBuilder.buildFeeBumpTransaction(
       feeAccount,
       bumpedFee,
@@ -164,8 +163,8 @@ export class StellarClient {
       try {
         const sendResponse = await this.server.sendTransaction(currentTx);
         if (sendResponse.status === 'ERROR') {
-          const isInsufficientFee = sendResponse.errorResultXdr && 
-                                    this.isInsufficientFee(sendResponse.errorResultXdr);
+          const isInsufficientFee = sendResponse.errorResult && 
+                                    this.isInsufficientFee(sendResponse.errorResult);
           
           if (isInsufficientFee) {
             if (attempt > maxAttempts) {
@@ -197,10 +196,10 @@ export class StellarClient {
           }
 
           if (statusResponse.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
-            if (statusResponse.resultMetaXdr && this.isInsufficientFee(statusResponse.resultMetaXdr)) {
+            if (statusResponse.resultXdr && this.isInsufficientFee(statusResponse.resultXdr)) {
                 break;
             }
-            throw new Error(`Transaction failed: ${statusResponse.resultMetaXdr}`);
+            throw new Error(`Transaction failed: ${statusResponse.resultXdr}`);
           }
 
           await new Promise((resolve) => setTimeout(resolve, 2000));
@@ -211,9 +210,9 @@ export class StellarClient {
         if (statusResponse.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
             return { txHash, response: statusResponse };
         } else if (statusResponse.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
-             if (statusResponse.resultMetaXdr && this.isInsufficientFee(statusResponse.resultMetaXdr)) {
+             if (statusResponse.resultXdr && this.isInsufficientFee(statusResponse.resultXdr)) {
                  if (attempt > maxAttempts) {
-                     throw new Error(`Transaction failed: ${statusResponse.resultMetaXdr}`);
+                     throw new Error(`Transaction failed: ${statusResponse.resultXdr}`);
                  }
                  const { bumpedFee, nextTx } = this.createFeeBump(tx, currentTx, networkPassphrase, maxStroops);
                  this.logger.warn(`Fee bump retry`, {
