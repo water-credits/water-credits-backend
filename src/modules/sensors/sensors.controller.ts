@@ -84,8 +84,10 @@ export class SensorsController {
   @ApiOperation({ summary: 'Register a new sensor device' })
   async registerDevice(
     @Body() dto: RegisterDeviceDto,
+    @CurrentUser('id') userId: string,
+    @CurrentUser('role') role?: string,
   ): Promise<SensorDevice & { apiKeyPlaintext: string }> {
-    return this.sensorsService.registerDevice(dto.projectId, dto);
+    return this.sensorsService.registerDevice(dto.projectId, dto, userId, role);
   }
 
   @Get('devices')

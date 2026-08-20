@@ -67,7 +67,12 @@ export class SensorsService {
   async registerDevice(
     projectId: string,
     dto: RegisterDeviceDto,
+    userId: string,
+    role?: string,
   ): Promise<SensorDevice & { apiKeyPlaintext: string }> {
+    // Verify the caller owns the project (or holds a privileged role)
+    await this.projectAccess.assertProjectAccess(userId, role, projectId);
+
     const existing = await this.deviceRepo.findOne({ where: { deviceId: dto.deviceId } });
     if (existing) {
       throw new BadRequestException('Device with this deviceId already registered');

@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { getQueueToken } from '@nestjs/bull';
 import { DataSource } from 'typeorm';
@@ -10,6 +10,7 @@ import { SensorReading } from './entities/sensor-reading.entity';
 import { ReadingBatch, BatchStatus } from './entities/reading-batch.entity';
 import { CreateReadingDto } from './dto/create-reading.dto';
 import { SensorProjectAccessService } from './sensor-project-access.service';
+import { UserRole } from '../users/entities/user.entity';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -680,6 +681,7 @@ describe('SensorsService — registerDevice', () => {
     increment: jest.Mock;
     createQueryBuilder: jest.Mock;
   };
+  let projectAccessService: SensorProjectAccessService;
 
   let testKeypair: Keypair;
 
@@ -716,6 +718,15 @@ describe('SensorsService — registerDevice', () => {
       createQueryBuilder: jest.fn(),
     };
 
+    // Use a real SensorProjectAccessService backed by a mock ProjectsService
+    // so that the ownership check is exercised in registerDevice tests.
+    const mockProjectsService = {
+      findById: jest.fn().mockResolvedValue({ id: 'proj-1', ownerId: 'owner-1' }),
+    };
+    projectAccessService = new SensorProjectAccessService(
+      mockProjectsService as unknown as import('../projects/projects.service').ProjectsService,
+    );
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         SensorsService,
@@ -726,7 +737,7 @@ describe('SensorsService — registerDevice', () => {
         { provide: DataSource, useValue: makeMockDataSource() },
         {
           provide: SensorProjectAccessService,
-          useValue: { assertProjectAccess: jest.fn(), requirePrivilegedRole: jest.fn() },
+          useValue: projectAccessService,
         },
       ],
     }).compile();
@@ -764,7 +775,7 @@ describe('SensorsService — registerDevice', () => {
 
     // publicKey is set per test using real keypair
     const dto = { ...BASE_DTO, publicKey: testKeypair.publicKey() };
-    const result = await service.registerDevice('proj-1', dto as never);
+    const result = await service.registerDevice('proj-1', dto as never, 'owner-1', 'farmer');
 
     expect(deviceRepo.save).toHaveBeenCalled();
     expect(result.apiKeyPlaintext).toBeDefined();
@@ -776,10 +787,10 @@ describe('SensorsService — registerDevice', () => {
     deviceRepo.findOne.mockResolvedValue(existing);
 
     const dto = { ...BASE_DTO, publicKey: testKeypair.publicKey() };
-    await expect(service.registerDevice('proj-1', dto as never)).rejects.toThrow(
+    await expect(service.registerDevice('proj-1', dto as never, 'owner-1', 'farmer')).rejects.toThrow(
       BadRequestException,
     );
-    await expect(service.registerDevice('proj-1', dto as never)).rejects.toThrow(
+    await expect(service.registerDevice('proj-1', dto as never, 'owner-1', 'farmer')).rejects.toThrow(
       'already registered',
     );
   });
@@ -788,7 +799,7 @@ describe('SensorsService — registerDevice', () => {
     const devices = [{ id: 'dev-1', projectId: 'proj-1' }] as SensorDevice[];
     deviceRepo.find.mockResolvedValue(devices);
 
-    const result = await service.getDevices('proj-1', 'user-1', 'farmer');
+    const result = await service.getDevices('proj-1', 'owner-1', 'farmer');
     expect(result).toEqual(devices);
     expect(deviceRepo.find).toHaveBeenCalledWith({ where: { projectId: 'proj-1' } });
   });
@@ -803,10 +814,10 @@ describe('SensorsService — registerDevice', () => {
   });
 
   it('getDeviceById returns device when found', async () => {
-    const device = { id: 'device-uuid-1', deviceId: 'dev-001' } as SensorDevice;
+    const device = { id: 'device-uuid-1', deviceId: 'dev-001', projectId: 'proj-1' } as SensorDevice;
     deviceRepo.findOne.mockResolvedValue(device);
 
-    const result = await service.getDeviceById('device-uuid-1', 'user-1', 'farmer');
+    const result = await service.getDeviceById('device-uuid-1', 'owner-1', 'farmer');
     expect(result).toEqual(device);
   });
 
@@ -815,6 +826,72 @@ describe('SensorsService — registerDevice', () => {
     await expect(service.getDeviceById('nonexistent', 'user-1', 'farmer')).rejects.toThrow(
       NotFoundException,
     );
+  });
+
+  // ── Security: project ownership gate on registerDevice ──────────────────
+
+  it('rejects registerDevice when caller does not own the project (User A vs User B)', async () => {
+    // projectAccessService is backed by a mock ProjectsService that returns
+    // { id: 'proj-1', ownerId: 'owner-1' }.  Calling as 'user-b' (farmer)
+    // must throw ForbiddenException.
+    const dto = { ...BASE_DTO, publicKey: testKeypair.publicKey() };
+    await expect(
+      service.registerDevice('proj-1', dto as never, 'user-b', UserRole.FARMER),
+    ).rejects.toThrow(ForbiddenException);
+  });
+
+  it('allows registerDevice when caller is the project owner', async () => {
+    // The mock ProjectsService returns ownerId: 'owner-1'.
+    deviceRepo.findOne.mockResolvedValue(null);
+    const savedDevice: SensorDevice = {
+      id: 'device-uuid-new',
+      projectId: 'proj-1',
+      deviceId: 'dev-new-001',
+      manufacturer: 'YSI',
+      model: 'ProDSS',
+      publicKey: testKeypair.publicKey(),
+      parameters: null,
+      apiKeyHash: 'hashed',
+      isActive: true,
+      lastReadingAt: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      project: null as never,
+    };
+    deviceRepo.create.mockReturnValue(savedDevice);
+    deviceRepo.save.mockResolvedValue(savedDevice);
+
+    const dto = { ...BASE_DTO, publicKey: testKeypair.publicKey() };
+    const result = await service.registerDevice('proj-1', dto as never, 'owner-1', UserRole.FARMER);
+
+    expect(result.apiKeyPlaintext).toBeDefined();
+  });
+
+  it('allows registerDevice when caller has a privileged role (admin)', async () => {
+    deviceRepo.findOne.mockResolvedValue(null);
+    const savedDevice: SensorDevice = {
+      id: 'device-uuid-new',
+      projectId: 'proj-1',
+      deviceId: 'dev-new-001',
+      manufacturer: 'YSI',
+      model: 'ProDSS',
+      publicKey: testKeypair.publicKey(),
+      parameters: null,
+      apiKeyHash: 'hashed',
+      isActive: true,
+      lastReadingAt: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      project: null as never,
+    };
+    deviceRepo.create.mockReturnValue(savedDevice);
+    deviceRepo.save.mockResolvedValue(savedDevice);
+
+    const dto = { ...BASE_DTO, publicKey: testKeypair.publicKey() };
+    // 'other-user' is not the owner, but admin role is privileged → allowed
+    const result = await service.registerDevice('proj-1', dto as never, 'other-user', UserRole.ADMIN);
+
+    expect(result.apiKeyPlaintext).toBeDefined();
   });
 });
 

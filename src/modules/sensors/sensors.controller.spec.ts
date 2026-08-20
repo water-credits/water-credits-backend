@@ -279,4 +279,17 @@ describe('SensorsController – ingestReading wiring', () => {
 
     expect(getReadings).toHaveBeenCalledWith(query, 'user-a', 'farmer');
   });
+
+  it('passes userId and role to registerDevice for project ownership check', async () => {
+    const registerDevice = (controller as unknown as { sensorsService: { registerDevice: jest.Mock } })
+      .sensorsService.registerDevice;
+    const deviceResult = { id: 'dev-1', apiKeyPlaintext: 'wc_x_y' };
+    registerDevice.mockResolvedValue(deviceResult);
+
+    const dto = { projectId: 'proj-1', deviceId: 'dev-001', manufacturer: 'YSI', model: 'ProDSS', publicKey: 'G'.padEnd(56, 'A'), parameters: ['ph'] } as never;
+    const result = await controller.registerDevice(dto, 'user-a', 'farmer');
+
+    expect(registerDevice).toHaveBeenCalledWith('proj-1', dto, 'user-a', 'farmer');
+    expect(result).toBe(deviceResult);
+  });
 });
