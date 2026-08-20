@@ -21,6 +21,7 @@ import { SensorReading } from './entities/sensor-reading.entity';
 import { SensorDevice } from './entities/sensor-device.entity';
 import { PaginatedResponseDto } from '../../common/dto/api-response.dto';
 import { ThrottleSensor } from '../../common/decorators/throttle.decorator';
+import { CurrentUser } from '../../common/decorators/current-user.decorator';
 
 @ApiTags('sensors')
 @ApiBearerAuth()
@@ -51,17 +52,21 @@ export class SensorsController {
   @ApiOperation({ summary: 'List sensor readings (paginated)' })
   async getReadings(
     @Query() query: QueryReadingsDto,
+    @CurrentUser('id') userId: string,
+    @CurrentUser('role') role?: string,
   ): Promise<PaginatedResponseDto<SensorReading>> {
-    const { data, total, page, limit } = await this.sensorsService.getReadings(query);
+    const { data, total, page, limit } = await this.sensorsService.getReadings(query, userId, role);
     return PaginatedResponseDto.from(data, total, page, limit);
   }
 
   @Get('readings/latest')
   @ApiOperation({ summary: 'Get the latest reading (optionally per device)' })
   async getLatestReading(
+    @CurrentUser('id') userId: string,
+    @CurrentUser('role') role: string | undefined,
     @Query('deviceId') deviceId?: string,
   ): Promise<SensorReading | SensorReading[]> {
-    return this.sensorsService.getLatestReading(deviceId);
+    return this.sensorsService.getLatestReading(userId, role, deviceId);
   }
 
   @Get('readings/summary')
@@ -85,13 +90,21 @@ export class SensorsController {
 
   @Get('devices')
   @ApiOperation({ summary: 'List sensor devices (optionally per project)' })
-  async getDevices(@Query('projectId') projectId?: string): Promise<SensorDevice[]> {
-    return this.sensorsService.getDevices(projectId);
+  async getDevices(
+    @Query('projectId') projectId: string | undefined,
+    @CurrentUser('id') userId: string,
+    @CurrentUser('role') role?: string,
+  ): Promise<SensorDevice[]> {
+    return this.sensorsService.getDevices(projectId, userId, role);
   }
 
   @Get('devices/:id')
   @ApiOperation({ summary: 'Get a sensor device by ID' })
-  async getDeviceById(@Param('id') id: string): Promise<SensorDevice> {
-    return this.sensorsService.getDeviceById(id);
+  async getDeviceById(
+    @Param('id') id: string,
+    @CurrentUser('id') userId: string,
+    @CurrentUser('role') role?: string,
+  ): Promise<SensorDevice> {
+    return this.sensorsService.getDeviceById(id, userId, role);
   }
 }

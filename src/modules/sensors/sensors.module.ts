@@ -4,6 +4,7 @@ import { BullModule } from '@nestjs/bull';
 import { SensorsController } from './sensors.controller';
 import { SensorsService } from './sensors.service';
 import { SensorsGateway } from './sensors.gateway';
+import { SensorProjectAccessService } from './sensor-project-access.service';
 import { SensorsIngestionProcessor } from './sensors-ingestion.processor';
 import { SensorDevice } from './entities/sensor-device.entity';
 import { SensorReading } from './entities/sensor-reading.entity';
@@ -29,7 +30,13 @@ import { ProjectsModule } from '../projects/projects.module';
     }),
   ],
   controllers: [SensorsController],
-  providers: [SensorsService, SensorsGateway, SensorsIngestionProcessor, ApiKeyGuard],
+  providers: [
+    SensorsService,
+    SensorsGateway,
+    SensorProjectAccessService,
+    SensorsIngestionProcessor,
+    ApiKeyGuard,
+  ],
   exports: [SensorsService, SensorsGateway, TypeOrmModule],
 })
 export class SensorsModule {}

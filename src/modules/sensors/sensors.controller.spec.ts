@@ -268,4 +268,15 @@ describe('SensorsController – ingestReading wiring', () => {
   it('AC11 – controller has no ConfigService dependency (global key removed)', () => {
     expect((controller as unknown as Record<string, unknown>).configService).toBeUndefined();
   });
+
+  it('passes the authenticated user context to protected sensor reads', async () => {
+    const query = { projectId: 'project-a' } as never;
+    const getReadings = (controller as unknown as { sensorsService: { getReadings: jest.Mock } })
+      .sensorsService.getReadings;
+    getReadings.mockResolvedValue({ data: [], total: 0, page: 1, limit: 20 });
+
+    await controller.getReadings(query, 'user-a', 'farmer');
+
+    expect(getReadings).toHaveBeenCalledWith(query, 'user-a', 'farmer');
+  });
 });

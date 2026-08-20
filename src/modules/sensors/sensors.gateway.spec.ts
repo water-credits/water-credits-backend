@@ -2,8 +2,8 @@ import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { Socket } from 'socket.io';
 import { SensorsGateway } from './sensors.gateway';
-import { ProjectsService } from '../projects/projects.service';
 import { UserRole } from '../users/entities/user.entity';
+import { SensorProjectAccessService } from './sensor-project-access.service';
 
 function mockSocket(overrides: Partial<Socket> = {}): Socket {
   return {
@@ -22,12 +22,12 @@ function mockSocket(overrides: Partial<Socket> = {}): Socket {
 describe('SensorsGateway', () => {
   let gateway: SensorsGateway;
   let jwtService: { verifyAsync: jest.Mock };
-  let projectsService: { findById: jest.Mock };
+  let projectAccess: { canAccessProject: jest.Mock };
   let configService: { get: jest.Mock };
 
   beforeEach(() => {
     jwtService = { verifyAsync: jest.fn() };
-    projectsService = { findById: jest.fn() };
+    projectAccess = { canAccessProject: jest.fn() };
     configService = {
       get: jest.fn((key: string, defaultVal?: unknown) => {
         const values: Record<string, unknown> = {
@@ -40,7 +40,7 @@ describe('SensorsGateway', () => {
     };
     gateway = new SensorsGateway(
       jwtService as unknown as JwtService,
-      projectsService as unknown as ProjectsService,
+      projectAccess as unknown as SensorProjectAccessService,
       configService as unknown as ConfigService,
     );
     // afterInit is NOT called in unit tests — Redis clients are never created.
@@ -94,7 +94,7 @@ describe('SensorsGateway', () => {
     }
 
     it('allows the project owner to subscribe', async () => {
-      projectsService.findById.mockResolvedValue({ id: 'p1', ownerId: 'user-1' });
+      projectAccess.canAccessProject.mockResolvedValue(true);
       const client = await connectedClient('user-1', UserRole.FARMER);
 
       await gateway.handleSubscribeProject(client, 'p1');
@@ -104,7 +104,7 @@ describe('SensorsGateway', () => {
     });
 
     it('denies a non-owner farmer from subscribing', async () => {
-      projectsService.findById.mockResolvedValue({ id: 'p1', ownerId: 'someone-else' });
+      projectAccess.canAccessProject.mockResolvedValue(false);
       const client = await connectedClient('user-1', UserRole.FARMER);
 
       await gateway.handleSubscribeProject(client, 'p1');
@@ -117,16 +117,17 @@ describe('SensorsGateway', () => {
     });
 
     it('allows privileged roles (admin/verifier/oracle) regardless of ownership', async () => {
+      projectAccess.canAccessProject.mockResolvedValue(true);
       const client = await connectedClient('admin-1', UserRole.ADMIN);
 
       await gateway.handleSubscribeProject(client, 'p1');
 
-      expect(projectsService.findById).not.toHaveBeenCalled();
+      expect(projectAccess.canAccessProject).toHaveBeenCalledWith('admin-1', UserRole.ADMIN, 'p1');
       expect(client.join).toHaveBeenCalledWith('project:p1');
     });
 
     it('denies subscription when the project does not exist', async () => {
-      projectsService.findById.mockRejectedValue(new Error('not found'));
+      projectAccess.canAccessProject.mockResolvedValue(false);
       const client = await connectedClient('user-1', UserRole.FARMER);
 
       await gateway.handleSubscribeProject(client, 'missing-project');

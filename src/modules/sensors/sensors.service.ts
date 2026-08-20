@@ -9,6 +9,7 @@ import { CreateReadingDto } from './dto/create-reading.dto';
 import { QueryReadingsDto } from './dto/query-readings.dto';
 import { RegisterDeviceDto } from './dto/register-device.dto';
 import { generateDeviceApiKey } from '../../common/utils/api-key.util';
+import { SensorProjectAccessService } from './sensor-project-access.service';
 
 interface ParameterRange {
   min: number;
@@ -56,6 +57,7 @@ export class SensorsService {
     @InjectRepository(ReadingBatch)
     private readonly batchRepo: Repository<ReadingBatch>,
     private readonly dataSource: DataSource,
+    private readonly projectAccess: SensorProjectAccessService,
   ) {}
 
   async registerDevice(
@@ -91,18 +93,29 @@ export class SensorsService {
     return Object.assign(saved, { apiKeyPlaintext: plaintext });
   }
 
-  async getDevices(projectId?: string): Promise<SensorDevice[]> {
+  async getDevices(
+    projectId: string | undefined,
+    userId: string,
+    role: string | undefined,
+  ): Promise<SensorDevice[]> {
     if (projectId) {
+      await this.projectAccess.assertProjectAccess(userId, role, projectId);
       return this.deviceRepo.find({ where: { projectId } });
     }
+    this.projectAccess.requirePrivilegedRole(role);
     return this.deviceRepo.find({ order: { createdAt: 'DESC' } });
   }
 
-  async getDeviceById(deviceId: string): Promise<SensorDevice> {
+  async getDeviceById(
+    deviceId: string,
+    userId: string,
+    role: string | undefined,
+  ): Promise<SensorDevice> {
     const device = await this.deviceRepo.findOne({ where: { id: deviceId } });
     if (!device) {
       throw new NotFoundException('Sensor device not found');
     }
+    await this.projectAccess.assertProjectAccess(userId, role, device.projectId);
     return device;
   }
 
@@ -270,13 +283,26 @@ export class SensorsService {
     return batch;
   }
 
-  async getReadings(query: QueryReadingsDto): Promise<{
+  async getReadings(
+    query: QueryReadingsDto,
+    userId: string,
+    role: string | undefined,
+  ): Promise<{
     data: SensorReading[];
     total: number;
     page: number;
     limit: number;
   }> {
     const qb = this.readingRepo.createQueryBuilder('reading');
+
+    if (query.projectId) {
+      await this.projectAccess.assertProjectAccess(userId, role, query.projectId);
+    } else if (query.deviceId) {
+      const device = await this.getDeviceByDeviceId(query.deviceId);
+      await this.projectAccess.assertProjectAccess(userId, role, device.projectId);
+    } else {
+      this.projectAccess.requirePrivilegedRole(role);
+    }
 
     if (query.deviceId) {
       qb.andWhere('reading.device_id = :deviceId', { deviceId: query.deviceId });
@@ -308,9 +334,14 @@ export class SensorsService {
    * it with one index scan on (device_id, timestamp DESC) and returns exactly
    * one row per device regardless of fleet size.
    */
-  async getLatestReading(deviceId?: string): Promise<SensorReading | SensorReading[]> {
+  async getLatestReading(
+    userId: string,
+    role: string | undefined,
+    deviceId?: string,
+  ): Promise<SensorReading | SensorReading[]> {
     if (deviceId) {
       const device = await this.getDeviceByDeviceId(deviceId);
+      await this.projectAccess.assertProjectAccess(userId, role, device.projectId);
       const reading = await this.readingRepo.findOne({
         where: { deviceId: device.id },
         order: { timestamp: 'DESC' },
@@ -320,6 +351,8 @@ export class SensorsService {
       }
       return reading;
     }
+
+    this.projectAccess.requirePrivilegedRole(role);
 
     // Single-query path: DISTINCT ON picks the row with the greatest timestamp
     // for each device_id.  TypeORM's QueryBuilder has no native DISTINCT ON

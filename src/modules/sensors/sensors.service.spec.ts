@@ -8,6 +8,7 @@ import { SensorDevice } from './entities/sensor-device.entity';
 import { SensorReading } from './entities/sensor-reading.entity';
 import { ReadingBatch, BatchStatus } from './entities/reading-batch.entity';
 import { CreateReadingDto } from './dto/create-reading.dto';
+import { SensorProjectAccessService } from './sensor-project-access.service';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -105,6 +106,10 @@ describe('SensorsService', () => {
         { provide: getRepositoryToken(SensorReading), useValue: readingRepo },
         { provide: getRepositoryToken(ReadingBatch), useValue: batchRepo },
         { provide: DataSource, useValue: dataSource },
+        {
+          provide: SensorProjectAccessService,
+          useValue: { assertProjectAccess: jest.fn(), requirePrivilegedRole: jest.fn() },
+        },
       ],
     }).compile();
 
@@ -516,7 +521,7 @@ describe('SensorsService', () => {
       deviceRepo.findOne.mockResolvedValue(fakeDevice as SensorDevice);
       readingRepo.findOne.mockResolvedValue(fakeReading as SensorReading);
 
-      const result = await service.getLatestReading('dev-001');
+      const result = await service.getLatestReading('user-1', 'farmer', 'dev-001');
 
       expect(result).toEqual(fakeReading);
       expect(readingRepo.findOne).toHaveBeenCalledTimes(1);
@@ -533,7 +538,9 @@ describe('SensorsService', () => {
       deviceRepo.findOne.mockResolvedValue(fakeDevice as SensorDevice);
       readingRepo.findOne.mockResolvedValue(null);
 
-      await expect(service.getLatestReading('dev-001')).rejects.toThrow(NotFoundException);
+      await expect(service.getLatestReading('user-1', 'farmer', 'dev-001')).rejects.toThrow(
+        NotFoundException,
+      );
     });
 
     it('getLatestReading() without deviceId should fetch all latest readings in a single query instead of one findOne per device', async () => {
@@ -585,7 +592,7 @@ describe('SensorsService', () => {
       // readingRepo.create maps each row to a typed entity.
       readingRepo.create.mockImplementation((d) => d as SensorReading);
 
-      const result = (await service.getLatestReading()) as SensorReading[];
+      const result = (await service.getLatestReading('admin-1', 'admin')) as SensorReading[];
 
       // ── Assertion 1: single DB round-trip ──
       expect(dataSource.query).toHaveBeenCalledTimes(1);
@@ -606,7 +613,7 @@ describe('SensorsService', () => {
       dataSource.query.mockResolvedValueOnce([]);
       readingRepo.create.mockImplementation((d) => d as SensorReading);
 
-      const result = (await service.getLatestReading()) as SensorReading[];
+      const result = (await service.getLatestReading('admin-1', 'admin')) as SensorReading[];
 
       expect(dataSource.query).toHaveBeenCalledTimes(1);
       expect(result).toHaveLength(0);
@@ -690,6 +697,10 @@ describe('SensorsService — registerDevice', () => {
         { provide: getRepositoryToken(SensorReading), useValue: readingRepo },
         { provide: getRepositoryToken(ReadingBatch), useValue: batchRepo },
         { provide: DataSource, useValue: makeMockDataSource() },
+        {
+          provide: SensorProjectAccessService,
+          useValue: { assertProjectAccess: jest.fn(), requirePrivilegedRole: jest.fn() },
+        },
       ],
     }).compile();
 
@@ -750,7 +761,7 @@ describe('SensorsService — registerDevice', () => {
     const devices = [{ id: 'dev-1', projectId: 'proj-1' }] as SensorDevice[];
     deviceRepo.find.mockResolvedValue(devices);
 
-    const result = await service.getDevices('proj-1');
+    const result = await service.getDevices('proj-1', 'user-1', 'farmer');
     expect(result).toEqual(devices);
     expect(deviceRepo.find).toHaveBeenCalledWith({ where: { projectId: 'proj-1' } });
   });
@@ -759,7 +770,7 @@ describe('SensorsService — registerDevice', () => {
     const devices = [{ id: 'dev-1' }, { id: 'dev-2' }] as SensorDevice[];
     deviceRepo.find.mockResolvedValue(devices);
 
-    const result = await service.getDevices();
+    const result = await service.getDevices(undefined, 'admin-1', 'admin');
     expect(result).toHaveLength(2);
     expect(deviceRepo.find).toHaveBeenCalledWith({ order: { createdAt: 'DESC' } });
   });
@@ -768,13 +779,15 @@ describe('SensorsService — registerDevice', () => {
     const device = { id: 'device-uuid-1', deviceId: 'dev-001' } as SensorDevice;
     deviceRepo.findOne.mockResolvedValue(device);
 
-    const result = await service.getDeviceById('device-uuid-1');
+    const result = await service.getDeviceById('device-uuid-1', 'user-1', 'farmer');
     expect(result).toEqual(device);
   });
 
   it('getDeviceById throws NotFoundException when device is not found', async () => {
     deviceRepo.findOne.mockResolvedValue(null);
-    await expect(service.getDeviceById('nonexistent')).rejects.toThrow(NotFoundException);
+    await expect(service.getDeviceById('nonexistent', 'user-1', 'farmer')).rejects.toThrow(
+      NotFoundException,
+    );
   });
 });
 
@@ -808,6 +821,10 @@ describe('SensorsService — getReadings', () => {
         { provide: getRepositoryToken(SensorReading), useValue: readingRepo },
         { provide: getRepositoryToken(ReadingBatch), useValue: batchRepo },
         { provide: DataSource, useValue: makeMockDataSource() },
+        {
+          provide: SensorProjectAccessService,
+          useValue: { assertProjectAccess: jest.fn(), requirePrivilegedRole: jest.fn() },
+        },
       ],
     }).compile();
 
@@ -818,7 +835,11 @@ describe('SensorsService — getReadings', () => {
     const qb = makeQb();
     readingRepo.createQueryBuilder.mockReturnValue(qb);
 
-    const result = await service.getReadings({ skip: 0, limit: 20, page: 1 } as never);
+    const result = await service.getReadings(
+      { skip: 0, limit: 20, page: 1 } as never,
+      'admin-1',
+      'admin',
+    );
 
     expect(qb.getManyAndCount).toHaveBeenCalled();
     expect(result.page).toBe(1);
@@ -828,8 +849,17 @@ describe('SensorsService — getReadings', () => {
   it('filters by deviceId when provided', async () => {
     const qb = makeQb();
     readingRepo.createQueryBuilder.mockReturnValue(qb);
+    deviceRepo.findOne.mockResolvedValue({
+      id: 'device-1',
+      deviceId: 'dev-001',
+      projectId: 'proj-1',
+    } as SensorDevice);
 
-    await service.getReadings({ deviceId: 'dev-001', skip: 0, limit: 20, page: 1 } as never);
+    await service.getReadings(
+      { deviceId: 'dev-001', skip: 0, limit: 20, page: 1 } as never,
+      'user-1',
+      'farmer',
+    );
 
     expect(qb.andWhere).toHaveBeenCalledWith(
       expect.stringContaining('device_id'),
@@ -841,7 +871,11 @@ describe('SensorsService — getReadings', () => {
     const qb = makeQb();
     readingRepo.createQueryBuilder.mockReturnValue(qb);
 
-    await service.getReadings({ projectId: 'proj-1', skip: 0, limit: 20, page: 1 } as never);
+    await service.getReadings(
+      { projectId: 'proj-1', skip: 0, limit: 20, page: 1 } as never,
+      'user-1',
+      'farmer',
+    );
 
     expect(qb.andWhere).toHaveBeenCalledWith(
       expect.stringContaining('project_id'),
@@ -853,13 +887,17 @@ describe('SensorsService — getReadings', () => {
     const qb = makeQb();
     readingRepo.createQueryBuilder.mockReturnValue(qb);
 
-    await service.getReadings({
-      startDate: '2026-01-01',
-      endDate: '2026-12-31',
-      skip: 0,
-      limit: 20,
-      page: 1,
-    } as never);
+    await service.getReadings(
+      {
+        startDate: '2026-01-01',
+        endDate: '2026-12-31',
+        skip: 0,
+        limit: 20,
+        page: 1,
+      } as never,
+      'admin-1',
+      'admin',
+    );
 
     expect(qb.andWhere).toHaveBeenCalledTimes(2);
   });
@@ -883,6 +921,10 @@ describe('SensorsService — getAggregatedSummary', () => {
         { provide: getRepositoryToken(SensorReading), useValue: readingRepo },
         { provide: getRepositoryToken(ReadingBatch), useValue: batchRepo },
         { provide: DataSource, useValue: makeMockDataSource() },
+        {
+          provide: SensorProjectAccessService,
+          useValue: { assertProjectAccess: jest.fn(), requirePrivilegedRole: jest.fn() },
+        },
       ],
     }).compile();
 
@@ -971,6 +1013,10 @@ describe('SensorsService — validateParameters unknown key', () => {
         { provide: getRepositoryToken(SensorReading), useValue: readingRepo },
         { provide: getRepositoryToken(ReadingBatch), useValue: batchRepo },
         { provide: DataSource, useValue: dataSource },
+        {
+          provide: SensorProjectAccessService,
+          useValue: { assertProjectAccess: jest.fn(), requirePrivilegedRole: jest.fn() },
+        },
       ],
     }).compile();
 

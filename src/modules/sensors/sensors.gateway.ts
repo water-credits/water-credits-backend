@@ -15,13 +15,9 @@ import { ConfigService } from '@nestjs/config';
 import Redis from 'ioredis';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { verifyWsToken } from '../../common/websockets/ws-jwt.util';
-import { ProjectsService } from '../projects/projects.service';
-import { UserRole } from '../users/entities/user.entity';
+import { SensorProjectAccessService } from './sensor-project-access.service';
 
 const PROJECT_PREFIX = 'project:';
-
-// Roles that may observe any project's sensor stream regardless of ownership.
-const PRIVILEGED_ROLES = new Set<string>([UserRole.ADMIN, UserRole.VERIFIER, UserRole.ORACLE]);
 
 @WebSocketGateway({
   namespace: '/sensors',
@@ -44,7 +40,7 @@ export class SensorsGateway
 
   constructor(
     private readonly jwtService: JwtService,
-    private readonly projectsService: ProjectsService,
+    private readonly projectAccess: SensorProjectAccessService,
     private readonly configService: ConfigService,
   ) {}
 
@@ -125,20 +121,10 @@ export class SensorsGateway
   // Project owners always have access; admins/verifiers/oracles may observe
   // any project. Everyone else is denied.
   private async canAccessProject(client: Socket, projectId: string): Promise<boolean> {
-    const userId = client.data.userId as string | undefined;
-    const role = client.data.role as string | undefined;
-    if (!userId) {
-      return false;
-    }
-    if (role && PRIVILEGED_ROLES.has(role)) {
-      return true;
-    }
-
-    try {
-      const project = await this.projectsService.findById(projectId);
-      return project.ownerId === userId;
-    } catch {
-      return false;
-    }
+    return this.projectAccess.canAccessProject(
+      client.data.userId as string | undefined,
+      client.data.role as string | undefined,
+      projectId,
+    );
   }
 }
