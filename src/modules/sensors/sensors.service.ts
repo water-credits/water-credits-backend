@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { Keypair } from '@stellar/stellar-sdk';
 import { SensorDevice } from './entities/sensor-device.entity';
 import { SensorReading } from './entities/sensor-reading.entity';
@@ -55,6 +55,7 @@ export class SensorsService {
     private readonly readingRepo: Repository<SensorReading>,
     @InjectRepository(ReadingBatch)
     private readonly batchRepo: Repository<ReadingBatch>,
+    private readonly dataSource: DataSource,
   ) {}
 
   async registerDevice(
@@ -187,23 +188,86 @@ export class SensorsService {
     }
   }
 
+  /**
+   * Return the current open PENDING batch for the given project, creating one
+   * if none exists within the active collection window.
+   *
+   * Race-safety: two concurrent callers for the same project must never produce
+   * more than one PENDING row.  We achieve this with a two-phase approach:
+   *
+   *   1. Attempt an INSERT … ON CONFLICT (project_id) WHERE status = 'pending'
+   *      DO NOTHING.  The partial unique index added in migration 012 makes the
+   *      conflict target precise.  Exactly one concurrent caller wins the INSERT;
+   *      the rest get 0 rows from RETURNING and fall through to the SELECT.
+   *
+   *   2. SELECT the PENDING batch (either the one just inserted or the one that
+   *      already existed).  This second read is guaranteed to find exactly one
+   *      row because the unique index prevents duplicates.
+   *
+   * If the PENDING batch that is already in the table is older than the 15-minute
+   * collection window, we close it (set status = 'submitted' so the oracle
+   * scheduler picks it up) before inserting a fresh one.  The window-expiry
+   * check + status flip is wrapped in a single UPDATE … WHERE to avoid a
+   * separate round-trip.
+   */
   private async resolveBatch(projectId: string): Promise<ReadingBatch> {
     const cutoff = new Date(Date.now() - BATCH_WINDOW_MS);
-    const pending = await this.batchRepo.findOne({
-      where: { projectId, status: BatchStatus.PENDING },
-      order: { createdAt: 'DESC' },
-    });
 
-    if (pending && pending.createdAt >= cutoff) {
-      return pending;
-    }
+    // Close any stale PENDING batch for this project atomically before we try
+    // to create a new one.  If none is stale (or none exists at all), 0 rows
+    // are updated and we proceed straight to the INSERT attempt.
+    await this.dataSource.query<void>(
+      `UPDATE reading_batches
+          SET status     = $1,
+              updated_at = NOW()
+        WHERE project_id = $2
+          AND status     = $3
+          AND created_at < $4`,
+      [BatchStatus.SUBMITTED, projectId, BatchStatus.PENDING, cutoff],
+    );
 
+    // Attempt to insert a fresh PENDING batch.  The partial unique index on
+    // (project_id) WHERE status = 'pending' turns a concurrent duplicate INSERT
+    // into a no-op (DO NOTHING), so only one row is ever created.
+    await this.dataSource.query<void>(
+      `INSERT INTO reading_batches (project_id, status, reading_count)
+       VALUES ($1, $2, 0)
+       ON CONFLICT (project_id) WHERE status = 'pending'
+       DO NOTHING`,
+      [projectId, BatchStatus.PENDING],
+    );
+
+    // At this point exactly one PENDING batch exists for this project.
+    // Map the raw row back through the entity so callers receive a typed object.
+    const rows = await this.dataSource.query<
+      {
+        id: string;
+        project_id: string;
+        status: string;
+        reading_count: number;
+        created_at: Date;
+        updated_at: Date;
+      }[]
+    >(
+      `SELECT id, project_id, status, reading_count, created_at, updated_at
+         FROM reading_batches
+        WHERE project_id = $1
+          AND status     = $2
+        LIMIT 1`,
+      [projectId, BatchStatus.PENDING],
+    );
+
+    // Map snake_case columns back to the entity shape expected by callers.
+    const row = rows[0];
     const batch = this.batchRepo.create({
-      projectId,
-      status: BatchStatus.PENDING,
-      readingCount: 0,
+      id: row.id,
+      projectId: row.project_id,
+      status: row.status as BatchStatus,
+      readingCount: row.reading_count,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
     });
-    return this.batchRepo.save(batch);
+    return batch;
   }
 
   async getReadings(query: QueryReadingsDto): Promise<{
@@ -234,6 +298,16 @@ export class SensorsService {
     return { data, total, page: query.page ?? 1, limit: query.limit ?? 20 };
   }
 
+  /**
+   * Return the latest reading for a specific device (when `deviceId` is
+   * provided) or the latest reading per device across the whole fleet (when
+   * `deviceId` is omitted).
+   *
+   * The no-deviceId path previously issued one `findOne` per device (N+1).
+   * It is now a single `DISTINCT ON (device_id)` query — PostgreSQL resolves
+   * it with one index scan on (device_id, timestamp DESC) and returns exactly
+   * one row per device regardless of fleet size.
+   */
   async getLatestReading(deviceId?: string): Promise<SensorReading | SensorReading[]> {
     if (deviceId) {
       const device = await this.getDeviceByDeviceId(deviceId);
@@ -247,18 +321,68 @@ export class SensorsService {
       return reading;
     }
 
-    const devices = await this.deviceRepo.find({ order: { createdAt: 'DESC' } });
-    const readings: SensorReading[] = [];
-    for (const device of devices) {
-      const reading = await this.readingRepo.findOne({
-        where: { deviceId: device.id },
-        order: { timestamp: 'DESC' },
-      });
-      if (reading) {
-        readings.push(reading);
-      }
-    }
-    return readings;
+    // Single-query path: DISTINCT ON picks the row with the greatest timestamp
+    // for each device_id.  TypeORM's QueryBuilder has no native DISTINCT ON
+    // support (it is PostgreSQL-specific), so we use a typed raw query and
+    // map the snake_case result back to SensorReading instances.
+    const rows = await this.dataSource.query<
+      {
+        id: string;
+        device_id: string;
+        project_id: string;
+        timestamp: Date;
+        ph: string | null;
+        turbidity: string | null;
+        dissolved_oxygen: string | null;
+        flow_rate: string | null;
+        nitrogen: string | null;
+        phosphorus: string | null;
+        temperature: string | null;
+        signature: string;
+        is_verified: boolean;
+        batch_id: string | null;
+        created_at: Date;
+      }[]
+    >(
+      `SELECT DISTINCT ON (device_id)
+              id,
+              device_id,
+              project_id,
+              timestamp,
+              ph,
+              turbidity,
+              dissolved_oxygen,
+              flow_rate,
+              nitrogen,
+              phosphorus,
+              temperature,
+              signature,
+              is_verified,
+              batch_id,
+              created_at
+         FROM sensor_readings
+        ORDER BY device_id, timestamp DESC`,
+    );
+
+    return rows.map((row) =>
+      this.readingRepo.create({
+        id: row.id,
+        deviceId: row.device_id,
+        projectId: row.project_id,
+        timestamp: row.timestamp,
+        ph: row.ph !== null ? parseFloat(row.ph) : null,
+        turbidity: row.turbidity !== null ? parseFloat(row.turbidity) : null,
+        dissolvedOxygen: row.dissolved_oxygen !== null ? parseFloat(row.dissolved_oxygen) : null,
+        flowRate: row.flow_rate !== null ? parseFloat(row.flow_rate) : null,
+        nitrogen: row.nitrogen !== null ? parseFloat(row.nitrogen) : null,
+        phosphorus: row.phosphorus !== null ? parseFloat(row.phosphorus) : null,
+        temperature: row.temperature !== null ? parseFloat(row.temperature) : null,
+        signature: row.signature,
+        isVerified: row.is_verified,
+        batchId: row.batch_id,
+        createdAt: row.created_at,
+      }),
+    );
   }
 
   async getAggregatedSummary(

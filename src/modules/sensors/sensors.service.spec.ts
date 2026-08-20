@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
+import { DataSource } from 'typeorm';
 import { Keypair } from '@stellar/stellar-sdk';
 import { SensorsService } from './sensors.service';
 import { SensorDevice } from './entities/sensor-device.entity';
@@ -69,6 +70,12 @@ function makeMockRepo(): MockRepo {
   };
 }
 
+type MockDataSource = { query: jest.Mock };
+
+function makeMockDataSource(): MockDataSource {
+  return { query: jest.fn() };
+}
+
 // ── Test suite ────────────────────────────────────────────────────────────────
 
 describe('SensorsService', () => {
@@ -76,6 +83,7 @@ describe('SensorsService', () => {
   let deviceRepo: MockRepo;
   let readingRepo: MockRepo;
   let batchRepo: MockRepo;
+  let dataSource: MockDataSource;
 
   // A real Stellar keypair used for signature tests — generated once per suite.
   let testKeypair: Keypair;
@@ -88,6 +96,7 @@ describe('SensorsService', () => {
     deviceRepo = makeMockRepo();
     readingRepo = makeMockRepo();
     batchRepo = makeMockRepo();
+    dataSource = makeMockDataSource();
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -95,6 +104,7 @@ describe('SensorsService', () => {
         { provide: getRepositoryToken(SensorDevice), useValue: deviceRepo },
         { provide: getRepositoryToken(SensorReading), useValue: readingRepo },
         { provide: getRepositoryToken(ReadingBatch), useValue: batchRepo },
+        { provide: DataSource, useValue: dataSource },
       ],
     }).compile();
 
@@ -144,23 +154,29 @@ describe('SensorsService', () => {
       );
       deviceRepo.update.mockResolvedValue(undefined);
       batchRepo.increment.mockResolvedValue(undefined);
+
+      // Wire the three raw queries that resolveBatch() issues:
+      //   query[0] — UPDATE stale batches (returns void)
+      //   query[1] — INSERT … ON CONFLICT DO NOTHING (returns void)
+      //   query[2] — SELECT the current PENDING batch row
+      const fakeBatchRow = {
+        id: 'batch-1',
+        project_id: 'proj-1',
+        status: BatchStatus.PENDING,
+        reading_count: 0,
+        created_at: new Date(),
+        updated_at: new Date(),
+      };
+      dataSource.query
+        .mockResolvedValueOnce(undefined) // UPDATE stale
+        .mockResolvedValueOnce(undefined) // INSERT ON CONFLICT
+        .mockResolvedValueOnce([fakeBatchRow]); // SELECT PENDING
+      batchRepo.create.mockImplementation((d) => d as ReadingBatch);
     });
 
     it('accepts a valid ECDSA signature (real keypair, no mock)', async () => {
       const payload = buildPayload('dev-001', TIMESTAMP, PARAMS);
       const signature = signPayload(testKeypair, payload);
-
-      const fakeBatch: Partial<ReadingBatch> = {
-        id: 'batch-1',
-        projectId: 'proj-1',
-        status: BatchStatus.PENDING,
-        createdAt: new Date(),
-      };
-      batchRepo.findOne.mockResolvedValue(fakeBatch);
-      batchRepo.create.mockImplementation((d) => d as ReadingBatch);
-      batchRepo.save.mockImplementation((b) =>
-        Promise.resolve({ ...b, id: 'batch-1' } as ReadingBatch),
-      );
 
       const dto: CreateReadingDto = {
         deviceId: 'dev-001',
@@ -333,6 +349,28 @@ describe('SensorsService', () => {
     let fakeDevice: SensorDevice;
     let validSignature: string;
 
+    /**
+     * Helper: set up the three dataSource.query calls that resolveBatch() issues.
+     *
+     *   call 0 — UPDATE stale batches (void)
+     *   call 1 — INSERT … ON CONFLICT DO NOTHING (void)
+     *   call 2 — SELECT PENDING batch → returns batchRow
+     */
+    function wireResolveBatch(batchRow: {
+      id: string;
+      project_id: string;
+      status: BatchStatus;
+      reading_count: number;
+      created_at: Date;
+      updated_at: Date;
+    }) {
+      dataSource.query
+        .mockResolvedValueOnce(undefined)
+        .mockResolvedValueOnce(undefined)
+        .mockResolvedValueOnce([batchRow]);
+      batchRepo.create.mockImplementation((d) => d as ReadingBatch);
+    }
+
     beforeEach(() => {
       fakeDevice = {
         id: 'device-uuid-1',
@@ -370,75 +408,51 @@ describe('SensorsService', () => {
       validSignature = signPayload(testKeypair, payload);
     });
 
-    it('reuses a PENDING batch created within the last 15 minutes', async () => {
-      const recentBatch: Partial<ReadingBatch> = {
-        id: 'batch-recent',
-        projectId: 'proj-1',
+    it('resolves the batch and increments readingCount via the race-safe raw query path', async () => {
+      const batchRow = {
+        id: 'batch-1',
+        project_id: 'proj-1',
         status: BatchStatus.PENDING,
-        // Created just 1 minute ago — well within the window
-        createdAt: new Date(Date.now() - 60_000),
+        reading_count: 0,
+        created_at: new Date(),
+        updated_at: new Date(),
       };
+      wireResolveBatch(batchRow);
 
-      batchRepo.findOne.mockResolvedValue(recentBatch);
-      batchRepo.create.mockImplementation((d) => d as ReadingBatch);
-      batchRepo.save.mockImplementation((b) =>
-        Promise.resolve({ ...b, id: 'batch-new' } as ReadingBatch),
+      await service.ingestReading({
+        deviceId: 'dev-001',
+        timestamp: TIMESTAMP,
+        signature: validSignature,
+      });
+
+      // Three raw queries issued: UPDATE stale, INSERT ON CONFLICT, SELECT.
+      expect(dataSource.query).toHaveBeenCalledTimes(3);
+      // The UPDATE (first call) should filter by PENDING status and the cutoff.
+      expect(dataSource.query).toHaveBeenNthCalledWith(
+        1,
+        expect.stringContaining('UPDATE reading_batches'),
+        expect.arrayContaining([BatchStatus.SUBMITTED, 'proj-1', BatchStatus.PENDING]),
       );
-
-      await service.ingestReading({
-        deviceId: 'dev-001',
-        timestamp: TIMESTAMP,
-        signature: validSignature,
-      });
-
-      // A new batch should NOT have been created; only increment was called.
-      expect(batchRepo.save).not.toHaveBeenCalled();
-      expect(batchRepo.increment).toHaveBeenCalledWith({ id: 'batch-recent' }, 'readingCount', 1);
+      // The INSERT (second call) should use ON CONFLICT DO NOTHING.
+      expect(dataSource.query).toHaveBeenNthCalledWith(
+        2,
+        expect.stringContaining('ON CONFLICT'),
+        expect.arrayContaining(['proj-1', BatchStatus.PENDING]),
+      );
+      // readingCount incremented on the resolved batch.
+      expect(batchRepo.increment).toHaveBeenCalledWith({ id: 'batch-1' }, 'readingCount', 1);
     });
 
-    it('creates a new batch when the existing PENDING batch is older than 15 minutes', async () => {
-      const staleBatch: Partial<ReadingBatch> = {
-        id: 'batch-stale',
-        projectId: 'proj-1',
-        status: BatchStatus.PENDING,
-        // Created 16 minutes ago — outside the 15-minute window
-        createdAt: new Date(Date.now() - 16 * 60_000),
-      };
-
-      const newBatch: Partial<ReadingBatch> = {
-        id: 'batch-new',
-        projectId: 'proj-1',
-        status: BatchStatus.PENDING,
-        createdAt: new Date(),
-      };
-
-      batchRepo.findOne.mockResolvedValue(staleBatch);
-      batchRepo.create.mockReturnValue(newBatch as ReadingBatch);
-      batchRepo.save.mockResolvedValue(newBatch as ReadingBatch);
-
-      await service.ingestReading({
-        deviceId: 'dev-001',
-        timestamp: TIMESTAMP,
-        signature: validSignature,
-      });
-
-      // A brand-new batch was saved.
-      expect(batchRepo.save).toHaveBeenCalled();
-      expect(batchRepo.increment).toHaveBeenCalledWith({ id: 'batch-new' }, 'readingCount', 1);
-    });
-
-    it('creates a new batch when no PENDING batch exists at all', async () => {
-      batchRepo.findOne.mockResolvedValue(null);
-
-      const newBatch: Partial<ReadingBatch> = {
+    it('resolveBatch issues exactly 3 raw queries regardless of whether an existing batch was found', async () => {
+      const batchRow = {
         id: 'batch-fresh',
-        projectId: 'proj-1',
+        project_id: 'proj-1',
         status: BatchStatus.PENDING,
-        createdAt: new Date(),
+        reading_count: 0,
+        created_at: new Date(),
+        updated_at: new Date(),
       };
-
-      batchRepo.create.mockReturnValue(newBatch as ReadingBatch);
-      batchRepo.save.mockResolvedValue(newBatch as ReadingBatch);
+      wireResolveBatch(batchRow);
 
       await service.ingestReading({
         deviceId: 'dev-001',
@@ -446,36 +460,24 @@ describe('SensorsService', () => {
         signature: validSignature,
       });
 
-      expect(batchRepo.save).toHaveBeenCalled();
+      // Always: UPDATE stale, INSERT ON CONFLICT, SELECT — 3 queries, no more.
+      expect(dataSource.query).toHaveBeenCalledTimes(3);
     });
 
-    it('uses exactly the 15-minute boundary: a batch created precisely at cutoff is reused (not expired)', async () => {
-      // We freeze time so that Date.now() inside resolveBatch() returns the same
-      // value as when we create the batch timestamp below.
+    it('uses exactly the 15-minute boundary: the UPDATE uses cutoff = NOW() - BATCH_WINDOW_MS', async () => {
       jest.useFakeTimers();
       const FROZEN_NOW = 1_700_000_000_000;
       jest.setSystemTime(FROZEN_NOW);
 
-      // cutoff = FROZEN_NOW - 15*60*1000
-      // batch.createdAt = exactly cutoff → satisfies `createdAt >= cutoff` → reused.
-      const exactCutoffTime = FROZEN_NOW - 15 * 60_000;
-      const cutoffBatch: Partial<ReadingBatch> = {
+      const batchRow = {
         id: 'batch-cutoff',
-        projectId: 'proj-1',
+        project_id: 'proj-1',
         status: BatchStatus.PENDING,
-        createdAt: new Date(exactCutoffTime),
+        reading_count: 0,
+        created_at: new Date(FROZEN_NOW),
+        updated_at: new Date(FROZEN_NOW),
       };
-
-      const newBatch: Partial<ReadingBatch> = {
-        id: 'batch-new',
-        projectId: 'proj-1',
-        status: BatchStatus.PENDING,
-        createdAt: new Date(FROZEN_NOW),
-      };
-
-      batchRepo.findOne.mockResolvedValue(cutoffBatch);
-      batchRepo.create.mockReturnValue(newBatch as ReadingBatch);
-      batchRepo.save.mockResolvedValue(newBatch as ReadingBatch);
+      wireResolveBatch(batchRow);
 
       await service.ingestReading({
         deviceId: 'dev-001',
@@ -485,51 +487,15 @@ describe('SensorsService', () => {
 
       jest.useRealTimers();
 
-      // Batch at exactly cutoff satisfies `>= cutoff`, so no new batch is created.
-      expect(batchRepo.save).not.toHaveBeenCalled();
-      expect(batchRepo.increment).toHaveBeenCalledWith({ id: 'batch-cutoff' }, 'readingCount', 1);
-    });
-
-    it('creates a new batch when the existing batch is 1ms beyond the cutoff (strictly expired)', async () => {
-      // Freeze time for a deterministic cutoff.
-      jest.useFakeTimers();
-      const FROZEN_NOW = 1_700_000_000_000;
-      jest.setSystemTime(FROZEN_NOW);
-
-      // 1ms before cutoff → does NOT satisfy `>= cutoff` → new batch.
-      const expiredTime = FROZEN_NOW - 15 * 60_000 - 1;
-      const expiredBatch: Partial<ReadingBatch> = {
-        id: 'batch-expired',
-        projectId: 'proj-1',
-        status: BatchStatus.PENDING,
-        createdAt: new Date(expiredTime),
-      };
-
-      const newBatch: Partial<ReadingBatch> = {
-        id: 'batch-new-2',
-        projectId: 'proj-1',
-        status: BatchStatus.PENDING,
-        createdAt: new Date(FROZEN_NOW),
-      };
-
-      batchRepo.findOne.mockResolvedValue(expiredBatch);
-      batchRepo.create.mockReturnValue(newBatch as ReadingBatch);
-      batchRepo.save.mockResolvedValue(newBatch as ReadingBatch);
-
-      await service.ingestReading({
-        deviceId: 'dev-001',
-        timestamp: TIMESTAMP,
-        signature: validSignature,
-      });
-
-      jest.useRealTimers();
-
-      expect(batchRepo.save).toHaveBeenCalled();
-      expect(batchRepo.increment).toHaveBeenCalledWith({ id: 'batch-new-2' }, 'readingCount', 1);
+      // The fourth argument to the UPDATE query must be the cutoff Date.
+      const updateArgs = dataSource.query.mock.calls[0][1] as unknown[];
+      const cutoffArg = updateArgs[3] as Date;
+      expect(cutoffArg).toBeInstanceOf(Date);
+      expect(cutoffArg.getTime()).toBe(FROZEN_NOW - 15 * 60 * 1000);
     });
   });
 
-  // ── getLatestReading — N+1 documentation ────────────────────────────────
+  // ── getLatestReading — N+1 fix ───────────────────────────────────────────
 
   describe('getLatestReading', () => {
     it('returns the latest reading for a specific deviceId', async () => {
@@ -570,35 +536,80 @@ describe('SensorsService', () => {
       await expect(service.getLatestReading('dev-001')).rejects.toThrow(NotFoundException);
     });
 
-    // TODO: N+1 — replace with a single query that fetches the latest reading
-    // per device in one round-trip (e.g. a DISTINCT ON (device_id) query or a
-    // subquery join). When getLatestReading() is called without a deviceId it
-    // currently issues one findOne per device returned by deviceRepo.find(),
-    // which is O(n) database queries for n devices.
-    it.todo(
-      'getLatestReading() without deviceId should fetch all latest readings in a single query instead of one findOne per device',
-    );
+    it('getLatestReading() without deviceId should fetch all latest readings in a single query instead of one findOne per device', async () => {
+      // The fix replaces the per-device findOne loop with a single
+      // DISTINCT ON (device_id) raw query.  We verify:
+      //   1. dataSource.query is called exactly once (single round-trip).
+      //   2. readingRepo.findOne is never called (N+1 path is gone).
+      //   3. The returned array contains one typed SensorReading per row.
 
-    it('returns an array of latest readings (one per device) when no deviceId is given', async () => {
-      const devices: Partial<SensorDevice>[] = [
-        { id: 'dev-uuid-1', deviceId: 'dev-001', projectId: 'proj-1', publicKey: '' },
-        { id: 'dev-uuid-2', deviceId: 'dev-002', projectId: 'proj-1', publicKey: '' },
+      const rawRows = [
+        {
+          id: 'r-1',
+          device_id: 'dev-uuid-1',
+          project_id: 'proj-1',
+          timestamp: new Date('2026-01-01T01:00:00Z'),
+          ph: '7.0',
+          turbidity: null,
+          dissolved_oxygen: null,
+          flow_rate: null,
+          nitrogen: null,
+          phosphorus: null,
+          temperature: '18.5',
+          signature: 'sig1',
+          is_verified: true,
+          batch_id: 'batch-1',
+          created_at: new Date('2026-01-01T01:00:00Z'),
+        },
+        {
+          id: 'r-2',
+          device_id: 'dev-uuid-2',
+          project_id: 'proj-1',
+          timestamp: new Date('2026-01-01T02:00:00Z'),
+          ph: '6.8',
+          turbidity: '11.0',
+          dissolved_oxygen: null,
+          flow_rate: null,
+          nitrogen: null,
+          phosphorus: null,
+          temperature: null,
+          signature: 'sig2',
+          is_verified: false,
+          batch_id: null,
+          created_at: new Date('2026-01-01T02:00:00Z'),
+        },
       ];
-      const readings: Partial<SensorReading>[] = [
-        { id: 'r-1', deviceId: 'dev-uuid-1', ph: 7.0 },
-        { id: 'r-2', deviceId: 'dev-uuid-2', ph: 6.8 },
-      ];
 
-      deviceRepo.find.mockResolvedValue(devices as SensorDevice[]);
-      readingRepo.findOne
-        .mockResolvedValueOnce(readings[0] as SensorReading)
-        .mockResolvedValueOnce(readings[1] as SensorReading);
+      // dataSource.query returns the raw rows for the DISTINCT ON query.
+      dataSource.query.mockResolvedValueOnce(rawRows);
+      // readingRepo.create maps each row to a typed entity.
+      readingRepo.create.mockImplementation((d) => d as SensorReading);
 
-      const result = await service.getLatestReading();
+      const result = (await service.getLatestReading()) as SensorReading[];
 
-      // N+1: one findOne call issued per device
-      expect(readingRepo.findOne).toHaveBeenCalledTimes(2);
+      // ── Assertion 1: single DB round-trip ──
+      expect(dataSource.query).toHaveBeenCalledTimes(1);
+      const [sql] = dataSource.query.mock.calls[0] as [string];
+      expect(sql).toMatch(/DISTINCT ON\s*\(\s*device_id\s*\)/i);
+
+      // ── Assertion 2: N+1 path is gone ──
+      expect(readingRepo.findOne).not.toHaveBeenCalled();
+      expect(deviceRepo.find).not.toHaveBeenCalled();
+
+      // ── Assertion 3: result shape ──
       expect(result).toHaveLength(2);
+      expect(result[0]).toMatchObject({ id: 'r-1', ph: 7.0, temperature: 18.5 });
+      expect(result[1]).toMatchObject({ id: 'r-2', ph: 6.8, turbidity: 11.0 });
+    });
+
+    it('returns an empty array when no readings exist (no-deviceId path)', async () => {
+      dataSource.query.mockResolvedValueOnce([]);
+      readingRepo.create.mockImplementation((d) => d as SensorReading);
+
+      const result = (await service.getLatestReading()) as SensorReading[];
+
+      expect(dataSource.query).toHaveBeenCalledTimes(1);
+      expect(result).toHaveLength(0);
     });
   });
 });
@@ -678,6 +689,7 @@ describe('SensorsService — registerDevice', () => {
         { provide: getRepositoryToken(SensorDevice), useValue: deviceRepo },
         { provide: getRepositoryToken(SensorReading), useValue: readingRepo },
         { provide: getRepositoryToken(ReadingBatch), useValue: batchRepo },
+        { provide: DataSource, useValue: makeMockDataSource() },
       ],
     }).compile();
 
@@ -795,6 +807,7 @@ describe('SensorsService — getReadings', () => {
         { provide: getRepositoryToken(SensorDevice), useValue: deviceRepo },
         { provide: getRepositoryToken(SensorReading), useValue: readingRepo },
         { provide: getRepositoryToken(ReadingBatch), useValue: batchRepo },
+        { provide: DataSource, useValue: makeMockDataSource() },
       ],
     }).compile();
 
@@ -869,6 +882,7 @@ describe('SensorsService — getAggregatedSummary', () => {
         { provide: getRepositoryToken(SensorDevice), useValue: deviceRepo },
         { provide: getRepositoryToken(SensorReading), useValue: readingRepo },
         { provide: getRepositoryToken(ReadingBatch), useValue: batchRepo },
+        { provide: DataSource, useValue: makeMockDataSource() },
       ],
     }).compile();
 
@@ -937,6 +951,7 @@ describe('SensorsService — validateParameters unknown key', () => {
   let deviceRepo: MockRepo;
   let readingRepo: MockRepo;
   let batchRepo: MockRepo;
+  let dataSource: MockDataSource;
   let testKeypair: Keypair;
 
   beforeAll(() => {
@@ -947,6 +962,7 @@ describe('SensorsService — validateParameters unknown key', () => {
     deviceRepo = makeMockRepo();
     readingRepo = makeMockRepo();
     batchRepo = makeMockRepo();
+    dataSource = makeMockDataSource();
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -954,6 +970,7 @@ describe('SensorsService — validateParameters unknown key', () => {
         { provide: getRepositoryToken(SensorDevice), useValue: deviceRepo },
         { provide: getRepositoryToken(SensorReading), useValue: readingRepo },
         { provide: getRepositoryToken(ReadingBatch), useValue: batchRepo },
+        { provide: DataSource, useValue: dataSource },
       ],
     }).compile();
 
@@ -980,13 +997,19 @@ describe('SensorsService — validateParameters unknown key', () => {
     });
     const signature = signPayload(testKeypair, payload);
 
-    const batch = {
+    const batchRow = {
       id: 'batch-1',
-      projectId: 'proj-1',
+      project_id: 'proj-1',
       status: BatchStatus.PENDING,
-      createdAt: new Date(),
+      reading_count: 0,
+      created_at: new Date(),
+      updated_at: new Date(),
     };
-    batchRepo.findOne.mockResolvedValue(batch);
+    dataSource.query
+      .mockResolvedValueOnce(undefined) // UPDATE stale
+      .mockResolvedValueOnce(undefined) // INSERT ON CONFLICT
+      .mockResolvedValueOnce([batchRow]); // SELECT PENDING
+    batchRepo.create.mockImplementation((d) => d as ReadingBatch);
     readingRepo.create.mockImplementation((d) => d as SensorReading);
     readingRepo.save.mockImplementation((r) =>
       Promise.resolve({ ...r, id: 'r-1' } as SensorReading),
