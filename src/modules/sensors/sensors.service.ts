@@ -1,5 +1,7 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
+import { InjectQueue } from '@nestjs/bull';
+import { Queue } from 'bull';
 import { DataSource, Repository } from 'typeorm';
 import { Keypair } from '@stellar/stellar-sdk';
 import { SensorDevice } from './entities/sensor-device.entity';
@@ -55,6 +57,8 @@ export class SensorsService {
     private readonly readingRepo: Repository<SensorReading>,
     @InjectRepository(ReadingBatch)
     private readonly batchRepo: Repository<ReadingBatch>,
+    @InjectQueue('sensor-ingestion')
+    private readonly sensorIngestionQueue: Queue,
     private readonly dataSource: DataSource,
   ) {}
 
@@ -158,6 +162,20 @@ export class SensorsService {
     await this.deviceRepo.update(device.id, { lastReadingAt: new Date() });
 
     await this.batchRepo.increment({ id: batch.id }, 'readingCount', 1);
+
+    // Fan the reading out asynchronously: SensorsIngestionProcessor loads the
+    // saved reading, broadcasts it via SensorsGateway (sensor:reading) and
+    // evaluates threshold-breach alerts (sensor:alert).  The job is added
+    // WITHOUT a name so it lands on Bull's default ('__default__') queue,
+    // which is what the unnamed @Process({ concurrency: 5 }) handler in
+    // SensorsIngestionProcessor subscribes to.  Default job options (5
+    // attempts, exponential backoff) come from the queue registration in
+    // SensorsModule.
+    await this.sensorIngestionQueue.add({
+      readingId: saved.id,
+      deviceId: device.id,
+      projectId: device.projectId,
+    });
 
     return saved;
   }

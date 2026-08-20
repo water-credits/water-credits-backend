@@ -63,6 +63,15 @@ export class SensorReading {
   @Column({ name: 'is_verified', default: false })
   isVerified: boolean;
 
+  /**
+   * Timestamp marking when the ingestion processor finished fanning this
+   * reading out over WebSocket (sensor:reading + sensor:alert events).
+   * Used as an idempotency guard so a Bull retry never double-emits events
+   * to connected clients.
+   */
+  @Column({ name: 'ws_emitted_at', type: 'timestamptz', nullable: true })
+  wsEmittedAt: Date | null;
+
   @Column({ name: 'batch_id', nullable: true })
   @Index()
   batchId: string | null;
