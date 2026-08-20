@@ -38,7 +38,7 @@ describe('CreditsController', () => {
   describe('getPortfolio', () => {
     it('should call creditsService.getPortfolio with the userId from @CurrentUser', async () => {
       const userId = 'user-123';
-      const expected = { totalRetired: 100, totalValue: 0, projects: [] };
+      const expected = { totalRetired: 100, totalValue: 100, projects: [] };
       creditsService.getPortfolio.mockResolvedValue(expected);
 
       const result = await controller.getPortfolio(userId);

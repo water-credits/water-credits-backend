@@ -95,9 +95,12 @@ export class CreditsService {
       projectMap.set(r.projectId, entry);
     }
 
+    const creditPrice = this.configService.get<number>('CREDIT_PRICE_PER_UNIT') ?? 1;
+    const totalValue = totalRetired * creditPrice;
+
     return {
       totalRetired,
-      totalValue: 0,
+      totalValue,
       projects: Array.from(projectMap.values()),
     };
   }

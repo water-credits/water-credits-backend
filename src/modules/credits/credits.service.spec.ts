@@ -663,6 +663,32 @@ describe('CreditsService — getPortfolio and getRetirements', () => {
       const result = await service.getPortfolio('user-1');
       expect(result.projects[0].projectName).toBe('Unknown');
     });
+
+    it('computes totalValue as totalRetired * creditPrice from config', async () => {
+      const retirements: Partial<Retirement>[] = [
+        {
+          id: 'r-1',
+          userId: 'user-1',
+          projectId: 'proj-a',
+          amount: 200,
+          project: { name: 'Green Valley' } as never,
+        },
+        {
+          id: 'r-2',
+          userId: 'user-1',
+          projectId: 'proj-a',
+          amount: 300,
+          project: { name: 'Green Valley' } as never,
+        },
+      ];
+      retirementRepo.find.mockResolvedValue(retirements as Retirement[]);
+
+      const result = await service.getPortfolio('user-1');
+
+      expect(result.totalRetired).toBe(500);
+      // Default CREDIT_PRICE_PER_UNIT is 1, so totalValue = 500 * 1 = 500
+      expect(result.totalValue).toBe(500);
+    });
   });
 
   // ── getRetirements ──────────────────────────────────────────────────────
