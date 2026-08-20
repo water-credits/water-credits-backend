@@ -350,8 +350,67 @@ export class GovernanceService {
     });
 
     const saved = await this.proposalRepo.save(proposal);
-    this.logger.log(`Proposal ${saved.id} created by ${proposer}`);
+
+    // Register the proposal on-chain so executeProposal() has the u32 id the
+    // Soroban governance contract's execute() expects.  The off-chain row
+    // remains authoritative for voting/timelock; the on-chain id captured here
+    // guarantees every proposal created through this endpoint is executable.
+    const onChainProposalId = await this.registerProposalOnChain(saved);
+    if (onChainProposalId !== null) {
+      saved.onChainProposalId = onChainProposalId;
+      await this.proposalRepo.save(saved);
+    }
+
+    this.logger.log(
+      `Proposal ${saved.id} created by ${proposer}${
+        onChainProposalId !== null
+          ? ` (on-chain id ${onChainProposalId})`
+          : ' (on-chain registration deferred — contract unavailable)'
+      }`,
+    );
     return saved;
+  }
+
+  /**
+   * Registers a proposal with the on-chain Soroban governance contract and
+   * returns the u32 proposal id the contract assigned, or null when the
+   * contract is not configured / the call fails.
+   *
+   * Registration failures are intentionally non-fatal at creation time: the
+   * off-chain proposal is still created and executeProposal() retries the
+   * registration lazily, so a transient RPC outage never loses a proposal.
+   */
+  private async registerProposalOnChain(proposal: Proposal): Promise<number | null> {
+    const governanceContractId = this.configService.get<string>('stellar.contractGovernance', '');
+    if (!governanceContractId) {
+      this.logger.warn(
+        `Proposal ${proposal.id}: governance contract ID not configured ` +
+          '(stellar.contractGovernance) — on-chain registration skipped',
+      );
+      return null;
+    }
+
+    try {
+      const onChainProposalId = await this.stellarService.createProposal(
+        governanceContractId,
+        proposal.title,
+        proposal.description ?? '',
+        {
+          actionType: proposal.actionType,
+          actionParams: proposal.actionParams ?? {},
+        },
+      );
+      this.logger.log(
+        `Proposal ${proposal.id} registered on-chain with proposal id ${onChainProposalId}`,
+      );
+      return onChainProposalId;
+    } catch (err) {
+      this.logger.error(
+        `Proposal ${proposal.id}: on-chain registration failed: ${(err as Error).message}`,
+        (err as Error).stack,
+      );
+      return null;
+    }
   }
 
   // ── Vote ─────────────────────────────────────────────────────────────────
@@ -535,15 +594,23 @@ export class GovernanceService {
       );
     }
 
-    // onChainProposalId must be set before execution.  In the current flow
-    // proposals are created off-chain only, so we derive a deterministic u32
-    // from the DB row's auto-incrementing numeric sequence.  If the proposal
-    // was created on-chain in the future, this field would be populated at
-    // proposal creation time instead.
-    if (proposal.onChainProposalId === null || proposal.onChainProposalId === undefined) {
-      throw new BadRequestException(
-        'Proposal does not have an on-chain ID. Set onChainProposalId before executing.',
-      );
+    // Resolve the u32 on-chain proposal id required by the Soroban governance
+    // contract.  Proposals created through createProposal() are registered
+    // on-chain at creation time, so their id is already populated.  This
+    // fallback covers legacy rows (created before on-chain registration
+    // existed) and proposals whose creation-time registration failed (e.g.
+    // the contract was not yet configured) by registering them now.
+    let onChainProposalId = proposal.onChainProposalId;
+    if (onChainProposalId === null || onChainProposalId === undefined) {
+      onChainProposalId = await this.registerProposalOnChain(proposal);
+      if (onChainProposalId === null) {
+        throw new BadRequestException(
+          'Proposal does not have an on-chain ID and could not be registered ' +
+            'on-chain. Set onChainProposalId before executing.',
+        );
+      }
+      proposal.onChainProposalId = onChainProposalId;
+      await this.proposalRepo.save(proposal);
     }
 
     // ── Call Soroban BEFORE updating local state ──────────────────────────
@@ -551,10 +618,7 @@ export class GovernanceService {
     // call leaves the proposal in PASSED and allows retries.
     let txHash: string;
     try {
-      const result = await this.stellarService.execute(
-        governanceContractId,
-        proposal.onChainProposalId,
-      );
+      const result = await this.stellarService.execute(governanceContractId, onChainProposalId);
 
       txHash =
         (result as { txHash?: string } | null)?.txHash ??

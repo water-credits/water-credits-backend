@@ -135,7 +135,7 @@ describe('GovernanceService', () => {
   let configRepo: jest.Mocked<Record<string, jest.Mock>>;
   let configChangeRepo: jest.Mocked<Record<string, jest.Mock>>;
   let dataSource: { createQueryRunner: jest.Mock };
-  let stellarService: { execute: jest.Mock };
+  let stellarService: { execute: jest.Mock; createProposal: jest.Mock };
   let configService: { get: jest.Mock };
 
   beforeEach(async () => {
@@ -183,6 +183,7 @@ describe('GovernanceService', () => {
 
     stellarService = {
       execute: jest.fn(),
+      createProposal: jest.fn(),
     };
 
     configService = {
@@ -510,7 +511,7 @@ describe('GovernanceService', () => {
       );
     });
 
-    it('throws BadRequestException when onChainProposalId is null', async () => {
+    it('throws BadRequestException when onChainProposalId is null and on-chain registration fails', async () => {
       const oldDeadline = new Date(Date.now() - 2 * 86_400_000); // 2 days ago
       const proposal = makeProposal({
         status: ProposalStatus.PASSED,
@@ -519,10 +520,60 @@ describe('GovernanceService', () => {
       });
       proposalRepo.findOne.mockResolvedValue(proposal);
       configRepo.findOne.mockResolvedValue(makeConfig({ timelockPeriod: 86400 }));
+      // Self-healing registration is attempted but fails, so no on-chain id
+      // can be resolved and execution must be rejected.
+      stellarService.createProposal.mockRejectedValue(new Error('RPC down'));
 
       await expect(service.executeProposal(proposal.id, 'GADMIN')).rejects.toThrow(
         BadRequestException,
       );
+    });
+
+    it('self-heals: registers the proposal on-chain and executes when onChainProposalId is null', async () => {
+      const oldDeadline = new Date(Date.now() - 2 * 86_400_000);
+      const proposal = makeProposal({
+        status: ProposalStatus.PASSED,
+        deadline: oldDeadline,
+        onChainProposalId: null,
+      });
+
+      proposalRepo.findOne
+        .mockResolvedValueOnce(proposal) // getProposalById
+        .mockResolvedValueOnce({
+          // reload after update
+          ...proposal,
+          status: ProposalStatus.EXECUTED,
+          executionTxHash: 'abc123',
+          executedBy: 'GADMIN',
+          onChainProposalId: 11,
+        });
+
+      configRepo.findOne.mockResolvedValue(makeConfig({ timelockPeriod: 86400 }));
+
+      const execQb = {
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue(undefined),
+      };
+      proposalRepo.createQueryBuilder.mockReturnValue(execQb);
+
+      stellarService.createProposal.mockResolvedValue(11);
+      stellarService.execute.mockResolvedValue({ txHash: 'abc123' });
+
+      const result = await service.executeProposal(proposal.id, 'GADMIN');
+
+      expect(stellarService.createProposal).toHaveBeenCalledWith(
+        'CGOVERNANCE123',
+        proposal.title,
+        '',
+        { actionType: proposal.actionType, actionParams: {} },
+      );
+      expect(stellarService.execute).toHaveBeenCalledWith('CGOVERNANCE123', 11);
+      expect(proposalRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({ onChainProposalId: 11 }),
+      );
+      expect(result.status).toBe(ProposalStatus.EXECUTED);
     });
 
     it('calls stellarService.execute() with the correct contract ID and proposal number', async () => {
@@ -887,7 +938,7 @@ describe('GovernanceService', () => {
     let voteRepo: jest.Mocked<Record<string, jest.Mock>>;
     let configRepo: jest.Mocked<Record<string, jest.Mock>>;
     let dataSource: { createQueryRunner: jest.Mock };
-    let stellarService: { execute: jest.Mock };
+    let stellarService: { execute: jest.Mock; createProposal: jest.Mock };
     let configService: { get: jest.Mock };
     let service: GovernanceService;
 
@@ -909,8 +960,15 @@ describe('GovernanceService', () => {
         createQueryRunner: jest.fn(),
         query: jest.fn().mockResolvedValue(undefined),
       } as never;
-      stellarService = { execute: jest.fn() };
-      configService = { get: jest.fn() };
+      stellarService = { execute: jest.fn(), createProposal: jest.fn() };
+      configService = {
+        get: jest.fn().mockImplementation((key: string, fallback?: unknown) => {
+          if (key === 'stellar.contractGovernance') {
+            return 'CGOVERNANCE123';
+          }
+          return fallback;
+        }),
+      };
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
@@ -949,6 +1007,68 @@ describe('GovernanceService', () => {
 
       expect(proposalRepo.create).toHaveBeenCalled();
       expect(result).toBeDefined();
+    });
+
+    it('registers the proposal on-chain and persists the returned onChainProposalId', async () => {
+      configRepo.findOne.mockResolvedValue(makeConfig({ votingPeriod: 3600 }));
+      const created = makeProposal({
+        title: 'On-chain proposal',
+        description: 'desc',
+        actionType: 'update_fee',
+        actionParams: { fee: 200 },
+      });
+      proposalRepo.create.mockReturnValue(created);
+      proposalRepo.save.mockResolvedValue(created);
+      stellarService.createProposal.mockResolvedValue(42);
+
+      const result = await service.createProposal('GPROPOSER', {
+        title: 'On-chain proposal',
+        description: 'desc',
+        actionType: 'update_fee',
+        actionParams: { fee: 200 },
+      } as never);
+
+      expect(stellarService.createProposal).toHaveBeenCalledWith(
+        'CGOVERNANCE123',
+        'On-chain proposal',
+        'desc',
+        { actionType: 'update_fee', actionParams: { fee: 200 } },
+      );
+      expect(proposalRepo.save).toHaveBeenLastCalledWith(
+        expect.objectContaining({ onChainProposalId: 42 }),
+      );
+      expect(result.onChainProposalId).toBe(42);
+    });
+
+    it('leaves onChainProposalId null when the governance contract is not configured', async () => {
+      configRepo.findOne.mockResolvedValue(makeConfig({ votingPeriod: 3600 }));
+      const created = makeProposal();
+      proposalRepo.create.mockReturnValue(created);
+      proposalRepo.save.mockResolvedValue(created);
+      configService.get.mockReturnValue('');
+
+      const result = await service.createProposal('GPROPOSER', {
+        title: 'Offline proposal',
+        actionType: 'update_fee',
+      } as never);
+
+      expect(stellarService.createProposal).not.toHaveBeenCalled();
+      expect(result.onChainProposalId).toBeNull();
+    });
+
+    it('leaves onChainProposalId null when on-chain registration throws', async () => {
+      configRepo.findOne.mockResolvedValue(makeConfig({ votingPeriod: 3600 }));
+      const created = makeProposal();
+      proposalRepo.create.mockReturnValue(created);
+      proposalRepo.save.mockResolvedValue(created);
+      stellarService.createProposal.mockRejectedValue(new Error('RPC timeout'));
+
+      const result = await service.createProposal('GPROPOSER', {
+        title: 'Offline proposal',
+        actionType: 'update_fee',
+      } as never);
+
+      expect(result.onChainProposalId).toBeNull();
     });
   });
 

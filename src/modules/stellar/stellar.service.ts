@@ -265,17 +265,40 @@ export class StellarService {
     return this.callReadOnly(governanceId, 'get_config');
   }
 
+  /**
+   * Submits the on-chain `propose(title, description, action)` call and
+   * returns the u32 proposal id assigned by the Soroban governance contract.
+   *
+   * The id is decoded from the transaction's return value, so callers (e.g.
+   * GovernanceService) can persist it as Proposal.onChainProposalId — the
+   * exact value the contract's `execute()` and `vote()` methods expect.
+   */
   async createProposal(
     governanceId: string,
     title: string,
     description: string,
     action: Record<string, unknown>,
-  ): Promise<unknown> {
-    return this.invokeContract(governanceId, 'propose', [
+  ): Promise<number> {
+    const response = (await this.invokeContract(governanceId, 'propose', [
       nativeToScVal(title, { type: 'string' }),
       nativeToScVal(description, { type: 'string' }),
       nativeToScVal(JSON.stringify(action), { type: 'string' }),
-    ]);
+    ])) as SorobanRpc.Api.GetSuccessfulTransactionResponse | null | undefined;
+
+    if (
+      !response ||
+      response.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS ||
+      response.returnValue === undefined
+    ) {
+      throw new Error('Governance propose() did not return a proposal id');
+    }
+
+    const proposalId = scValToNative(response.returnValue);
+    if (typeof proposalId !== 'number' || !Number.isFinite(proposalId)) {
+      throw new Error(`Governance propose() returned an unexpected value: ${String(proposalId)}`);
+    }
+
+    return proposalId;
   }
 
   async vote(governanceId: string, proposalId: number, support: boolean): Promise<unknown> {
