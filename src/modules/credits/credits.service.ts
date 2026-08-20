@@ -8,6 +8,7 @@ import { Retirement } from './entities/retirement.entity';
 import { RetireCreditsDto } from './dto/retire-credits.dto';
 import { CreditQueryDto } from './dto/credit-query.dto';
 import { Project, ProjectStatus } from '../projects/entities/project.entity';
+import { User } from '../users/entities/user.entity';
 import { StellarService } from '../stellar/stellar.service';
 
 // Shape of the response for GET /credits
@@ -45,6 +46,8 @@ export class CreditsService {
     private readonly retirementRepo: Repository<Retirement>,
     @InjectRepository(Project)
     private readonly projectRepo: Repository<Project>,
+    @InjectRepository(User)
+    private readonly userRepo: Repository<User>,
     @InjectQueue('retirements')
     private readonly retirementsQueue: Queue,
     private readonly configService: ConfigService,
@@ -104,6 +107,11 @@ export class CreditsService {
       throw new BadRequestException('Amount must be positive');
     }
 
+    const user = await this.userRepo.findOne({ where: { id: userId } });
+    if (!user || !user.wallet) {
+      throw new BadRequestException('User wallet not found');
+    }
+
     // The retirement job calls the Soroban contract directly by address, so
     // a project without a deployed credit token would enqueue a job that is
     // guaranteed to fail on-chain. Fail fast instead of burning retries.
@@ -112,6 +120,14 @@ export class CreditsService {
       throw new BadRequestException('Project credit token not yet deployed');
     }
     const tokenId = project.creditTokenAddress;
+
+    // Verify caller holds sufficient on-chain token balance before creating DB record or queuing
+    const balance = await this.stellarService.getBalance(tokenId, user.wallet);
+    if (balance.isLessThan(dto.amount)) {
+      throw new BadRequestException(
+        `Insufficient credit balance. Required: ${dto.amount}, Available: ${balance.toString()}`,
+      );
+    }
 
     const retirement = this.retirementRepo.create({
       userId,

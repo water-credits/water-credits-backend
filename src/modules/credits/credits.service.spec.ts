@@ -8,6 +8,7 @@ import { CreditsService } from './credits.service';
 import { Retirement } from './entities/retirement.entity';
 import { RetireCreditsDto } from './dto/retire-credits.dto';
 import { Project } from '../projects/entities/project.entity';
+import { User } from '../users/entities/user.entity';
 import { StellarService } from '../stellar/stellar.service';
 
 // ── Typed mock factories ──────────────────────────────────────────────────────
@@ -49,6 +50,12 @@ describe('CreditsService', () => {
   let retirementsQueue: { add: jest.Mock };
 
   let projectRepo: { find: jest.Mock; findOne: jest.Mock; count: jest.Mock };
+  let userRepo: { find: jest.Mock; findOne: jest.Mock };
+  let stellarService: {
+    getBalance: jest.Mock;
+    getTotalSupply: jest.Mock;
+    getTotalRetired: jest.Mock;
+  };
 
   beforeEach(async () => {
     retirementRepo = makeRetirementRepo();
@@ -60,21 +67,27 @@ describe('CreditsService', () => {
       findOne: jest.fn().mockResolvedValue({ id: 'proj-1', creditTokenAddress: 'C-token-default' }),
       count: jest.fn(),
     };
+    userRepo = {
+      find: jest.fn(),
+      findOne: jest.fn().mockResolvedValue({ id: 'user-1', wallet: 'G-wallet-user-1' }),
+    };
+    stellarService = {
+      getBalance: jest.fn().mockResolvedValue(new BigNumber(1000000)),
+      getTotalSupply: jest.fn(),
+      getTotalRetired: jest.fn(),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         CreditsService,
         { provide: getRepositoryToken(Retirement), useValue: retirementRepo },
         { provide: getRepositoryToken(Project), useValue: projectRepo },
+        { provide: getRepositoryToken(User), useValue: userRepo },
         { provide: getQueueToken('retirements'), useValue: retirementsQueue },
         { provide: ConfigService, useValue: { get: jest.fn() } },
         {
           provide: StellarService,
-          useValue: {
-            getBalance: jest.fn(),
-            getTotalSupply: jest.fn(),
-            getTotalRetired: jest.fn(),
-          },
+          useValue: stellarService,
         },
       ],
     }).compile();
@@ -258,6 +271,146 @@ describe('CreditsService', () => {
     });
   });
 
+  // ── retire — user wallet lookup ──────────────────────────────────────────
+
+  describe('retire — user wallet lookup', () => {
+    it('throws BadRequestException when user record is not found', async () => {
+      userRepo.findOne.mockResolvedValue(null);
+
+      const dto: RetireCreditsDto = {
+        projectId: 'proj-1',
+        amount: 100,
+        purpose: 'compliance',
+      };
+
+      await expect(service.retire('user-nonexistent', dto)).rejects.toThrow(BadRequestException);
+      await expect(service.retire('user-nonexistent', dto)).rejects.toThrow(
+        'User wallet not found',
+      );
+      expect(retirementRepo.save).not.toHaveBeenCalled();
+      expect(retirementsQueue.add).not.toHaveBeenCalled();
+    });
+
+    it('throws BadRequestException when user has no wallet address', async () => {
+      userRepo.findOne.mockResolvedValue({ id: 'user-1', wallet: '' });
+
+      const dto: RetireCreditsDto = {
+        projectId: 'proj-1',
+        amount: 100,
+        purpose: 'compliance',
+      };
+
+      await expect(service.retire('user-1', dto)).rejects.toThrow(BadRequestException);
+      await expect(service.retire('user-1', dto)).rejects.toThrow('User wallet not found');
+      expect(retirementRepo.save).not.toHaveBeenCalled();
+      expect(retirementsQueue.add).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── retire — on-chain balance & entitlement validation ────────────────────
+
+  describe('retire — on-chain balance check', () => {
+    it('throws BadRequestException when user on-chain balance is less than retirement amount', async () => {
+      userRepo.findOne.mockResolvedValue({ id: 'user-1', wallet: 'G-wallet-1' });
+      projectRepo.findOne.mockResolvedValue({ id: 'proj-1', creditTokenAddress: 'C-token-1' });
+      stellarService.getBalance.mockResolvedValue(new BigNumber(50)); // balance 50, trying to retire 100
+
+      const dto: RetireCreditsDto = {
+        projectId: 'proj-1',
+        amount: 100,
+        purpose: 'compliance',
+      };
+
+      await expect(service.retire('user-1', dto)).rejects.toThrow(BadRequestException);
+      await expect(service.retire('user-1', dto)).rejects.toThrow(
+        'Insufficient credit balance. Required: 100, Available: 50',
+      );
+      expect(stellarService.getBalance).toHaveBeenCalledWith('C-token-1', 'G-wallet-1');
+      // Must not create DB record or queue job
+      expect(retirementRepo.save).not.toHaveBeenCalled();
+      expect(retirementsQueue.add).not.toHaveBeenCalled();
+    });
+
+    it('throws BadRequestException when user has zero on-chain balance', async () => {
+      userRepo.findOne.mockResolvedValue({ id: 'user-1', wallet: 'G-wallet-1' });
+      projectRepo.findOne.mockResolvedValue({ id: 'proj-1', creditTokenAddress: 'C-token-1' });
+      stellarService.getBalance.mockResolvedValue(new BigNumber(0));
+
+      const dto: RetireCreditsDto = {
+        projectId: 'proj-1',
+        amount: 10,
+        purpose: 'offset',
+      };
+
+      await expect(service.retire('user-1', dto)).rejects.toThrow(BadRequestException);
+      await expect(service.retire('user-1', dto)).rejects.toThrow(
+        'Insufficient credit balance. Required: 10, Available: 0',
+      );
+      expect(retirementRepo.save).not.toHaveBeenCalled();
+      expect(retirementsQueue.add).not.toHaveBeenCalled();
+    });
+
+    it('proceeds and creates retirement when user has exactly equal balance', async () => {
+      userRepo.findOne.mockResolvedValue({ id: 'user-1', wallet: 'G-wallet-1' });
+      projectRepo.findOne.mockResolvedValue({ id: 'proj-1', creditTokenAddress: 'C-token-1' });
+      stellarService.getBalance.mockResolvedValue(new BigNumber(100));
+
+      const saved: Partial<Retirement> = {
+        id: 'ret-exact-1',
+        userId: 'user-1',
+        projectId: 'proj-1',
+        amount: 100,
+        purpose: 'exact balance test',
+        txHash: '',
+        retiredAt: new Date(),
+      };
+      retirementRepo.create.mockReturnValue(saved as Retirement);
+      retirementRepo.save.mockResolvedValue(saved as Retirement);
+
+      const dto: RetireCreditsDto = {
+        projectId: 'proj-1',
+        amount: 100,
+        purpose: 'exact balance test',
+      };
+
+      const result = await service.retire('user-1', dto);
+
+      expect(result.id).toBe('ret-exact-1');
+      expect(retirementRepo.save).toHaveBeenCalledTimes(1);
+      expect(retirementsQueue.add).toHaveBeenCalledTimes(1);
+    });
+
+    it('proceeds and creates retirement when user has more than requested balance', async () => {
+      userRepo.findOne.mockResolvedValue({ id: 'user-1', wallet: 'G-wallet-1' });
+      projectRepo.findOne.mockResolvedValue({ id: 'proj-1', creditTokenAddress: 'C-token-1' });
+      stellarService.getBalance.mockResolvedValue(new BigNumber(5000));
+
+      const saved: Partial<Retirement> = {
+        id: 'ret-ample-1',
+        userId: 'user-1',
+        projectId: 'proj-1',
+        amount: 100,
+        purpose: 'ample balance test',
+        txHash: '',
+        retiredAt: new Date(),
+      };
+      retirementRepo.create.mockReturnValue(saved as Retirement);
+      retirementRepo.save.mockResolvedValue(saved as Retirement);
+
+      const dto: RetireCreditsDto = {
+        projectId: 'proj-1',
+        amount: 100,
+        purpose: 'ample balance test',
+      };
+
+      const result = await service.retire('user-1', dto);
+
+      expect(result.id).toBe('ret-ample-1');
+      expect(retirementRepo.save).toHaveBeenCalledTimes(1);
+      expect(retirementsQueue.add).toHaveBeenCalledTimes(1);
+    });
+  });
+
   // ── retire — partial failure: queue throws after DB save ─────────────────
   //
   // Behaviour contract: if the DB save succeeds but the queue.add() throws,
@@ -427,6 +580,10 @@ describe('CreditsService — getPortfolio and getRetirements', () => {
         {
           provide: getRepositoryToken(Project),
           useValue: { find: jest.fn(), findOne: jest.fn(), count: jest.fn() },
+        },
+        {
+          provide: getRepositoryToken(User),
+          useValue: { find: jest.fn(), findOne: jest.fn() },
         },
         { provide: getQueueToken('retirements'), useValue: retirementsQueue },
         { provide: ConfigService, useValue: { get: jest.fn() } },
@@ -644,6 +801,10 @@ describe('CreditsService — getCreditOverview and getProjectCredits', () => {
         CreditsService,
         { provide: getRepositoryToken(Retirement), useValue: retirementRepo },
         { provide: getRepositoryToken(Project), useValue: projectRepo },
+        {
+          provide: getRepositoryToken(User),
+          useValue: { find: jest.fn(), findOne: jest.fn() },
+        },
         { provide: getQueueToken('retirements'), useValue: { add: jest.fn() } },
         { provide: ConfigService, useValue: { get: jest.fn() } },
         { provide: StellarService, useValue: stellarService },
