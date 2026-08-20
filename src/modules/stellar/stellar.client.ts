@@ -99,8 +99,8 @@ export class StellarClient {
       }));
       const response = await this.server.getLedgerEntries(accountKey);
       if (response.entries && response.entries.length > 0) {
-        const entry = response.entries[0];
-        const ledgerEntryData = xdr.LedgerEntryData.fromXDR(entry.xdr, 'base64');
+        const entry = response.entries[0] as any;
+        const ledgerEntryData = xdr.LedgerEntryData.fromXDR(entry.result.xdr, 'base64');
         const seqNum = ledgerEntryData.account().seqNum().toString();
         
         const txSeq = new BigNumber(tx.sequence);
