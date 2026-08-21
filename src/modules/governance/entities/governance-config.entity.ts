@@ -1,6 +1,15 @@
-import { Entity, PrimaryGeneratedColumn, Column, UpdateDateColumn } from 'typeorm';
+import { Entity, PrimaryGeneratedColumn, Column, UpdateDateColumn, Check } from 'typeorm';
 
+/**
+ * Protocol config is a singleton: exactly one row, always id = 1.
+ * The CHECK constraint below (combined with the primary key on `id`) makes
+ * that a hard database guarantee instead of an application-level assumption
+ * — see GovernanceService.getConfig() for the matching race-free upsert and
+ * migration 016_governance_config_singleton.sql for how existing databases
+ * are reconciled onto it.
+ */
 @Entity('governance_config')
+@Check('governance_config_singleton_id', '"id" = 1')
 export class GovernanceConfig {
   @PrimaryGeneratedColumn()
   id: number;
