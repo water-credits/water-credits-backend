@@ -9,22 +9,25 @@ import {
   MessageBody,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
-import { Logger, OnModuleDestroy } from '@nestjs/common';
+import { Inject, Logger, OnModuleDestroy } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
+import { ThrottlerStorage } from '@nestjs/throttler';
 import Redis from 'ioredis';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { verifyWsToken } from '../../common/websockets/ws-jwt.util';
 import { SensorProjectAccessService } from './sensor-project-access.service';
+import { corsOptions } from '../../config/cors.config';
+import {
+  WS_CONNECTION_THROTTLE,
+  WS_SUBSCRIBE_THROTTLE,
+} from '../../common/decorators/throttle.decorator';
 
 const PROJECT_PREFIX = 'project:';
 
 @WebSocketGateway({
   namespace: '/sensors',
-  cors: {
-    origin: process.env.NODE_ENV === 'production' ? process.env.CORS_ORIGIN : '*',
-    credentials: true,
-  },
+  cors: corsOptions,
 })
 export class SensorsGateway
   implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect, OnModuleDestroy
@@ -42,6 +45,7 @@ export class SensorsGateway
     private readonly jwtService: JwtService,
     private readonly projectAccess: SensorProjectAccessService,
     private readonly configService: ConfigService,
+    @Inject(ThrottlerStorage) private readonly throttlerStorage: ThrottlerStorage,
   ) {}
 
   afterInit(server: Server): void {
@@ -62,6 +66,16 @@ export class SensorsGateway
   }
 
   async handleConnection(client: Socket): Promise<void> {
+    const ip = client.handshake.address ?? 'unknown';
+    if (await this.isThrottled(`ws:sensors:connect:${ip}`, WS_CONNECTION_THROTTLE)) {
+      this.logger.warn(
+        `Rejected connection ${client.id}: connection rate limit exceeded for ${ip}`,
+      );
+      client.emit('error', { message: 'Too many connection attempts, please slow down' });
+      client.disconnect(true);
+      return;
+    }
+
     const payload = await verifyWsToken(client, this.jwtService, this.logger);
     if (!payload) {
       client.disconnect(true);
@@ -86,6 +100,10 @@ export class SensorsGateway
     @ConnectedSocket() client: Socket,
     @MessageBody() projectId: string,
   ): Promise<void> {
+    if (await this.isSubscribeThrottled(client)) {
+      return;
+    }
+
     const allowed = await this.canAccessProject(client, projectId);
     if (!allowed) {
       client.emit('error', { message: 'Forbidden: no access to this project' });
@@ -101,10 +119,14 @@ export class SensorsGateway
   }
 
   @SubscribeMessage('unsubscribe:project')
-  handleUnsubscribeProject(
+  async handleUnsubscribeProject(
     @ConnectedSocket() client: Socket,
     @MessageBody() projectId: string,
-  ): void {
+  ): Promise<void> {
+    if (await this.isSubscribeThrottled(client)) {
+      return;
+    }
+
     const room = `${PROJECT_PREFIX}${projectId}`;
     client.leave(room);
     this.logger.log(`Client ${client.id} unsubscribed from project ${projectId}`);
@@ -126,5 +148,25 @@ export class SensorsGateway
       client.data.role as string | undefined,
       projectId,
     );
+  }
+
+  // subscribe:project and unsubscribe:project share one counter per client so
+  // rapid subscribe/unsubscribe cycling can't be used to dodge the limit.
+  private async isSubscribeThrottled(client: Socket): Promise<boolean> {
+    const key = `ws:sensors:subscribe:${(client.data.userId as string | undefined) ?? client.id}`;
+    const throttled = await this.isThrottled(key, WS_SUBSCRIBE_THROTTLE);
+    if (throttled) {
+      client.emit('error', { message: 'Too many subscription requests, please slow down' });
+      this.logger.warn(`Client ${client.id} throttled: subscribe/unsubscribe rate limit exceeded`);
+    }
+    return throttled;
+  }
+
+  private async isThrottled(
+    key: string,
+    { limit, ttl }: { limit: number; ttl: number },
+  ): Promise<boolean> {
+    const { totalHits } = await this.throttlerStorage.increment(key, ttl);
+    return totalHits > limit;
   }
 }
