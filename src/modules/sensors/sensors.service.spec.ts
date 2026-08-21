@@ -1,5 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { BadRequestException, NotFoundException, ForbiddenException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { getQueueToken } from '@nestjs/bull';
 import { DataSource } from 'typeorm';
@@ -73,10 +74,18 @@ function makeMockRepo(): MockRepo {
   };
 }
 
-type MockDataSource = { query: jest.Mock };
+type MockDataSource = {
+  query: jest.Mock;
+  transaction: jest.Mock;
+};
 
 function makeMockDataSource(): MockDataSource {
-  return { query: jest.fn() };
+  return {
+    query: jest.fn(),
+    transaction: jest.fn((callback) =>
+      Promise.resolve(callback({ save: jest.fn(), increment: jest.fn() })),
+    ),
+  };
 }
 
 // ── Test suite ────────────────────────────────────────────────────────────────
@@ -115,6 +124,18 @@ describe('SensorsService', () => {
           provide: SensorProjectAccessService,
           useValue: { assertProjectAccess: jest.fn(), requirePrivilegedRole: jest.fn() },
         },
+        {
+          provide: ConfigService,
+          useValue: {
+            get: jest.fn((key: string) => {
+              const config: Record<string, number> = {
+                'sensor.maxAgeSeconds': 86400,
+                'sensor.futureOffsetSeconds': 300,
+              };
+              return config[key] || null;
+            }),
+          },
+        },
       ],
     }).compile();
 
@@ -128,7 +149,7 @@ describe('SensorsService', () => {
   // ── verifySignature (via ingestReading) ──────────────────────────────────
 
   describe('ingestReading — signature verification', () => {
-    const TIMESTAMP = '2026-01-01T00:00:00.000Z';
+    const TIMESTAMP = new Date().toISOString();
     const PARAMS = {
       ph: 7.0,
       turbidity: null,
@@ -164,6 +185,17 @@ describe('SensorsService', () => {
       );
       deviceRepo.update.mockResolvedValue(undefined);
       batchRepo.increment.mockResolvedValue(undefined);
+
+      // Mock dataSource.transaction to use the real save and increment mocks
+      dataSource.transaction.mockImplementation(
+        (callback) =>
+          callback({
+            save: readingRepo.save,
+            increment: jest.fn((entity, where, column, value) =>
+              batchRepo.increment(where, column, value),
+            ),
+          }),
+      );
 
       // Wire the three raw queries that resolveBatch() issues:
       //   query[0] — UPDATE stale batches (returns void)
@@ -297,7 +329,7 @@ describe('SensorsService', () => {
       // Validation fires before signature check, so signature value does not matter here.
       const dto: CreateReadingDto = {
         deviceId: 'dev-001',
-        timestamp: '2026-01-01T00:00:00.000Z',
+        timestamp: new Date().toISOString(),
         ph: 15, // out of range
         signature: 'aGVsbG8=',
       };
@@ -309,7 +341,7 @@ describe('SensorsService', () => {
     it('throws BadRequestException when ph is below 0', async () => {
       const dto: CreateReadingDto = {
         deviceId: 'dev-001',
-        timestamp: '2026-01-01T00:00:00.000Z',
+        timestamp: new Date().toISOString(),
         ph: -1,
         signature: 'aGVsbG8=',
       };
@@ -320,7 +352,7 @@ describe('SensorsService', () => {
     it('throws BadRequestException when temperature exceeds 100', async () => {
       const dto: CreateReadingDto = {
         deviceId: 'dev-001',
-        timestamp: '2026-01-01T00:00:00.000Z',
+        timestamp: new Date().toISOString(),
         temperature: 101,
         signature: 'aGVsbG8=',
       };
@@ -332,7 +364,7 @@ describe('SensorsService', () => {
     it('throws BadRequestException when temperature is below -50', async () => {
       const dto: CreateReadingDto = {
         deviceId: 'dev-001',
-        timestamp: '2026-01-01T00:00:00.000Z',
+        timestamp: new Date().toISOString(),
         temperature: -51,
         signature: 'aGVsbG8=',
       };
@@ -345,7 +377,7 @@ describe('SensorsService', () => {
       // check will throw BadRequestException which is fine for this test.
       const dtoMin: CreateReadingDto = {
         deviceId: 'dev-001',
-        timestamp: '2026-01-01T00:00:00.000Z',
+        timestamp: new Date().toISOString(),
         ph: 0,
         signature: 'aGVsbG8=',
       };
@@ -354,7 +386,7 @@ describe('SensorsService', () => {
 
       const dtoMax: CreateReadingDto = {
         deviceId: 'dev-001',
-        timestamp: '2026-01-01T00:00:00.000Z',
+        timestamp: new Date().toISOString(),
         ph: 14,
         signature: 'aGVsbG8=',
       };
@@ -364,7 +396,7 @@ describe('SensorsService', () => {
     it('skips validation for null/undefined optional parameters', async () => {
       const dto: CreateReadingDto = {
         deviceId: 'dev-001',
-        timestamp: '2026-01-01T00:00:00.000Z',
+        timestamp: new Date().toISOString(),
         // all optional params omitted → all null
         signature: 'aGVsbG8=',
       };
@@ -376,7 +408,7 @@ describe('SensorsService', () => {
   // ── resolveBatch — 15-minute window boundary ─────────────────────────────
 
   describe('ingestReading — batch window boundary (resolveBatch)', () => {
-    const TIMESTAMP = '2026-01-01T00:00:00.000Z';
+    const TIMESTAMP = new Date().toISOString();
 
     let fakeDevice: SensorDevice;
     let validSignature: string;
@@ -426,6 +458,17 @@ describe('SensorsService', () => {
       );
       deviceRepo.update.mockResolvedValue(undefined);
       batchRepo.increment.mockResolvedValue(undefined);
+
+      // Mock dataSource.transaction to use the real save and increment mocks
+      dataSource.transaction.mockImplementation(
+        (callback) =>
+          callback({
+            save: readingRepo.save,
+            increment: jest.fn((entity, where, column, value) =>
+              batchRepo.increment(where, column, value),
+            ),
+          }),
+      );
 
       // Build a valid signature for an all-null param set
       const payload = buildPayload('dev-001', TIMESTAMP, {
@@ -500,6 +543,8 @@ describe('SensorsService', () => {
       jest.useFakeTimers();
       const FROZEN_NOW = 1_700_000_000_000;
       jest.setSystemTime(FROZEN_NOW);
+      // Generate timestamp using frozen time so it's valid
+      const frozenTimestamp = new Date(FROZEN_NOW).toISOString();
 
       const batchRow = {
         id: 'batch-cutoff',
@@ -511,10 +556,22 @@ describe('SensorsService', () => {
       };
       wireResolveBatch(batchRow);
 
+      // Regenerate signature with the frozen timestamp using null params
+      const frozenPayload = buildPayload('dev-001', frozenTimestamp, {
+        ph: null,
+        turbidity: null,
+        dissolvedOxygen: null,
+        flowRate: null,
+        nitrogen: null,
+        phosphorus: null,
+        temperature: null,
+      });
+      const frozenSignature = signPayload(testKeypair, frozenPayload);
+
       await service.ingestReading({
         deviceId: 'dev-001',
-        timestamp: TIMESTAMP,
-        signature: validSignature,
+        timestamp: frozenTimestamp,
+        signature: frozenSignature,
       });
 
       jest.useRealTimers();
@@ -542,7 +599,7 @@ describe('SensorsService', () => {
         id: 'reading-uuid-1',
         deviceId: 'device-uuid-1',
         ph: 7.1,
-        timestamp: new Date('2026-01-01T01:00:00Z'),
+        timestamp: new Date(),
       };
 
       deviceRepo.findOne.mockResolvedValue(fakeDevice as SensorDevice);
@@ -582,7 +639,7 @@ describe('SensorsService', () => {
           id: 'r-1',
           device_id: 'dev-uuid-1',
           project_id: 'proj-1',
-          timestamp: new Date('2026-01-01T01:00:00Z'),
+          timestamp: new Date(),
           ph: '7.0',
           turbidity: null,
           dissolved_oxygen: null,
@@ -593,13 +650,13 @@ describe('SensorsService', () => {
           signature: 'sig1',
           is_verified: true,
           batch_id: 'batch-1',
-          created_at: new Date('2026-01-01T01:00:00Z'),
+          created_at: new Date(),
         },
         {
           id: 'r-2',
           device_id: 'dev-uuid-2',
           project_id: 'proj-1',
-          timestamp: new Date('2026-01-01T02:00:00Z'),
+          timestamp: new Date(),
           ph: '6.8',
           turbidity: '11.0',
           dissolved_oxygen: null,
@@ -610,7 +667,7 @@ describe('SensorsService', () => {
           signature: 'sig2',
           is_verified: false,
           batch_id: null,
-          created_at: new Date('2026-01-01T02:00:00Z'),
+          created_at: new Date(),
         },
       ];
 
@@ -739,6 +796,18 @@ describe('SensorsService — registerDevice', () => {
           provide: SensorProjectAccessService,
           useValue: projectAccessService,
         },
+        {
+          provide: ConfigService,
+          useValue: {
+            get: jest.fn((key: string) => {
+              const config: Record<string, number> = {
+                'sensor.maxAgeSeconds': 86400,
+                'sensor.futureOffsetSeconds': 300,
+              };
+              return config[key] || null;
+            }),
+          },
+        },
       ],
     }).compile();
 
@@ -787,12 +856,12 @@ describe('SensorsService — registerDevice', () => {
     deviceRepo.findOne.mockResolvedValue(existing);
 
     const dto = { ...BASE_DTO, publicKey: testKeypair.publicKey() };
-    await expect(service.registerDevice('proj-1', dto as never, 'owner-1', 'farmer')).rejects.toThrow(
-      BadRequestException,
-    );
-    await expect(service.registerDevice('proj-1', dto as never, 'owner-1', 'farmer')).rejects.toThrow(
-      'already registered',
-    );
+    await expect(
+      service.registerDevice('proj-1', dto as never, 'owner-1', 'farmer'),
+    ).rejects.toThrow(BadRequestException);
+    await expect(
+      service.registerDevice('proj-1', dto as never, 'owner-1', 'farmer'),
+    ).rejects.toThrow('already registered');
   });
 
   it('filters devices by projectId', async () => {
@@ -814,7 +883,11 @@ describe('SensorsService — registerDevice', () => {
   });
 
   it('getDeviceById returns device when found', async () => {
-    const device = { id: 'device-uuid-1', deviceId: 'dev-001', projectId: 'proj-1' } as SensorDevice;
+    const device = {
+      id: 'device-uuid-1',
+      deviceId: 'dev-001',
+      projectId: 'proj-1',
+    } as SensorDevice;
     deviceRepo.findOne.mockResolvedValue(device);
 
     const result = await service.getDeviceById('device-uuid-1', 'owner-1', 'farmer');
@@ -889,7 +962,12 @@ describe('SensorsService — registerDevice', () => {
 
     const dto = { ...BASE_DTO, publicKey: testKeypair.publicKey() };
     // 'other-user' is not the owner, but admin role is privileged → allowed
-    const result = await service.registerDevice('proj-1', dto as never, 'other-user', UserRole.ADMIN);
+    const result = await service.registerDevice(
+      'proj-1',
+      dto as never,
+      'other-user',
+      UserRole.ADMIN,
+    );
 
     expect(result.apiKeyPlaintext).toBeDefined();
   });
@@ -929,6 +1007,18 @@ describe('SensorsService — getReadings', () => {
         {
           provide: SensorProjectAccessService,
           useValue: { assertProjectAccess: jest.fn(), requirePrivilegedRole: jest.fn() },
+        },
+        {
+          provide: ConfigService,
+          useValue: {
+            get: jest.fn((key: string) => {
+              const config: Record<string, number> = {
+                'sensor.maxAgeSeconds': 86400,
+                'sensor.futureOffsetSeconds': 300,
+              };
+              return config[key] || null;
+            }),
+          },
         },
       ],
     }).compile();
@@ -1031,6 +1121,18 @@ describe('SensorsService — getAggregatedSummary', () => {
           provide: SensorProjectAccessService,
           useValue: { assertProjectAccess: jest.fn(), requirePrivilegedRole: jest.fn() },
         },
+        {
+          provide: ConfigService,
+          useValue: {
+            get: jest.fn((key: string) => {
+              const config: Record<string, number> = {
+                'sensor.maxAgeSeconds': 86400,
+                'sensor.futureOffsetSeconds': 300,
+              };
+              return config[key] || null;
+            }),
+          },
+        },
       ],
     }).compile();
 
@@ -1124,10 +1226,56 @@ describe('SensorsService — validateParameters unknown key', () => {
           provide: SensorProjectAccessService,
           useValue: { assertProjectAccess: jest.fn(), requirePrivilegedRole: jest.fn() },
         },
+        {
+          provide: ConfigService,
+          useValue: {
+            get: jest.fn((key: string) => {
+              const config: Record<string, number> = {
+                'sensor.maxAgeSeconds': 86400,
+                'sensor.futureOffsetSeconds': 300,
+              };
+              return config[key] || null;
+            }),
+          },
+        },
       ],
     }).compile();
 
     service = module.get<SensorsService>(SensorsService);
+
+    // Setup mocks for ingestReading
+    readingRepo.create.mockImplementation((data) => data as SensorReading);
+    readingRepo.save.mockImplementation((r) =>
+      Promise.resolve({ ...r, id: 'reading-uuid-1' } as SensorReading),
+    );
+    deviceRepo.update.mockResolvedValue(undefined);
+    batchRepo.increment.mockResolvedValue(undefined);
+
+    // Mock dataSource.transaction to use the real save and increment mocks
+    dataSource.transaction.mockImplementation(
+      (callback) =>
+        callback({
+          save: readingRepo.save,
+          increment: jest.fn((entity, where, column, value) =>
+            batchRepo.increment(where, column, value),
+          ),
+        }),
+    );
+
+    // Setup resolveBatch mocks
+    const fakeBatchRow = {
+      id: 'batch-1',
+      project_id: 'proj-1',
+      status: BatchStatus.PENDING,
+      reading_count: 0,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    dataSource.query
+      .mockResolvedValueOnce(undefined) // UPDATE stale
+      .mockResolvedValueOnce(undefined) // INSERT ON CONFLICT
+      .mockResolvedValueOnce([fakeBatchRow]); // SELECT PENDING
+    batchRepo.create.mockImplementation((d) => d as ReadingBatch);
   });
 
   it('skips validation for unknown parameter keys (not in PARAMETER_RANGES)', async () => {
@@ -1139,7 +1287,7 @@ describe('SensorsService — validateParameters unknown key', () => {
     } as SensorDevice;
     deviceRepo.findOne.mockResolvedValue(device);
 
-    const payload = buildPayload('dev-001', '2026-01-01T00:00:00.000Z', {
+    const payload = buildPayload('dev-001', new Date().toISOString(), {
       ph: 7.0,
       turbidity: null,
       dissolvedOxygen: null,
@@ -1172,7 +1320,7 @@ describe('SensorsService — validateParameters unknown key', () => {
 
     const result = await service.ingestReading({
       deviceId: 'dev-001',
-      timestamp: '2026-01-01T00:00:00.000Z',
+      timestamp: new Date().toISOString(),
       ph: 7.0,
       someUnknownParam: 999 as never,
       signature,
