@@ -195,7 +195,7 @@ export class SensorsService {
       });
     } catch (error) {
       // Handle duplicate reading (replay protection)
-      if (error instanceof QueryFailedError && error.databaseError?.code === '23505') {
+      if (error instanceof QueryFailedError && (error as any).code === '23505') {
         // Unique constraint violation - reading already exists
         // Return the existing reading for idempotency
         const existing = await this.readingRepo.findOne({
