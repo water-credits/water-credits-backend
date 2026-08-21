@@ -6,6 +6,7 @@ import { UsersService } from './users.service';
 import { User, UserRole } from './entities/user.entity';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { UpdateRoleDto } from './dto/update-role.dto';
+import { AdminUpdateUserDto } from './dto/admin-update-user.dto';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -180,23 +181,15 @@ describe('UsersService', () => {
       expect(result.displayName).toBe('Alice');
     });
 
-    it('updates isKycVerified when user is an admin', async () => {
-      const user = makeUser({ role: UserRole.ADMIN, isKycVerified: false });
-      repo.findOne.mockResolvedValue(user);
-      repo.save.mockResolvedValue({ ...user, isKycVerified: true });
-
-      const dto: UpdateUserDto = { isKycVerified: true };
-      const result = await service.updateProfile(user.id, dto);
-
-      expect(result.isKycVerified).toBe(true);
-    });
-
-    it('throws ForbiddenException when non-admin tries to update KYC', async () => {
+    it('updates isKycVerified only via the admin KYC endpoint, never through updateProfile', async () => {
       const user = makeUser({ role: UserRole.FARMER, isKycVerified: false });
       repo.findOne.mockResolvedValue(user);
+      repo.save.mockImplementation((u) => Promise.resolve(u));
 
-      const dto: UpdateUserDto = { isKycVerified: true };
-      await expect(service.updateProfile(user.id, dto)).rejects.toThrow(ForbiddenException);
+      const dto: UpdateUserDto = { displayName: 'No KYC here' };
+      const result = await service.updateProfile(user.id, dto);
+
+      expect(result.isKycVerified).toBe(false);
     });
 
     it('applies partial updates without affecting other fields', async () => {
@@ -216,6 +209,89 @@ describe('UsersService', () => {
 
       const dto: UpdateUserDto = { email: 'test@test.com' };
       await expect(service.updateProfile('no-such-id', dto)).rejects.toThrow(NotFoundException);
+    });
+
+    it('never touches isKycVerified even for admin callers', async () => {
+      const user = makeUser({ role: UserRole.ADMIN, isKycVerified: false });
+      repo.findOne.mockResolvedValue(user);
+      repo.save.mockImplementation((u) => Promise.resolve(u));
+
+      const dto: UpdateUserDto = { displayName: 'Admin Self' };
+      const result = await service.updateProfile(user.id, dto);
+
+      expect(result.isKycVerified).toBe(false);
+    });
+  });
+
+  // ── updateKycStatus ───────────────────────────────────────────────────────
+
+  describe('updateKycStatus', () => {
+    it('allows an admin to set KYC status on another user', async () => {
+      const target = makeUser({ id: 'uuid-target', role: UserRole.FARMER, isKycVerified: false });
+      repo.findOne.mockResolvedValue(target);
+      repo.save.mockImplementation((u) => Promise.resolve(u));
+
+      const dto: AdminUpdateUserDto = { isKycVerified: true };
+      const result = await service.updateKycStatus('actor-1', 'uuid-target', dto);
+
+      expect(result.isKycVerified).toBe(true);
+      expect(repo.save).toHaveBeenCalledTimes(1);
+    });
+
+    it('allows an admin to revoke KYC status (set to false)', async () => {
+      const target = makeUser({ id: 'uuid-target', role: UserRole.FARMER, isKycVerified: true });
+      repo.findOne.mockResolvedValue(target);
+      repo.save.mockImplementation((u) => Promise.resolve(u));
+
+      const dto: AdminUpdateUserDto = { isKycVerified: false };
+      const result = await service.updateKycStatus('actor-1', 'uuid-target', dto);
+
+      expect(result.isKycVerified).toBe(false);
+    });
+
+    it('throws ForbiddenException when an admin targets their own id (self-KYC)', async () => {
+      const dto: AdminUpdateUserDto = { isKycVerified: true };
+
+      await expect(service.updateKycStatus('actor-1', 'actor-1', dto)).rejects.toThrow(
+        ForbiddenException,
+      );
+      await expect(service.updateKycStatus('actor-1', 'actor-1', dto)).rejects.toThrow(
+        'Admins cannot update their own KYC status',
+      );
+      expect(repo.findOne).not.toHaveBeenCalled();
+      expect(repo.save).not.toHaveBeenCalled();
+    });
+
+    it('throws NotFoundException when the target user does not exist', async () => {
+      repo.findOne.mockResolvedValue(null);
+
+      const dto: AdminUpdateUserDto = { isKycVerified: true };
+      await expect(service.updateKycStatus('actor-1', 'no-such-id', dto)).rejects.toThrow(
+        NotFoundException,
+      );
+      expect(repo.save).not.toHaveBeenCalled();
+    });
+
+    it('writes an audit event with previous and new KYC values', async () => {
+      const target = makeUser({ id: 'uuid-1', role: UserRole.FARMER, isKycVerified: false });
+      repo.findOne.mockResolvedValue(target);
+      repo.save.mockImplementation((u) => Promise.resolve(u));
+
+      const dto: AdminUpdateUserDto = { isKycVerified: true };
+      await service.updateKycStatus('actor-1', 'uuid-1', dto);
+
+      expect(dataSource.query).toHaveBeenCalledWith(
+        expect.stringContaining('INSERT INTO user_audit_log'),
+        [
+          'kyc_status_changed',
+          'actor-1',
+          'uuid-1',
+          JSON.stringify({
+            previousKycVerified: false,
+            newKycVerified: true,
+          }),
+        ],
+      );
     });
   });
 

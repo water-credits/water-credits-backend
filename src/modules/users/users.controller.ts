@@ -3,6 +3,7 @@ import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { UsersService } from './users.service';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { UpdateRoleDto } from './dto/update-role.dto';
+import { AdminUpdateUserDto } from './dto/admin-update-user.dto';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { User, UserRole } from './entities/user.entity';
@@ -40,6 +41,18 @@ export class UsersController {
       pagination.limit,
     );
     return PaginatedResponseDto.from(data, total, page, limit);
+  }
+
+  @Patch(':id/kyc')
+  @Roles(UserRole.ADMIN)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Set a user KYC verification status (admin only)' })
+  async updateKyc(
+    @CurrentUser('id') actorUserId: string,
+    @Param('id') id: string,
+    @Body() dto: AdminUpdateUserDto,
+  ): Promise<User> {
+    return this.usersService.updateKycStatus(actorUserId, id, dto);
   }
 
   @Patch(':id/role')

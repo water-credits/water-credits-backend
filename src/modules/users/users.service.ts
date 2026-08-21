@@ -4,6 +4,7 @@ import { DataSource, In, Not, Repository } from 'typeorm';
 import { User, UserRole } from './entities/user.entity';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { UpdateRoleDto } from './dto/update-role.dto';
+import { AdminUpdateUserDto } from './dto/admin-update-user.dto';
 
 // Roles that count towards the "at least one active admin" guarantee.
 const ADMIN_ROLES = [UserRole.ADMIN, UserRole.SUPER_ADMIN];
@@ -50,14 +51,34 @@ export class UsersService {
     if (dto.displayName !== undefined) {
       user.displayName = dto.displayName;
     }
-    if (dto.isKycVerified !== undefined) {
-      if (user.role === UserRole.ADMIN) {
-        user.isKycVerified = dto.isKycVerified;
-      } else {
-        throw new ForbiddenException('Only admins can update KYC status');
-      }
-    }
     return this.userRepo.save(user);
+  }
+
+  /**
+   * Admin-only KYC verification. Must be performed by a different admin than
+   * the target user — self-approval is blocked to keep the integrity check
+   * meaningful.
+   */
+  async updateKycStatus(
+    actorUserId: string,
+    targetUserId: string,
+    dto: AdminUpdateUserDto,
+  ): Promise<User> {
+    if (actorUserId === targetUserId) {
+      throw new ForbiddenException('Admins cannot update their own KYC status');
+    }
+
+    const user = await this.findById(targetUserId);
+    const previousKycVerified = user.isKycVerified;
+    user.isKycVerified = dto.isKycVerified;
+    const saved = await this.userRepo.save(user);
+
+    await this.writeAuditEvent('kyc_status_changed', actorUserId, targetUserId, {
+      previousKycVerified,
+      newKycVerified: dto.isKycVerified,
+    });
+
+    return saved;
   }
 
   async updateRole(actorUserId: string, targetUserId: string, dto: UpdateRoleDto): Promise<User> {

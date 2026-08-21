@@ -1,5 +1,6 @@
 import {
   Injectable,
+  Logger,
   NotFoundException,
   BadRequestException,
   ForbiddenException,
@@ -10,6 +11,7 @@ import { Project, ProjectStatus } from './entities/project.entity';
 import { CreateProjectDto } from './dto/create-project.dto';
 import { UpdateProjectDto } from './dto/update-project.dto';
 import { QueryProjectsDto, SortOrder } from './dto/query-projects.dto';
+import { UserRole } from '../users/entities/user.entity';
 
 const VALID_TRANSITIONS: Record<ProjectStatus, ProjectStatus[]> = {
   [ProjectStatus.DRAFT]: [ProjectStatus.REGISTERED],
@@ -20,8 +22,13 @@ const VALID_TRANSITIONS: Record<ProjectStatus, ProjectStatus[]> = {
   [ProjectStatus.CLOSED]: [],
 };
 
+// Roles allowed to bypass the project ownership check on delete.
+const ADMIN_ROLES: string[] = [UserRole.ADMIN, UserRole.SUPER_ADMIN];
+
 @Injectable()
 export class ProjectsService {
+  private readonly logger = new Logger(ProjectsService.name);
+
   constructor(
     @InjectRepository(Project)
     private readonly projectRepo: Repository<Project>,
@@ -179,11 +186,19 @@ export class ProjectsService {
     return this.projectRepo.count();
   }
 
-  async remove(id: string, userId: string): Promise<void> {
+  async remove(id: string, userId: string, callerRole?: UserRole): Promise<void> {
     const project = await this.findById(id);
 
-    if (project.ownerId !== userId) {
+    const isAdmin = callerRole !== undefined && ADMIN_ROLES.includes(callerRole);
+
+    if (!isAdmin && project.ownerId !== userId) {
       throw new ForbiddenException('You can only delete your own projects');
+    }
+
+    if (isAdmin && project.ownerId !== userId) {
+      this.logger.warn(
+        `Admin override: user ${userId} (role=${callerRole}) deleted project ${id} owned by ${project.ownerId}`,
+      );
     }
 
     await this.projectRepo.remove(project);
