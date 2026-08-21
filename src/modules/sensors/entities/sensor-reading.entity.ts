@@ -6,12 +6,14 @@ import {
   ManyToOne,
   JoinColumn,
   Index,
+  Unique,
 } from 'typeorm';
 import { SensorDevice } from './sensor-device.entity';
 import { Project } from '../../projects/entities/project.entity';
 import { ReadingBatch } from './reading-batch.entity';
 
 @Entity('sensor_readings')
+@Unique('idx_device_timestamp_signature_unique', ['deviceId', 'timestamp', 'signature'])
 export class SensorReading {
   @PrimaryGeneratedColumn('uuid')
   id: string;
