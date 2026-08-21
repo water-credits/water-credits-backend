@@ -166,22 +166,6 @@ export class SensorsService {
 
     const batch = await this.resolveBatch(device.projectId);
 
-    const reading = this.readingRepo.create({
-      deviceId: device.id,
-      projectId: device.projectId,
-      timestamp: readingTimestamp,
-      ph: dto.ph ?? null,
-      turbidity: dto.turbidity ?? null,
-      dissolvedOxygen: dto.dissolvedOxygen ?? null,
-      flowRate: dto.flowRate ?? null,
-      nitrogen: dto.nitrogen ?? null,
-      phosphorus: dto.phosphorus ?? null,
-      temperature: dto.temperature ?? null,
-      signature: dto.signature,
-      isVerified: true,
-      batchId: batch.id,
-    });
-
     // Wrap reading insertion and batch count increment in a transaction
     // to ensure transactional consistency. If the reading insertion fails
     // due to replay protection (unique constraint), we return the existing
@@ -189,15 +173,25 @@ export class SensorsService {
     let saved: SensorReading;
     try {
       saved = await this.dataSource.transaction(async (entityManager) => {
-        const reading = await entityManager.save(reading);
+        const reading = this.readingRepo.create({
+          deviceId: device.id,
+          projectId: device.projectId,
+          timestamp: readingTimestamp,
+          ph: dto.ph ?? null,
+          turbidity: dto.turbidity ?? null,
+          dissolvedOxygen: dto.dissolvedOxygen ?? null,
+          flowRate: dto.flowRate ?? null,
+          nitrogen: dto.nitrogen ?? null,
+          phosphorus: dto.phosphorus ?? null,
+          temperature: dto.temperature ?? null,
+          signature: dto.signature,
+          isVerified: true,
+          batchId: batch.id,
+        });
+        const saved = await entityManager.save(reading);
         // Increment batch count atomically
-        await entityManager.increment(
-          ReadingBatch,
-          { id: batch.id },
-          'readingCount',
-          1,
-        );
-        return reading;
+        await entityManager.increment(ReadingBatch, { id: batch.id }, 'readingCount', 1);
+        return saved;
       });
     } catch (error) {
       // Handle duplicate reading (replay protection)
@@ -244,7 +238,8 @@ export class SensorsService {
   private validateTimestamp(timestamp: Date): void {
     const now = new Date();
     const maxAgeSeconds = this.configService.get<number>('sensor.maxAgeSeconds') || 24 * 60 * 60;
-    const futureOffsetSeconds = this.configService.get<number>('sensor.futureOffsetSeconds') || 5 * 60;
+    const futureOffsetSeconds =
+      this.configService.get<number>('sensor.futureOffsetSeconds') || 5 * 60;
 
     const maxAge = new Date(now.getTime() - maxAgeSeconds * 1000);
     const maxFuture = new Date(now.getTime() + futureOffsetSeconds * 1000);
