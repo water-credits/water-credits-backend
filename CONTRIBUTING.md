@@ -73,6 +73,8 @@ STELLAR_BACKEND_SECRET=SABC...   # the S... key
 
 For oracle-specific keys, repeat the same steps and populate `ORACLE_ADDRESS` and `ORACLE_SECRET`.
 
+Without a valid STELLAR_BACKEND_SECRET, the API still starts (random keypair fallback) but GET /api/v1/health reports checks.stellar.signing_ready: false and status: "degraded". For production-like boots, set STELLAR_REQUIRE_SIGNING_KEY=true so the process refuses to start if the secret is unusable.
+
 ### Using Docker (alternative)
 
 ```bash

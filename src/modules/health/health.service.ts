@@ -21,6 +21,10 @@ export interface ComponentHealth {
   detail?: string;
 }
 
+export interface StellarHealth extends ComponentHealth {
+  signing_ready: boolean;
+}
+
 export interface QueueHealth {
   status: 'ok' | 'degraded' | 'down';
   waiting: number;
@@ -59,7 +63,7 @@ export interface HealthReport {
   checks: {
     database: ComponentHealth;
     redis: ComponentHealth;
-    stellar: ComponentHealth;
+    stellar: StellarHealth;
     oracle: OracleHealth;
     indexer: IndexerHealth;
     queues: Record<string, QueueHealth>;
@@ -144,19 +148,37 @@ export class HealthService {
     }
   }
 
-  private async checkStellar(): Promise<ComponentHealth> {
+  private async checkStellar(): Promise<StellarHealth> {
     const start = Date.now();
+    const signingReady = this.stellarClient.isSigningReady();
+
     try {
       const server = this.stellarClient.getServer();
       const ledger = await server.getLatestLedger();
+      const latency = Date.now() - start;
+
+      if (!signingReady) {
+        return {
+          status: 'degraded',
+          latency_ms: latency,
+          signing_ready: false,
+          detail: `latest_ledger=${ledger.sequence}; STELLAR_BACKEND_SECRET not configured`,
+        };
+      }
+
       return {
         status: 'ok',
-        latency_ms: Date.now() - start,
+        latency_ms: latency,
+        signing_ready: true,
         detail: `latest_ledger=${ledger.sequence}`,
       };
     } catch (err) {
       this.logger.warn(`Stellar RPC health check failed: ${(err as Error).message}`);
-      return { status: 'degraded', detail: (err as Error).message };
+      return {
+        status: 'degraded',
+        signing_ready: signingReady,
+        detail: (err as Error).message,
+      };
     }
   }
 

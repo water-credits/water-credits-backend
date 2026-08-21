@@ -1130,8 +1130,14 @@ STELLAR_RPC_URL=https://soroban-testnet.stellar.org
 STELLAR_NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
 
 # ── Stellar Backend Account ──
-STELLAR_BACKEND_SECRET=SXXX...YYY        # Backend Stellar account secret
-STELLAR_BACKEND_PUBLIC=GABC...DEF        # Backend Stellar account public
+# Required for on-chain writes (oracle submit, retire, governance).
+# Empty / placeholder (SDN...TODO) / invalid → GET /health reports
+# checks.stellar.signing_ready=false and status=degraded.
+STELLAR_BACKEND_SECRET=SXXX...YYY        # Backend Stellar account secret (S…)
+STELLAR_BACKEND_PUBLIC=GABC...DEF        # Backend Stellar account public (G…)
+# Fail boot if the backend secret is missing/placeholder/invalid.
+# Set true in production. Default false so local/dev can still start.
+STELLAR_REQUIRE_SIGNING_KEY=false
 
 # ── Contract Addresses (deployed on Stellar) ──
 CONTRACT_CREDIT_FACTORY=C...
@@ -1368,20 +1374,27 @@ GET /health
 ```json
 {
   "status": "ok",
-  "timestamp": 1700000000,
-  "uptime": 3600,
+  "timestamp": "2024-01-01T00:00:00.000Z",
+  "uptime_s": 3600,
   "checks": {
     "database": { "status": "ok", "latency_ms": 2 },
     "redis": { "status": "ok", "latency_ms": 1 },
-    "stellar": { "status": "ok", "latest_ledger": 12345678 },
+    "stellar": {
+      "status": "ok",
+      "latency_ms": 12,
+      "signing_ready": true,
+      "detail": "latest_ledger=12345678"
+    },
     "queues": {
-      "sensor-ingestion": { "waiting": 0, "active": 2, "failed": 0 },
-      "oracle-submit": { "waiting": 1, "active": 0, "failed": 0 },
-      "retirements": { "waiting": 0, "active": 0, "failed": 0 }
+      "sensor-ingestion": { "status": "ok", "waiting": 0, "active": 2, "failed": 0 },
+      "oracle-submit": { "status": "ok", "waiting": 1, "active": 0, "failed": 0 },
+      "retirements": { "status": "ok", "waiting": 0, "active": 0, "failed": 0 }
     }
   }
 }
 ```
+
+If `STELLAR_BACKEND_SECRET` is missing or invalid, `checks.stellar.signing_ready` is `false` and both `checks.stellar.status` and top-level `status` become `degraded` (HTTP still 200). Set `STELLAR_REQUIRE_SIGNING_KEY=true` to refuse startup instead.
 
 ### Metrics (Prometheus)
 

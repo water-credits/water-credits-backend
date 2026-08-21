@@ -3,6 +3,24 @@ import { ConfigService } from '@nestjs/config';
 import { SorobanRpc, Keypair, Transaction, xdr } from '@stellar/stellar-sdk';
 
 const DEFAULT_SIMULATION_SEED = Buffer.alloc(32);
+/** Placeholder / empty secrets are treated as "not configured". */
+export const STELLAR_BACKEND_SECRET_PLACEHOLDER = 'SDN...TODO';
+
+export function isUsableBackendSecret(secret: string | undefined | null): boolean {
+  if (!secret) {
+    return false;
+  }
+  const trimmed = secret.trim();
+  if (!trimmed || trimmed === STELLAR_BACKEND_SECRET_PLACEHOLDER) {
+    return false;
+  }
+  try {
+    Keypair.fromSecret(trimmed);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 @Injectable()
 export class StellarClient {
@@ -10,22 +28,37 @@ export class StellarClient {
   private server: SorobanRpc.Server;
   private keypair: Keypair;
   private readonly simulationKeypair: Keypair;
+  private readonly signingReady: boolean;
 
   constructor(private configService: ConfigService) {
     const rpcUrl = this.configService.get<string>('stellar.rpcUrl')!;
     const backendSecret = this.configService.get<string>('stellar.backendSecret');
     const simulationSecret = this.configService.get<string>('stellar.simulationSecret');
+    const requireSigningKey = this.configService.get<boolean>('stellar.requireSigningKey', false);
 
     this.server = new SorobanRpc.Server(rpcUrl);
     this.simulationKeypair = simulationSecret
       ? Keypair.fromSecret(simulationSecret)
       : Keypair.fromRawEd25519Seed(DEFAULT_SIMULATION_SEED);
 
-    if (backendSecret && backendSecret !== 'SDN...TODO') {
-      this.keypair = Keypair.fromSecret(backendSecret);
+    this.signingReady = isUsableBackendSecret(backendSecret);
+
+    if (this.signingReady) {
+      this.keypair = Keypair.fromSecret(backendSecret!.trim());
     } else {
-      this.logger.warn('STELLAR_BACKEND_SECRET not properly configured');
-      // Using a random keypair just to avoid null checks, but transactions will fail
+      this.logger.warn(
+        'STELLAR_BACKEND_SECRET not properly configured — on-chain writes will fail. ' +
+          'Set a valid secret, or set STELLAR_REQUIRE_SIGNING_KEY=true to fail fast.',
+      );
+
+      if (requireSigningKey) {
+        throw new Error(
+          'STELLAR_BACKEND_SECRET is missing, placeholder, or invalid, and ' +
+            'STELLAR_REQUIRE_SIGNING_KEY=true. Refusing to start.',
+        );
+      }
+
+      // Dev/test fallback only — transactions signed with this key will fail on-chain.
       this.keypair = Keypair.random();
     }
   }
@@ -40,6 +73,10 @@ export class StellarClient {
 
   getSimulationKeypair(): Keypair {
     return this.simulationKeypair;
+  }
+
+  isSigningReady(): boolean {
+    return this.signingReady;
   }
 
   private assertSendable(tx: Transaction): void {

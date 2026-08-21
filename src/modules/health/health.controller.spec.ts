@@ -170,6 +170,7 @@ describe('GET /health (oracle freshness + scheduler-added jobs)', () => {
           provide: StellarClient,
           useValue: {
             getServer: () => ({ getLatestLedger: async () => ({ sequence: 4242 }) }),
+            isSigningReady: () => true,
           },
         },
         {
