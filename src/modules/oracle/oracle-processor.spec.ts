@@ -2,7 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { ConfigService } from '@nestjs/config';
 import { SorobanRpc } from '@stellar/stellar-sdk';
-import { OracleProcessor } from './oracle-processor';
+import { OracleProcessor, mapSnapshotToPayload } from './oracle-processor';
 import { OracleSubmission, SubmissionStatus } from './entities/oracle-submission.entity';
 import { GovernanceConfig } from '../governance/entities/governance-config.entity';
 import { StellarService } from '../stellar/stellar.service';
@@ -22,7 +22,15 @@ function makeSubmission(overrides: Partial<OracleSubmission> = {}): OracleSubmis
     nonce: 1,
     txHash: '',
     status: SubmissionStatus.PENDING,
-    readingsSnapshot: { dissolvedOxygen: 6.8, ph: 7.2 },
+    readingsSnapshot: {
+      ph: 7.2,
+      turbidity: 12.4,
+      dissolvedOxygen: 6.8,
+      flowRate: 1.834,
+      nitrogen: 2.45,
+      phosphorus: 0.125,
+      temperature: 18.5,
+    },
     result: null,
     createdAt: new Date(),
     updatedAt: new Date(),
@@ -56,7 +64,102 @@ const SUCCESS_RESPONSE = {
 } as SorobanRpc.Api.GetSuccessfulTransactionResponse;
 
 // ---------------------------------------------------------------------------
-// Tests
+// Unit tests for mapSnapshotToPayload (exported pure function)
+// ---------------------------------------------------------------------------
+
+describe('mapSnapshotToPayload', () => {
+  it('maps a full camelCase snapshot to a complete payload', () => {
+    const snapshot = {
+      ph: 7.2,
+      turbidity: 12.4,
+      dissolvedOxygen: 6.8,
+      flowRate: 1.834,
+      nitrogen: 2.45,
+      phosphorus: 0.125,
+      temperature: 18.5,
+    };
+    const payload = mapSnapshotToPayload(snapshot);
+    expect(payload).toEqual({
+      ph: 7.2,
+      turbidity: 12.4,
+      dissolvedOxygen: 6.8,
+      flowRate: 1.834,
+      nitrogen: 2.45,
+      phosphorus: 0.125,
+      temperature: 18.5,
+    });
+  });
+
+  it('maps a full snake_case snapshot to camelCase payload fields', () => {
+    const snapshot = {
+      ph: 7.0,
+      turbidity_ntu: 15.0,
+      dissolved_oxygen: 5.5,
+      flow_rate_cms: 2.1,
+      total_nitrogen_mgl: 3.0,
+      total_phosphorus_mgl: 0.2,
+      temperature_c: 20.0,
+    };
+    const payload = mapSnapshotToPayload(snapshot);
+    expect(payload.ph).toBe(7.0);
+    expect(payload.turbidity).toBe(15.0);
+    expect(payload.dissolvedOxygen).toBe(5.5);
+    expect(payload.flowRate).toBe(2.1);
+    expect(payload.nitrogen).toBe(3.0);
+    expect(payload.phosphorus).toBe(0.2);
+    expect(payload.temperature).toBe(20.0);
+  });
+
+  it('sets absent parameters to null', () => {
+    const payload = mapSnapshotToPayload({ ph: 7.0 });
+    expect(payload.ph).toBe(7.0);
+    expect(payload.turbidity).toBeNull();
+    expect(payload.dissolvedOxygen).toBeNull();
+    expect(payload.flowRate).toBeNull();
+    expect(payload.nitrogen).toBeNull();
+    expect(payload.phosphorus).toBeNull();
+    expect(payload.temperature).toBeNull();
+  });
+
+  it('coerces string-encoded numbers', () => {
+    const payload = mapSnapshotToPayload({ dissolvedOxygen: '6.5', ph: '7.1' });
+    expect(payload.dissolvedOxygen).toBe(6.5);
+    expect(payload.ph).toBe(7.1);
+  });
+
+  it('throws when the snapshot has no recognised numeric fields', () => {
+    expect(() => mapSnapshotToPayload({})).toThrow(
+      /no recognisable numeric parameters/,
+    );
+  });
+
+  it('throws when every recognised key is null/undefined', () => {
+    expect(() =>
+      mapSnapshotToPayload({ ph: null, dissolvedOxygen: undefined }),
+    ).toThrow(/no recognisable numeric parameters/);
+  });
+
+  it('throws when only unrecognised keys are present', () => {
+    expect(() => mapSnapshotToPayload({ salinity: 35, conductivity: 1200 })).toThrow(
+      /no recognisable numeric parameters/,
+    );
+  });
+
+  it('ignores non-finite values (NaN, Infinity)', () => {
+    // NaN and Infinity should not satisfy the "has any value" check
+    expect(() => mapSnapshotToPayload({ ph: NaN, dissolvedOxygen: Infinity })).toThrow(
+      /no recognisable numeric parameters/,
+    );
+  });
+
+  it('prefers camelCase over snake_case when both are present', () => {
+    const payload = mapSnapshotToPayload({ dissolvedOxygen: 7.0, dissolved_oxygen: 5.0 });
+    expect(payload.dissolvedOxygen).toBe(7.0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Integration tests for OracleProcessor.processSubmission
 // ---------------------------------------------------------------------------
 
 describe('OracleProcessor', () => {
@@ -188,8 +291,19 @@ describe('OracleProcessor', () => {
     });
   });
 
-  it('calls submitReading with correct arguments derived from readingsSnapshot', async () => {
-    findOneMock.mockResolvedValue(makeSubmission({ readingsSnapshot: { dissolvedOxygen: 7.5 } }));
+  // ── multi-parameter mapping ───────────────────────────────────────────────
+
+  it('calls submitReading with the full OracleReadingPayload derived from readingsSnapshot', async () => {
+    const snapshot = {
+      ph: 7.2,
+      turbidity: 12.4,
+      dissolvedOxygen: 6.8,
+      flowRate: 1.834,
+      nitrogen: 2.45,
+      phosphorus: 0.125,
+      temperature: 18.5,
+    };
+    findOneMock.mockResolvedValue(makeSubmission({ readingsSnapshot: snapshot }));
     submitReadingMock.mockResolvedValue({ txHash: 'tx-hash', response: SUCCESS_RESPONSE });
 
     await processor.processSubmission(makeJob({ nonce: 5 }));
@@ -197,12 +311,21 @@ describe('OracleProcessor', () => {
     expect(submitReadingMock).toHaveBeenCalledWith(
       'CONTRACT_ORACLE_ID',
       'proj-1',
-      { value: 7.5 },
+      {
+        ph: 7.2,
+        turbidity: 12.4,
+        dissolvedOxygen: 6.8,
+        flowRate: 1.834,
+        nitrogen: 2.45,
+        phosphorus: 0.125,
+        temperature: 18.5,
+      },
       5,
     );
   });
 
-  it('falls back to ph when dissolvedOxygen is absent from snapshot', async () => {
+  it('passes null for absent parameters rather than defaulting to 0', async () => {
+    // Only pH is present; everything else should be null, not zero.
     findOneMock.mockResolvedValue(makeSubmission({ readingsSnapshot: { ph: 6.9 } }));
     submitReadingMock.mockResolvedValue({ txHash: 'tx-hash', response: SUCCESS_RESPONSE });
 
@@ -211,23 +334,142 @@ describe('OracleProcessor', () => {
     expect(submitReadingMock).toHaveBeenCalledWith(
       expect.any(String),
       expect.any(String),
-      { value: 6.9 },
+      expect.objectContaining({
+        ph: 6.9,
+        turbidity: null,
+        dissolvedOxygen: null,
+        flowRate: null,
+        nitrogen: null,
+        phosphorus: null,
+        temperature: null,
+      }),
       expect.any(Number),
     );
   });
 
-  it('uses value 0 when snapshot has no recognised keys', async () => {
-    findOneMock.mockResolvedValue(makeSubmission({ readingsSnapshot: { temperature: 20 } }));
+  it('maps snake_case snapshot fields to the structured payload', async () => {
+    const snapshot = {
+      ph: 7.0,
+      dissolved_oxygen: 5.5,
+      total_nitrogen_mgl: 3.0,
+    };
+    findOneMock.mockResolvedValue(makeSubmission({ readingsSnapshot: snapshot }));
     submitReadingMock.mockResolvedValue({ txHash: 'tx-hash', response: SUCCESS_RESPONSE });
 
     await processor.processSubmission(makeJob());
 
-    expect(submitReadingMock).toHaveBeenCalledWith(
-      expect.any(String),
-      expect.any(String),
-      { value: 0 },
-      expect.any(Number),
+    const call = submitReadingMock.mock.calls[0];
+    const payload = call[2];
+    expect(payload.ph).toBe(7.0);
+    expect(payload.dissolvedOxygen).toBe(5.5);
+    expect(payload.nitrogen).toBe(3.0);
+  });
+
+  // ── empty snapshot must error, not send 0 ────────────────────────────────
+
+  it('marks FAILED and throws when snapshot contains no recognisable parameters', async () => {
+    findOneMock.mockResolvedValue(makeSubmission({ readingsSnapshot: {} }));
+
+    await expect(processor.processSubmission(makeJob())).rejects.toThrow(
+      /no recognisable numeric parameters/,
     );
+
+    const failedSnapshot = savedSnapshots.find((s) => s.status === SubmissionStatus.FAILED);
+    expect(failedSnapshot).toBeDefined();
+    expect(failedSnapshot!.result).toMatchObject({
+      error: expect.stringMatching(/no recognisable numeric parameters/),
+    });
+    expect(submitReadingMock).not.toHaveBeenCalled();
+  });
+
+  it('marks FAILED when all snapshot values are null', async () => {
+    findOneMock.mockResolvedValue(
+      makeSubmission({ readingsSnapshot: { ph: null, dissolvedOxygen: null } }),
+    );
+
+    await expect(processor.processSubmission(makeJob())).rejects.toThrow(
+      /no recognisable numeric parameters/,
+    );
+    expect(submitReadingMock).not.toHaveBeenCalled();
+  });
+
+  // ── scoreReading penalty applies only to DO ───────────────────────────────
+
+  it('applies the DO penalty only to dissolvedOxygen, leaving other fields unchanged', async () => {
+    const snapshot = {
+      ph: 7.2,
+      turbidity: 5.0,
+      dissolvedOxygen: 3.0, // below typical doThreshold of 5.0
+      temperature: 20.0,
+    };
+    findOneMock.mockResolvedValue(makeSubmission({ readingsSnapshot: snapshot }));
+    submitReadingMock.mockResolvedValue({ txHash: 'tx-hash', response: SUCCESS_RESPONSE });
+
+    // Inject a config snapshot with doThreshold = 5.0 via job data
+    const jobWithConfig = {
+      data: {
+        submissionId: 'sub-1',
+        projectId: 'proj-1',
+        oracleAddress: 'GABC123',
+        nonce: 1,
+        configSnapshot: {
+          protocolFeeBps: 100,
+          minOracleConfirmations: 3,
+          phMin: null,
+          phMax: null,
+          doThreshold: 5.0,
+          tempPenaltyDelta: null,
+          weightVolumetric: 0.5,
+          weightNitrogen: 0.3,
+          weightPhosphorus: 0.2,
+        },
+      },
+    } as never;
+
+    await processor.processSubmission(jobWithConfig);
+
+    const call = submitReadingMock.mock.calls[0];
+    const payload = call[2];
+
+    // DO should be penalised: 3.0 * 0.8 = 2.4
+    expect(payload.dissolvedOxygen).toBeCloseTo(2.4, 3);
+    // pH must be untouched
+    expect(payload.ph).toBe(7.2);
+    // turbidity must be untouched
+    expect(payload.turbidity).toBe(5.0);
+    // temperature must be untouched
+    expect(payload.temperature).toBe(20.0);
+  });
+
+  it('does not penalise DO when it meets or exceeds the threshold', async () => {
+    const snapshot = { dissolvedOxygen: 6.0 };
+    findOneMock.mockResolvedValue(makeSubmission({ readingsSnapshot: snapshot }));
+    submitReadingMock.mockResolvedValue({ txHash: 'tx-hash', response: SUCCESS_RESPONSE });
+
+    const jobWithConfig = {
+      data: {
+        submissionId: 'sub-1',
+        projectId: 'proj-1',
+        oracleAddress: 'GABC123',
+        nonce: 1,
+        configSnapshot: {
+          protocolFeeBps: 100,
+          minOracleConfirmations: 3,
+          phMin: null,
+          phMax: null,
+          doThreshold: 5.0,
+          tempPenaltyDelta: null,
+          weightVolumetric: 0.5,
+          weightNitrogen: 0.3,
+          weightPhosphorus: 0.2,
+        },
+      },
+    } as never;
+
+    await processor.processSubmission(jobWithConfig);
+
+    const payload = submitReadingMock.mock.calls[0][2];
+    expect(payload.dissolvedOxygen).toBe(6.0);
   });
 
   // ── SUBMITTED → FAILED ───────────────────────────────────────────────────

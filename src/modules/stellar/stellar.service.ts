@@ -15,6 +15,24 @@ import {
 } from '@stellar/stellar-sdk';
 import { BigNumber } from 'bignumber.js';
 
+/**
+ * Structured multi-parameter water-quality reading submitted to the Soroban
+ * oracle contract.  Every field is optional (nullable) so sensors that do not
+ * measure a particular parameter can still participate.
+ *
+ * At least one numeric field MUST be non-null; the oracle processor enforces
+ * this before calling submitReading().
+ */
+export interface OracleReadingPayload {
+  ph: number | null;
+  turbidity: number | null;
+  dissolvedOxygen: number | null;
+  flowRate: number | null;
+  nitrogen: number | null;
+  phosphorus: number | null;
+  temperature: number | null;
+}
+
 @Injectable()
 export class StellarService {
   private readonly logger = new Logger(StellarService.name);
@@ -209,12 +227,44 @@ export class StellarService {
 
   // ── Oracle ──
 
+  /**
+   * Submit a multi-parameter water-quality reading to the Soroban oracle contract.
+   *
+   * The contract's `submit_reading` v2 signature is:
+   *
+   *   submit_reading(
+   *     project_id : String,
+   *     ph         : Option<i128>,   // × 1 000 (3 dp fixed-point)
+   *     turbidity  : Option<i128>,   // × 1 000
+   *     do         : Option<i128>,   // × 1 000  (dissolved oxygen)
+   *     flow_rate  : Option<i128>,   // × 1 000
+   *     nitrogen   : Option<i128>,   // × 1 000
+   *     phosphorus : Option<i128>,   // × 1 000
+   *     temperature: Option<i128>,   // × 1 000
+   *     nonce      : u32,
+   *   )
+   *
+   * Float values are multiplied by 1 000 and truncated to integer so the
+   * contract can store them as i128 without losing sub-unit precision.
+   * A `null` field is encoded as `ScVal::Void` (the Soroban None variant of
+   * Option<i128>), which tells the contract the sensor did not report that
+   * parameter — it is distinct from a zero reading.
+   *
+   * @throws {Error} if the payload contains no numeric fields at all (all null).
+   */
   async submitReading(
     oracleContractId: string,
     projectId: string,
-    reading: { value: number },
+    reading: OracleReadingPayload,
     nonce: number,
   ): Promise<{ txHash: string; response: SorobanRpc.Api.GetTransactionResponse }> {
+    // Encode a nullable float as Option<i128>: multiply by 1_000 and truncate.
+    // null → xdr.ScVal.scvVoid() (Soroban None)
+    const encodeParam = (v: number | null): xdr.ScVal =>
+      v === null
+        ? xdr.ScVal.scvVoid()
+        : nativeToScVal(Math.trunc(Math.round(v * 1000)), { type: 'i128' });
+
     const keypair = this.stellarClient.getKeypair();
     const network = await this.getNetwork();
     const account = await this.buildAccount(keypair);
@@ -228,7 +278,13 @@ export class StellarService {
         contract.call(
           'submit_reading',
           nativeToScVal(projectId, { type: 'string' }),
-          nativeToScVal(reading.value, { type: 'i128' }),
+          encodeParam(reading.ph),
+          encodeParam(reading.turbidity),
+          encodeParam(reading.dissolvedOxygen),
+          encodeParam(reading.flowRate),
+          encodeParam(reading.nitrogen),
+          encodeParam(reading.phosphorus),
+          encodeParam(reading.temperature),
           nativeToScVal(nonce, { type: 'u32' }),
         ),
       )

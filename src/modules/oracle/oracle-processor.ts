@@ -7,7 +7,7 @@ import { ConfigService } from '@nestjs/config';
 import { SorobanRpc } from '@stellar/stellar-sdk';
 import { OracleSubmission, SubmissionStatus } from './entities/oracle-submission.entity';
 import { GovernanceConfig } from '../governance/entities/governance-config.entity';
-import { StellarService } from '../stellar/stellar.service';
+import { StellarService, OracleReadingPayload } from '../stellar/stellar.service';
 import { CreditScoringService } from './credit-scoring.service';
 import { Project } from '../projects/entities/project.entity';
 import { ReadingBatch, BatchStatus } from '../sensors/entities/reading-batch.entity';
@@ -47,24 +47,62 @@ export interface GovernanceConfigSnapshot {
 }
 
 /**
- * Maps the free-form readingsSnapshot JSONB stored by OracleService into the
- * scalar value expected by StellarService.submitReading().
+ * Maps the free-form readingsSnapshot JSONB into a typed OracleReadingPayload
+ * that preserves ALL water-quality parameters rather than collapsing them to a
+ * single scalar.
  *
- * The contract's `submit_reading` takes a single i128 value.  We use the
- * dissolved-oxygen reading as the primary quality indicator; fall back to pH,
- * then to 0 so the call always goes through even when a sensor omits a field.
+ * Key differences from the old snapshotToReading():
+ * - Returns the full parameter set; no information is lost.
+ * - Accepts both camelCase and snake_case sensor field names.
+ * - Throws a descriptive Error when the snapshot is empty or contains no
+ *   numeric values, rather than silently submitting a falsified zero reading.
+ *
+ * @throws {Error} when the snapshot produces a payload with every field null.
  */
-function snapshotToReading(snapshot: Record<string, unknown>): { value: number } {
-  const coerce = (v: unknown): number | undefined =>
-    typeof v === 'number' ? v : typeof v === 'string' ? parseFloat(v) || undefined : undefined;
+export function mapSnapshotToPayload(snapshot: Record<string, unknown>): OracleReadingPayload {
+  const coerce = (v: unknown): number | null => {
+    if (typeof v === 'number' && isFinite(v)) return v;
+    if (typeof v === 'string') {
+      const n = parseFloat(v);
+      return isFinite(n) ? n : null;
+    }
+    return null;
+  };
 
-  const value =
-    coerce(snapshot['dissolvedOxygen']) ??
-    coerce(snapshot['dissolved_oxygen']) ??
-    coerce(snapshot['ph']) ??
-    0;
+  const payload: OracleReadingPayload = {
+    ph: coerce(snapshot['ph']),
+    turbidity: coerce(snapshot['turbidity']) ?? coerce(snapshot['turbidity_ntu']),
+    dissolvedOxygen:
+      coerce(snapshot['dissolvedOxygen']) ??
+      coerce(snapshot['dissolved_oxygen']) ??
+      coerce(snapshot['dissolved_oxygen_mgl']),
+    flowRate:
+      coerce(snapshot['flowRate']) ??
+      coerce(snapshot['flow_rate']) ??
+      coerce(snapshot['flow_rate_cms']),
+    nitrogen:
+      coerce(snapshot['nitrogen']) ??
+      coerce(snapshot['total_nitrogen']) ??
+      coerce(snapshot['total_nitrogen_mgl']),
+    phosphorus:
+      coerce(snapshot['phosphorus']) ??
+      coerce(snapshot['total_phosphorus']) ??
+      coerce(snapshot['total_phosphorus_mgl']),
+    temperature:
+      coerce(snapshot['temperature']) ??
+      coerce(snapshot['temperature_c']) ??
+      coerce(snapshot['temp']),
+  };
 
-  return { value };
+  const hasAnyValue = Object.values(payload).some((v) => v !== null);
+  if (!hasAnyValue) {
+    throw new Error(
+      'Oracle snapshot contains no recognisable numeric parameters — ' +
+        'refusing to submit an empty reading to the contract.',
+    );
+  }
+
+  return payload;
 }
 
 @Processor('oracle-submit')
@@ -142,7 +180,22 @@ export class OracleProcessor {
     // Apply the snapshotted scoring thresholds to the raw reading before
     // forwarding to the contract.  Using the snapshot here means the scoring
     // formula is fixed for the entire lifetime of this job, even across retries.
-    const reading = this.scoreReading(snapshotToReading(submission.readingsSnapshot), govConfig);
+    //
+    // mapSnapshotToPayload() throws if the snapshot contains no recognisable
+    // numeric fields — this is the guard against submitting a falsified zero
+    // reading.  We persist FAILED here so the error is visible in the DB and
+    // the job is not silently swallowed.
+    let reading: OracleReadingPayload;
+    try {
+      reading = this.scoreReading(mapSnapshotToPayload(submission.readingsSnapshot), govConfig);
+    } catch (mappingError) {
+      const message = mappingError instanceof Error ? mappingError.message : String(mappingError);
+      this.logger.error(`Oracle submission ${submissionId} has invalid snapshot: ${message}`);
+      submission.status = SubmissionStatus.FAILED;
+      submission.result = { error: message };
+      await this.submissionRepo.save(submission);
+      throw mappingError;
+    }
 
     let txHash: string;
     let txResponse: SorobanRpc.Api.GetTransactionResponse;
@@ -261,29 +314,34 @@ export class OracleProcessor {
   }
 
   /**
-   * Applies governance thresholds to the raw reading value.
+   * Applies governance thresholds to the full reading payload.
    *
-   * Currently applies a simple quality penalty:
-   *   - If doThreshold is set and the reading value is below it, the value is
+   * Currently applies a quality penalty to the dissolved-oxygen field:
+   *   - If doThreshold is set and the DO reading is below it, the DO value is
    *     penalised by 20% to reflect degraded water quality.
    *
-   * Extend this method as the scoring formula evolves; the snapshot contract
-   * guarantees all parameters here came from the same config version.
+   * All other parameters are forwarded unchanged.  Extend this method as the
+   * scoring formula evolves; the snapshot contract guarantees all parameters
+   * here came from the same config version.
    */
   private scoreReading(
-    reading: { value: number },
+    reading: OracleReadingPayload,
     config: GovernanceConfigSnapshot,
-  ): { value: number } {
-    let { value } = reading;
+  ): OracleReadingPayload {
+    let { dissolvedOxygen } = reading;
 
-    if (config.doThreshold !== null && value < config.doThreshold) {
+    if (
+      config.doThreshold !== null &&
+      dissolvedOxygen !== null &&
+      dissolvedOxygen < config.doThreshold
+    ) {
       // Below DO threshold: apply a quality penalty.
-      value = Math.round(value * 0.8);
+      dissolvedOxygen = Math.round(dissolvedOxygen * 0.8 * 1000) / 1000;
       this.logger.debug(
-        `DO below threshold (${config.doThreshold}): penalising reading value to ${value}`,
+        `DO below threshold (${config.doThreshold}): penalising DO reading to ${dissolvedOxygen}`,
       );
     }
 
-    return { value };
+    return { ...reading, dissolvedOxygen };
   }
 }
