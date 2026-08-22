@@ -3,6 +3,9 @@ import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { NotificationsService } from './notifications.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { PaginationDto } from '../../common/dto/pagination.dto';
+import { PaginatedResponseDto } from '../../common/dto/api-response.dto';
+import { Notification } from './entities/notification.entity';
 
 @ApiTags('notifications')
 @ApiBearerAuth()
@@ -12,13 +15,18 @@ export class NotificationsController {
   constructor(private readonly notificationsService: NotificationsService) {}
 
   @Get()
-  @ApiOperation({ summary: 'List the current user notifications' })
+  @ApiOperation({
+    summary: 'List the current user notifications',
+    description:
+      'Supports offset (?page=&limit=) and keyset (?cursor=&limit=) pagination. ' +
+      'Prefer the cursor returned in meta.nextCursor for stable paging under a live feed.',
+  })
   async getNotifications(
     @CurrentUser('id') userId: string,
-    @Query('limit') limit?: number,
-    @Query('offset') offset?: number,
-  ) {
-    return this.notificationsService.getNotifications(userId, limit, offset);
+    @Query() pagination: PaginationDto,
+  ): Promise<PaginatedResponseDto<Notification>> {
+    const result = await this.notificationsService.getNotifications(userId, pagination);
+    return PaginatedResponseDto.fromList(result);
   }
 
   @Patch(':id/read')

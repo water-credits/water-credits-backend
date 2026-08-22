@@ -16,6 +16,10 @@ export enum ProposalStatus {
 }
 
 @Entity('proposals')
+// Composite indexes backing keyset (created_at, id) pagination of
+// GET /governance/proposals and its status filter variant.
+@Index('idx_proposals_created_at_id', ['createdAt', 'id'])
+@Index('idx_proposals_status_created_at_id', ['status', 'createdAt', 'id'])
 export class Proposal {
   @PrimaryGeneratedColumn('uuid')
   id: string;

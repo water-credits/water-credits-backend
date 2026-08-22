@@ -21,6 +21,9 @@ export enum NotificationType {
 }
 
 @Entity('notifications')
+// Composite index backing keyset (created_at, id) pagination of
+// GET /notifications, which is always scoped to the caller's user_id.
+@Index('idx_notifications_user_created_at_id', ['userId', 'createdAt', 'id'])
 export class Notification {
   @PrimaryGeneratedColumn('uuid')
   id: string;

@@ -187,14 +187,13 @@ describe('SensorsService', () => {
       batchRepo.increment.mockResolvedValue(undefined);
 
       // Mock dataSource.transaction to use the real save and increment mocks
-      dataSource.transaction.mockImplementation(
-        (callback) =>
-          callback({
-            save: readingRepo.save,
-            increment: jest.fn((entity, where, column, value) =>
-              batchRepo.increment(where, column, value),
-            ),
-          }),
+      dataSource.transaction.mockImplementation((callback) =>
+        callback({
+          save: readingRepo.save,
+          increment: jest.fn((entity, where, column, value) =>
+            batchRepo.increment(where, column, value),
+          ),
+        }),
       );
 
       // Wire the three raw queries that resolveBatch() issues:
@@ -460,14 +459,13 @@ describe('SensorsService', () => {
       batchRepo.increment.mockResolvedValue(undefined);
 
       // Mock dataSource.transaction to use the real save and increment mocks
-      dataSource.transaction.mockImplementation(
-        (callback) =>
-          callback({
-            save: readingRepo.save,
-            increment: jest.fn((entity, where, column, value) =>
-              batchRepo.increment(where, column, value),
-            ),
-          }),
+      dataSource.transaction.mockImplementation((callback) =>
+        callback({
+          save: readingRepo.save,
+          increment: jest.fn((entity, where, column, value) =>
+            batchRepo.increment(where, column, value),
+          ),
+        }),
       );
 
       // Build a valid signature for an all-null param set
@@ -985,8 +983,10 @@ describe('SensorsService — getReadings', () => {
     return {
       andWhere: jest.fn().mockReturnThis(),
       orderBy: jest.fn().mockReturnThis(),
+      addOrderBy: jest.fn().mockReturnThis(),
       skip: jest.fn().mockReturnThis(),
       take: jest.fn().mockReturnThis(),
+      getMany: jest.fn().mockResolvedValue([]),
       getManyAndCount: jest.fn().mockResolvedValue([[], 0]),
     };
   }
@@ -1039,6 +1039,36 @@ describe('SensorsService — getReadings', () => {
     expect(qb.getManyAndCount).toHaveBeenCalled();
     expect(result.page).toBe(1);
     expect(result.limit).toBe(20);
+  });
+
+  it('uses keyset (cursor) mode when a cursor is supplied', async () => {
+    const qb = makeQb();
+    const createdAt = new Date('2026-08-01T00:00:00Z');
+    const timestamp = new Date('2026-08-01T00:00:00Z');
+    // Over-fetch by one (limit + 1) so the paginator reports hasMore.
+    qb.getMany.mockResolvedValue([
+      { id: 'r1', timestamp, createdAt },
+      { id: 'r2', timestamp, createdAt },
+      { id: 'r3', timestamp, createdAt },
+    ]);
+    readingRepo.createQueryBuilder.mockReturnValue(qb);
+
+    const cursor = Buffer.from(
+      JSON.stringify({ v: new Date('2026-09-01T00:00:00Z').toISOString(), id: 'seed' }),
+    ).toString('base64url');
+
+    const result = await service.getReadings({ cursor, limit: 2 } as never, 'admin-1', 'admin');
+
+    // Keyset mode seeks with a row-comparison predicate and never counts/skips.
+    expect(qb.getManyAndCount).not.toHaveBeenCalled();
+    expect(qb.skip).not.toHaveBeenCalled();
+    expect(qb.take).toHaveBeenCalledWith(3);
+    expect(qb.orderBy).toHaveBeenCalledWith('reading.timestamp', 'DESC');
+    expect(qb.addOrderBy).toHaveBeenCalledWith('reading.id', 'DESC');
+    expect(result.data).toHaveLength(2);
+    expect(result.hasMore).toBe(true);
+    expect(result.nextCursor).toBeTruthy();
+    expect(result.total).toBeUndefined();
   });
 
   it('filters by deviceId when provided', async () => {
@@ -1252,14 +1282,13 @@ describe('SensorsService — validateParameters unknown key', () => {
     batchRepo.increment.mockResolvedValue(undefined);
 
     // Mock dataSource.transaction to use the real save and increment mocks
-    dataSource.transaction.mockImplementation(
-      (callback) =>
-        callback({
-          save: readingRepo.save,
-          increment: jest.fn((entity, where, column, value) =>
-            batchRepo.increment(where, column, value),
-          ),
-        }),
+    dataSource.transaction.mockImplementation((callback) =>
+      callback({
+        save: readingRepo.save,
+        increment: jest.fn((entity, where, column, value) =>
+          batchRepo.increment(where, column, value),
+        ),
+      }),
     );
 
     // Setup resolveBatch mocks

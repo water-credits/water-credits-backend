@@ -31,7 +31,22 @@ type MockRepo = {
   save: jest.Mock;
   update: jest.Mock;
   count: jest.Mock;
+  createQueryBuilder: jest.Mock;
 };
+
+// Chainable QueryBuilder mock covering the surface the `paginate()` helper uses.
+function makeQb() {
+  return {
+    where: jest.fn().mockReturnThis(),
+    andWhere: jest.fn().mockReturnThis(),
+    orderBy: jest.fn().mockReturnThis(),
+    addOrderBy: jest.fn().mockReturnThis(),
+    skip: jest.fn().mockReturnThis(),
+    take: jest.fn().mockReturnThis(),
+    getMany: jest.fn().mockResolvedValue([]),
+    getManyAndCount: jest.fn().mockResolvedValue([[], 0]),
+  };
+}
 
 function makeRepo(): MockRepo {
   return {
@@ -40,6 +55,7 @@ function makeRepo(): MockRepo {
     save: jest.fn(),
     update: jest.fn(),
     count: jest.fn(),
+    createQueryBuilder: jest.fn(() => makeQb()),
   };
 }
 
@@ -121,37 +137,72 @@ describe('UsersService', () => {
   // ── findAll ───────────────────────────────────────────────────────────────
 
   describe('findAll', () => {
-    it('returns paginated results with default page/limit', async () => {
+    it('returns offset-paginated results with default page/limit', async () => {
       const users = [makeUser(), makeUser()];
-      repo.findAndCount.mockResolvedValue([users, 2]);
+      const qb = makeQb();
+      qb.getManyAndCount.mockResolvedValue([users, 2]);
+      repo.createQueryBuilder.mockReturnValue(qb);
 
       const result = await service.findAll();
+
       expect(result).toEqual({ data: users, total: 2, page: 1, limit: 20 });
-      expect(repo.findAndCount).toHaveBeenCalledWith({
-        skip: 0,
-        take: 20,
-        order: { createdAt: 'DESC' },
-      });
+      // Ordering carries the id tiebreaker so pages are a strict total order.
+      expect(qb.orderBy).toHaveBeenCalledWith('user.created_at', 'DESC');
+      expect(qb.addOrderBy).toHaveBeenCalledWith('user.id', 'DESC');
+      expect(qb.skip).toHaveBeenCalledWith(0);
+      expect(qb.take).toHaveBeenCalledWith(20);
     });
 
     it('respects custom page and limit', async () => {
       const users = [makeUser()];
-      repo.findAndCount.mockResolvedValue([users, 10]);
+      const qb = makeQb();
+      qb.getManyAndCount.mockResolvedValue([users, 10]);
+      repo.createQueryBuilder.mockReturnValue(qb);
 
-      const result = await service.findAll(3, 10);
+      const result = await service.findAll({ page: 3, limit: 10 });
+
       expect(result).toEqual({ data: users, total: 10, page: 3, limit: 10 });
-      expect(repo.findAndCount).toHaveBeenCalledWith({
-        skip: 20,
-        take: 10,
-        order: { createdAt: 'DESC' },
-      });
+      expect(qb.skip).toHaveBeenCalledWith(20);
+      expect(qb.take).toHaveBeenCalledWith(10);
     });
 
     it('returns empty array when no users exist', async () => {
-      repo.findAndCount.mockResolvedValue([[], 0]);
+      const qb = makeQb();
+      qb.getManyAndCount.mockResolvedValue([[], 0]);
+      repo.createQueryBuilder.mockReturnValue(qb);
 
       const result = await service.findAll();
       expect(result).toEqual({ data: [], total: 0, page: 1, limit: 20 });
+    });
+
+    it('uses keyset mode and returns a nextCursor when a cursor is supplied', async () => {
+      // Over-fetch by one (limit + 1) signals there is another page.
+      const page = [makeUser({ id: 'u1' }), makeUser({ id: 'u2' })];
+      const qb = makeQb();
+      qb.getMany.mockResolvedValue([...page, makeUser({ id: 'u3' })]);
+      repo.createQueryBuilder.mockReturnValue(qb);
+
+      const result = await service.findAll({ cursor: undefined, limit: 2 });
+      // No cursor → offset mode; assert the keyset branch separately below.
+      expect(result.total).toBe(0);
+
+      const qb2 = makeQb();
+      qb2.getMany.mockResolvedValue([...page, makeUser({ id: 'u3' })]);
+      repo.createQueryBuilder.mockReturnValue(qb2);
+      const cursorResult = await service.findAll({
+        cursor: Buffer.from(
+          JSON.stringify({ v: new Date('2026-01-01T00:00:00Z').toISOString(), id: 'seed' }),
+        ).toString('base64url'),
+        limit: 2,
+      });
+
+      expect(cursorResult.data).toHaveLength(2);
+      expect(cursorResult.hasMore).toBe(true);
+      expect(cursorResult.nextCursor).toBeTruthy();
+      expect(cursorResult.total).toBeUndefined();
+      // Keyset mode seeks, it never uses OFFSET.
+      expect(qb2.skip).not.toHaveBeenCalled();
+      expect(qb2.take).toHaveBeenCalledWith(3);
     });
   });
 
