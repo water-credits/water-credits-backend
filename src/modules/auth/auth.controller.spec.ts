@@ -41,7 +41,7 @@ describe('AuthController', () => {
   });
 
   describe('challenge', () => {
-    it('should call authService.generateChallenge with the wallet and return the result', () => {
+    it('should call authService.generateChallenge with the wallet and return the result', async () => {
       const dto: ChallengeRequestDto = {
         wallet: 'GABCDEF1234567890123456789012345678901234567890123456',
       };
@@ -49,9 +49,9 @@ describe('AuthController', () => {
         challenge: 'abc123',
         expiresAt: new Date('2026-07-20T00:00:00Z'),
       };
-      authService.generateChallenge.mockReturnValue(expected);
+      authService.generateChallenge.mockResolvedValue(expected);
 
-      const result = controller.challenge(dto);
+      const result = await controller.challenge(dto);
 
       expect(authService.generateChallenge).toHaveBeenCalledWith(dto.wallet);
       expect(result).toBe(expected);

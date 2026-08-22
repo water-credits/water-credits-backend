@@ -7,13 +7,16 @@ import { HealthService } from './health.service';
 import { StellarClient } from '../stellar/stellar.client';
 import { IndexerService } from '../indexer/indexer.service';
 import { OracleScheduleState } from '../oracle/entities/oracle-schedule-state.entity';
+import { RedisService } from '../auth/redis.service';
 
 describe('HealthService checkStellar signing_ready', () => {
   async function buildService(opts: {
     signingReady: boolean;
     getLatestLedger?: () => Promise<{ sequence: number }>;
+    authRedisPing?: () => Promise<void>;
   }) {
     const getLatestLedger = opts.getLatestLedger ?? (async () => ({ sequence: 100 }));
+    const authRedisPing = opts.authRedisPing ?? (async () => undefined);
 
     const moduleRef = await Test.createTestingModule({
       providers: [
@@ -76,6 +79,10 @@ describe('HealthService checkStellar signing_ready', () => {
             }),
           },
         },
+        {
+          provide: RedisService,
+          useValue: { ping: authRedisPing },
+        },
       ],
     }).compile();
 
@@ -113,5 +120,46 @@ describe('HealthService checkStellar signing_ready', () => {
     expect(report.checks.stellar.signing_ready).toBe(true);
     expect(report.checks.stellar.status).toBe('degraded');
     expect(report.checks.stellar.detail).toBe('rpc down');
+  });
+
+  // ── authRedis (#88) ──────────────────────────────────────────────────
+
+  it('reports authRedis ok and does not affect overall status when the auth Redis client is reachable', async () => {
+    const service = await buildService({ signingReady: true });
+    const report = await service.getHealth();
+
+    expect(report.checks.authRedis.status).toBe('ok');
+    expect(report.status).toBe('ok');
+  });
+
+  it('reports authRedis down and degrades the overall report when the auth Redis client is unreachable', async () => {
+    const service = await buildService({
+      signingReady: true,
+      authRedisPing: async () => {
+        throw new Error('connect ECONNREFUSED 127.0.0.1:6379');
+      },
+    });
+    const report = await service.getHealth();
+
+    expect(report.checks.authRedis.status).toBe('down');
+    expect(report.checks.authRedis.detail).toBe('connect ECONNREFUSED 127.0.0.1:6379');
+    // A down component takes precedence over the 'ok' otherwise-healthy checks.
+    expect(report.status).toBe('down');
+  });
+
+  it('keeps the authRedis check independent from the Bull-queue redis check', async () => {
+    // Bull's queue Redis (checked via checkRedis) is healthy in every fixture
+    // here; this asserts authRedis is a genuinely separate component rather
+    // than reusing/aliasing that same check.
+    const service = await buildService({
+      signingReady: true,
+      authRedisPing: async () => {
+        throw new Error('auth redis down');
+      },
+    });
+    const report = await service.getHealth();
+
+    expect(report.checks.redis.status).toBe('ok');
+    expect(report.checks.authRedis.status).toBe('down');
   });
 });
