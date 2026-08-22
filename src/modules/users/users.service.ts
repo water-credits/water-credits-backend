@@ -31,6 +31,14 @@ export class UsersService {
     return this.userRepo.findOne({ where: { wallet } });
   }
 
+  /** All active users holding any of the given roles (e.g. escalation recipients). */
+  async findByRoles(roles: UserRole[]): Promise<User[]> {
+    if (roles.length === 0) {
+      return [];
+    }
+    return this.userRepo.find({ where: { role: In(roles), isActive: true } });
+  }
+
   async findAll(
     page = 1,
     limit = 20,

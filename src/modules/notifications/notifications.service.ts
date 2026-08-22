@@ -71,6 +71,26 @@ export class NotificationsService {
     );
   }
 
+  async notifySensorAlert(userId: string, projectId: string, alert: Record<string, unknown>) {
+    return this.createNotification(
+      userId,
+      NotificationType.SENSOR_ALERT,
+      'Sensor Alert',
+      this.buildSensorAlertMessage(projectId, alert),
+      { projectId, alert },
+    );
+  }
+
+  private buildSensorAlertMessage(projectId: string, alert: Record<string, unknown>): string {
+    if (alert.parameter === 'staleness') {
+      const minutes = alert.staleMinutes as number | undefined;
+      return `Device ${alert.deviceId} on project ${projectId} has not reported ${
+        minutes !== undefined ? `in over ${minutes} minutes` : 'recently'
+      }.`;
+    }
+    return `Device ${alert.deviceId} on project ${projectId} reported ${alert.parameter}=${alert.value}, ${alert.direction} threshold ${alert.threshold}.`;
+  }
+
   async notifyCreditMinted(userId: string, projectId: string, amount: number) {
     return this.createNotification(
       userId,
