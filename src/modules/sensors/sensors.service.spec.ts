@@ -1287,7 +1287,8 @@ describe('SensorsService — validateParameters unknown key', () => {
     } as SensorDevice;
     deviceRepo.findOne.mockResolvedValue(device);
 
-    const payload = buildPayload('dev-001', new Date().toISOString(), {
+    const timestamp = new Date().toISOString();
+    const payload = buildPayload('dev-001', timestamp, {
       ph: 7.0,
       turbidity: null,
       dissolvedOxygen: null,
@@ -1320,7 +1321,7 @@ describe('SensorsService — validateParameters unknown key', () => {
 
     const result = await service.ingestReading({
       deviceId: 'dev-001',
-      timestamp: new Date().toISOString(),
+      timestamp,
       ph: 7.0,
       someUnknownParam: 999 as never,
       signature,
