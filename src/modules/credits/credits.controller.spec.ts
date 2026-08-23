@@ -84,7 +84,7 @@ describe('CreditsController', () => {
       expect(result).toEqual({
         success: true,
         data: retirements,
-        meta: { total: 1, page: 1, limit: 20, totalPages: 1 },
+        meta: { mode: 'offset', total: 1, page: 1, limit: 20, totalPages: 1 },
         timestamp: expect.any(String),
       });
     });

@@ -5,6 +5,7 @@ import { User, UserRole } from './entities/user.entity';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { UpdateRoleDto } from './dto/update-role.dto';
 import { AdminUpdateUserDto } from './dto/admin-update-user.dto';
+import { paginate, PaginatedList, PaginationParams } from '../../common/pagination';
 
 // Roles that count towards the "at least one active admin" guarantee.
 const ADMIN_ROLES = [UserRole.ADMIN, UserRole.SUPER_ADMIN];
@@ -39,16 +40,13 @@ export class UsersService {
     return this.userRepo.find({ where: { role: In(roles), isActive: true } });
   }
 
-  async findAll(
-    page = 1,
-    limit = 20,
-  ): Promise<{ data: User[]; total: number; page: number; limit: number }> {
-    const [data, total] = await this.userRepo.findAndCount({
-      skip: (page - 1) * limit,
-      take: limit,
-      order: { createdAt: 'DESC' },
-    });
-    return { data, total, page, limit };
+  async findAll(params: PaginationParams = {}): Promise<PaginatedList<User>> {
+    const qb = this.userRepo.createQueryBuilder('user');
+    return paginate(
+      qb,
+      { alias: 'user', sortColumn: 'user.created_at', sortProperty: 'createdAt' },
+      params,
+    );
   }
 
   async updateProfile(userId: string, dto: UpdateUserDto): Promise<User> {

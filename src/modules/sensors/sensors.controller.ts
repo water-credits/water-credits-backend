@@ -55,8 +55,8 @@ export class SensorsController {
     @CurrentUser('id') userId: string,
     @CurrentUser('role') role?: string,
   ): Promise<PaginatedResponseDto<SensorReading>> {
-    const { data, total, page, limit } = await this.sensorsService.getReadings(query, userId, role);
-    return PaginatedResponseDto.from(data, total, page, limit);
+    const result = await this.sensorsService.getReadings(query, userId, role);
+    return PaginatedResponseDto.fromList(result);
   }
 
   @Get('readings/latest')

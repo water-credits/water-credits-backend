@@ -11,6 +11,9 @@ import { User } from '../../users/entities/user.entity';
 import { Project } from '../../projects/entities/project.entity';
 
 @Entity('retirements')
+// Composite index backing keyset (retired_at, id) pagination of
+// GET /credits/retirements, which is always scoped to the caller's user_id.
+@Index('idx_retirements_user_retired_at_id', ['userId', 'retiredAt', 'id'])
 export class Retirement {
   @PrimaryGeneratedColumn('uuid')
   id: string;

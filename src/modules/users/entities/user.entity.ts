@@ -17,6 +17,8 @@ export enum UserRole {
 }
 
 @Entity('users')
+// Composite index backing keyset (created_at, id) pagination of GET /users.
+@Index('idx_users_created_at_id', ['createdAt', 'id'])
 export class User {
   @PrimaryGeneratedColumn('uuid')
   id: string;

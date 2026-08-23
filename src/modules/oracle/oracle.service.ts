@@ -13,6 +13,7 @@ import { Project } from '../projects/entities/project.entity';
 import { GovernanceConfig } from '../governance/entities/governance-config.entity';
 import { ReadingBatch, BatchStatus } from '../sensors/entities/reading-batch.entity';
 import { CreditScoringService } from './credit-scoring.service';
+import { paginate, PaginatedList } from '../../common/pagination';
 
 export interface AggregatedReading {
   medianPh: number | null;
@@ -84,9 +85,7 @@ export class OracleService {
     return { totalSubmissions, pending, confirmed, failed, lastSubmission };
   }
 
-  async getSubmissions(
-    query: OracleQueryDto,
-  ): Promise<{ data: OracleSubmission[]; total: number; page: number; limit: number }> {
+  async getSubmissions(query: OracleQueryDto): Promise<PaginatedList<OracleSubmission>> {
     const qb = this.submissionRepo.createQueryBuilder('submission');
 
     if (query.projectId) {
@@ -107,11 +106,11 @@ export class OracleService {
       qb.andWhere('submission.created_at <= :endDate', { endDate: query.endDate });
     }
 
-    qb.orderBy('submission.created_at', 'DESC');
-    qb.skip(query.skip).take(query.limit);
-
-    const [data, total] = await qb.getManyAndCount();
-    return { data, total, page: query.page ?? 1, limit: query.limit ?? 20 };
+    return paginate(
+      qb,
+      { alias: 'submission', sortColumn: 'submission.created_at', sortProperty: 'createdAt' },
+      query,
+    );
   }
 
   async getPendingSubmissions(): Promise<OracleSubmission[]> {

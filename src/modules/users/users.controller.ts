@@ -36,11 +36,8 @@ export class UsersController {
   @Roles(UserRole.ADMIN)
   @ApiOperation({ summary: 'List all users (paginated)' })
   async findAll(@Query() pagination: PaginationDto): Promise<PaginatedResponseDto<User>> {
-    const { data, total, page, limit } = await this.usersService.findAll(
-      pagination.page,
-      pagination.limit,
-    );
-    return PaginatedResponseDto.from(data, total, page, limit);
+    const result = await this.usersService.findAll(pagination);
+    return PaginatedResponseDto.fromList(result);
   }
 
   @Patch(':id/kyc')

@@ -30,8 +30,8 @@ export class OracleController {
   async getSubmissions(
     @Query() query: OracleQueryDto,
   ): Promise<PaginatedResponseDto<OracleSubmission>> {
-    const { data, total, page, limit } = await this.oracleService.getSubmissions(query);
-    return PaginatedResponseDto.from(data, total, page, limit);
+    const result = await this.oracleService.getSubmissions(query);
+    return PaginatedResponseDto.fromList(result);
   }
 
   @Get('pending')

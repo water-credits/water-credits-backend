@@ -24,6 +24,7 @@ import { GovernanceQueryDto } from './dto/governance-query.dto';
 import { UpdateGovernanceConfigDto } from './dto/update-governance-config.dto';
 import { PendingConfigChangeDto } from './dto/pending-config-change.dto';
 import { StellarService } from '../stellar/stellar.service';
+import { paginate, PaginatedList } from '../../common/pagination';
 
 // PostgreSQL unique-violation error code
 const PG_UNIQUE_VIOLATION = '23505';
@@ -322,12 +323,7 @@ export class GovernanceService {
 
   // ── Proposals ─────────────────────────────────────────────────────────────
 
-  async getProposals(query: GovernanceQueryDto): Promise<{
-    data: Proposal[];
-    total: number;
-    page: number;
-    limit: number;
-  }> {
+  async getProposals(query: GovernanceQueryDto): Promise<PaginatedList<Proposal>> {
     const qb = this.proposalRepo.createQueryBuilder('proposal');
 
     if (query.status) {
@@ -340,11 +336,11 @@ export class GovernanceService {
       qb.andWhere('proposal.action_type = :actionType', { actionType: query.actionType });
     }
 
-    qb.orderBy('proposal.created_at', 'DESC');
-    qb.skip(query.skip).take(query.limit);
-
-    const [data, total] = await qb.getManyAndCount();
-    return { data, total, page: query.page ?? 1, limit: query.limit ?? 20 };
+    return paginate(
+      qb,
+      { alias: 'proposal', sortColumn: 'proposal.created_at', sortProperty: 'createdAt' },
+      query,
+    );
   }
 
   async getProposalById(id: string): Promise<Proposal> {

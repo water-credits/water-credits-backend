@@ -13,6 +13,7 @@ import { QueryReadingsDto } from './dto/query-readings.dto';
 import { RegisterDeviceDto } from './dto/register-device.dto';
 import { generateDeviceApiKey } from '../../common/utils/api-key.util';
 import { SensorProjectAccessService } from './sensor-project-access.service';
+import { paginate, PaginatedList } from '../../common/pagination';
 
 interface ParameterRange {
   min: number;
@@ -369,12 +370,7 @@ export class SensorsService {
     query: QueryReadingsDto,
     userId: string,
     role: string | undefined,
-  ): Promise<{
-    data: SensorReading[];
-    total: number;
-    page: number;
-    limit: number;
-  }> {
+  ): Promise<PaginatedList<SensorReading>> {
     const qb = this.readingRepo.createQueryBuilder('reading');
 
     if (query.projectId) {
@@ -399,11 +395,14 @@ export class SensorsService {
       qb.andWhere('reading.timestamp <= :endDate', { endDate: query.endDate });
     }
 
-    qb.orderBy('reading.timestamp', 'DESC');
-    qb.skip(query.skip).take(query.limit);
-
-    const [data, total] = await qb.getManyAndCount();
-    return { data, total, page: query.page ?? 1, limit: query.limit ?? 20 };
+    // Order by (timestamp, id) so pages are a strict total order. Cursor mode
+    // (query.cursor) seeks past the last row for consistency under concurrent
+    // ingestion; otherwise legacy page/limit offset mode is used.
+    return paginate(
+      qb,
+      { alias: 'reading', sortColumn: 'reading.timestamp', sortProperty: 'timestamp' },
+      query,
+    );
   }
 
   /**

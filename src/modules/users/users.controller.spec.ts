@@ -77,11 +77,11 @@ describe('UsersController', () => {
 
       const result = await controller.findAll(pagination);
 
-      expect(service.findAll).toHaveBeenCalledWith(2, 10);
+      expect(service.findAll).toHaveBeenCalledWith(pagination);
       expect(result).toMatchObject({
         success: true,
         data,
-        meta: { total: 1, page: 2, limit: 10, totalPages: 1 },
+        meta: { mode: 'offset', total: 1, page: 2, limit: 10, totalPages: 1 },
       });
     });
   });

@@ -48,8 +48,8 @@ export class CreditsController {
     @CurrentUser('id') userId: string,
     @Query() query: CreditQueryDto,
   ): Promise<PaginatedResponseDto<Retirement>> {
-    const { data, total, page, limit } = await this.creditsService.getRetirements(userId, query);
-    return PaginatedResponseDto.from(data, total, page, limit);
+    const result = await this.creditsService.getRetirements(userId, query);
+    return PaginatedResponseDto.fromList(result);
   }
 
   @Get('retirements/:id/certificate')
