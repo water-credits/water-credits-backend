@@ -2,7 +2,7 @@ import { Process, Processor } from '@nestjs/bull';
 import { Job } from 'bull';
 import { Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Repository } from 'typeorm';
+import { In, MoreThan, Not, Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { SorobanRpc } from '@stellar/stellar-sdk';
 import { OracleSubmission, SubmissionStatus } from './entities/oracle-submission.entity';
@@ -61,7 +61,9 @@ export interface GovernanceConfigSnapshot {
  */
 export function mapSnapshotToPayload(snapshot: Record<string, unknown>): OracleReadingPayload {
   const coerce = (v: unknown): number | null => {
-    if (typeof v === 'number' && isFinite(v)) return v;
+    if (typeof v === 'number' && isFinite(v)) {
+      return v;
+    }
     if (typeof v === 'string') {
       const n = parseFloat(v);
       return isFinite(n) ? n : null;
@@ -177,6 +179,82 @@ export class OracleProcessor {
       throw new Error('Oracle contract ID not configured');
     }
 
+    // Read current on-chain nonce to assign/re-validate nonce at processing time
+    let onChainNonce: number;
+    try {
+      onChainNonce = await this.stellarService.getOracleNonce(oracleContractId, oracleAddress);
+    } catch (error) {
+      this.logger.error(
+        `Could not read on-chain nonce for ${oracleAddress}: ${(error as Error).message}`,
+      );
+      throw error;
+    }
+
+    const expectedNonce = onChainNonce + 1;
+    let submitNonce = submission.nonce;
+
+    if (submission.nonce !== expectedNonce) {
+      if (submission.nonce < expectedNonce) {
+        if (submission.nonce === onChainNonce) {
+          this.logger.log(
+            `Submission ${submissionId} (nonce ${submission.nonce}) already confirmed on-chain. Marking as CONFIRMED.`,
+          );
+
+          submission.status = SubmissionStatus.CONFIRMED;
+          submission.txHash = submission.txHash || 'reconciled-on-chain';
+          submission.result = {
+            confirmed: true,
+            confirmedAt: new Date().toISOString(),
+            oracleAddress,
+            nonce: submission.nonce,
+            reconciled: true,
+          };
+          await this.submissionRepo.save(submission);
+
+          await this.calculateCreditsAndConfirmBatch(submission, projectId);
+          return;
+        } else {
+          this.logger.warn(
+            `Submission ${submissionId} has stale nonce ${submission.nonce} (expected ${expectedNonce}). Failing cleanly.`,
+          );
+          submission.status = SubmissionStatus.FAILED;
+          submission.result = {
+            error: `Stale submission: on-chain nonce ${onChainNonce} is ahead of submission nonce ${submission.nonce}`,
+          };
+          await this.submissionRepo.save(submission);
+          return;
+        }
+      } else {
+        const newerConfirmed = await this.submissionRepo.findOne({
+          where: {
+            oracleAddress,
+            status: SubmissionStatus.CONFIRMED,
+            id: Not(submission.id),
+            createdAt: MoreThan(submission.createdAt),
+          },
+        });
+
+        if (newerConfirmed) {
+          this.logger.warn(
+            `Submission ${submissionId} nonce ${submission.nonce} is higher than expected ${expectedNonce}, but a newer submission ${newerConfirmed.id} is already confirmed. Failing cleanly.`,
+          );
+          submission.status = SubmissionStatus.FAILED;
+          submission.result = {
+            error: `Stale submission: newer submission ${newerConfirmed.id} already confirmed`,
+          };
+          await this.submissionRepo.save(submission);
+          return;
+        } else {
+          this.logger.log(
+            `Re-sequencing submission ${submissionId} from nonce ${submission.nonce} to ${expectedNonce}`,
+          );
+          submission.nonce = expectedNonce;
+          await this.submissionRepo.save(submission);
+          submitNonce = expectedNonce;
+        }
+      }
+    }
+
     // Apply the snapshotted scoring thresholds to the raw reading before
     // forwarding to the contract.  Using the snapshot here means the scoring
     // formula is fixed for the entire lifetime of this job, even across retries.
@@ -209,7 +287,7 @@ export class OracleProcessor {
         oracleContractId,
         projectId,
         reading,
-        nonce,
+        submitNonce,
       ));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -232,7 +310,7 @@ export class OracleProcessor {
         confirmed: true,
         confirmedAt: new Date().toISOString(),
         oracleAddress,
-        nonce,
+        nonce: submitNonce,
         ledger: txResponse.ledger,
         // Embed the snapshot so auditors can see exactly which parameters
         // were in effect when this submission was scored.
@@ -242,42 +320,7 @@ export class OracleProcessor {
 
       this.logger.log(`Oracle submission ${submissionId} confirmed on-chain (txHash: ${txHash})`);
 
-      // Calculate credits and update ReadingBatch
-      try {
-        const project = await this.projectRepo.findOne({ where: { id: projectId } });
-        const config = await this.governanceConfigRepo.findOne({ order: { id: 'DESC' } });
-
-        if (project && config) {
-          const credits = this.creditScoringService.calculate(
-            submission.readingsSnapshot,
-            config,
-            Number(project.areaHectares),
-          );
-
-          // Find a pending/submitted batch to assign the credits to
-          const batch = await this.batchRepo.findOne({
-            where: {
-              projectId,
-              status: In([BatchStatus.PENDING, BatchStatus.SUBMITTED]),
-            },
-            order: { createdAt: 'DESC' },
-          });
-
-          if (batch) {
-            batch.status = BatchStatus.CONFIRMED;
-            batch.confirmedAt = new Date();
-            batch.creditsGenerated = credits.toNumber();
-            await this.batchRepo.save(batch);
-            this.logger.log(`Calculated ${batch.creditsGenerated} credits for batch ${batch.id}`);
-          } else {
-            this.logger.warn(`No pending batch found for project ${projectId} to assign credits`);
-          }
-        } else {
-          this.logger.warn(`Could not calculate credits: Project or Config missing`);
-        }
-      } catch (err) {
-        this.logger.error(`Error calculating credits for submission ${submissionId}`, err);
-      }
+      await this.calculateCreditsAndConfirmBatch(submission, projectId);
     } else {
       const message = `Unexpected terminal status from submitReading: ${txResponse.status}`;
       this.logger.error(message);
@@ -287,6 +330,46 @@ export class OracleProcessor {
       await this.submissionRepo.save(submission);
 
       throw new Error(message);
+    }
+  }
+
+  private async calculateCreditsAndConfirmBatch(
+    submission: OracleSubmission,
+    projectId: string,
+  ): Promise<void> {
+    try {
+      const project = await this.projectRepo.findOne({ where: { id: projectId } });
+      const config = await this.governanceConfigRepo.findOne({ order: { id: 'DESC' } });
+
+      if (project && config) {
+        const credits = this.creditScoringService.calculate(
+          submission.readingsSnapshot,
+          config,
+          Number(project.areaHectares),
+        );
+
+        const batch = await this.batchRepo.findOne({
+          where: {
+            projectId,
+            status: In([BatchStatus.PENDING, BatchStatus.SUBMITTED]),
+          },
+          order: { createdAt: 'DESC' },
+        });
+
+        if (batch) {
+          batch.status = BatchStatus.CONFIRMED;
+          batch.confirmedAt = new Date();
+          batch.creditsGenerated = credits.toNumber();
+          await this.batchRepo.save(batch);
+          this.logger.log(`Calculated ${batch.creditsGenerated} credits for batch ${batch.id}`);
+        } else {
+          this.logger.warn(`No pending batch found for project ${projectId} to assign credits`);
+        }
+      } else {
+        this.logger.warn(`Could not calculate credits: Project or Config missing`);
+      }
+    } catch (err) {
+      this.logger.error(`Error calculating credits for submission ${submission.id}`, err);
     }
   }
 

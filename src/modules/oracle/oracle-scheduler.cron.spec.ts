@@ -5,6 +5,7 @@ import { ScheduleModule, SchedulerRegistry } from '@nestjs/schedule';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import {
   ORACLE_SUBMISSION_CRON_NAME,
+  ORACLE_RECONCILIATION_CRON_NAME,
   OracleSchedulerService,
   resolveCronExpression,
 } from './oracle-scheduler.service';
@@ -43,7 +44,12 @@ describe('OracleSchedulerService @Cron registration', () => {
         OracleSchedulerService,
         {
           provide: OracleService,
-          useValue: { aggregateReadingsForBatch: jest.fn(), triggerSubmission: jest.fn() },
+          useValue: {
+            aggregateReadingsForBatch: jest.fn(),
+            triggerSubmission: jest.fn(),
+            getUniqueOracleAddresses: jest.fn().mockResolvedValue([]),
+            reconcile: jest.fn(),
+          },
         },
         {
           provide: ConfigService,
@@ -81,6 +87,13 @@ describe('OracleSchedulerService @Cron registration', () => {
     const job = registry.getCronJob(ORACLE_SUBMISSION_CRON_NAME);
     expect(job.cronTime.source).toBe(DEFAULT_ORACLE_SUBMISSION_CRON);
     expect(job.isActive).toBe(true);
+
+    // reconciliation cron
+    expect(ORACLE_RECONCILIATION_CRON_NAME).toBe('oracle-reconciliation-cycle');
+    expect(registry.doesExist('cron', ORACLE_RECONCILIATION_CRON_NAME)).toBe(true);
+    const reconJob = registry.getCronJob(ORACLE_RECONCILIATION_CRON_NAME);
+    expect(reconJob.cronTime.source).toBe('30 * * * *');
+    expect(reconJob.isActive).toBe(true);
   });
 
   it('runs a submission cycle when the cron fires', async () => {
@@ -93,13 +106,24 @@ describe('OracleSchedulerService @Cron registration', () => {
     expect(cycle).toHaveBeenCalledTimes(1);
   });
 
+  it('runs a reconciliation cycle when the cron fires', async () => {
+    const recon = jest.spyOn(scheduler, 'runReconciliation').mockResolvedValue(undefined);
+
+    await moduleRef.get(SchedulerRegistry).getCronJob(ORACLE_RECONCILIATION_CRON_NAME).fireOnTick();
+
+    expect(recon).toHaveBeenCalledTimes(1);
+  });
+
   it('stops the cron job on application shutdown', async () => {
     const job = moduleRef.get(SchedulerRegistry).getCronJob(ORACLE_SUBMISSION_CRON_NAME);
+    const reconJob = moduleRef.get(SchedulerRegistry).getCronJob(ORACLE_RECONCILIATION_CRON_NAME);
     expect(job.isActive).toBe(true);
+    expect(reconJob.isActive).toBe(true);
 
     await moduleRef.close();
 
     expect(job.isActive).toBe(false);
+    expect(reconJob.isActive).toBe(false);
   });
 
   afterEach(async () => {

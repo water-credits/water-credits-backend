@@ -128,15 +128,13 @@ describe('mapSnapshotToPayload', () => {
   });
 
   it('throws when the snapshot has no recognised numeric fields', () => {
-    expect(() => mapSnapshotToPayload({})).toThrow(
-      /no recognisable numeric parameters/,
-    );
+    expect(() => mapSnapshotToPayload({})).toThrow(/no recognisable numeric parameters/);
   });
 
   it('throws when every recognised key is null/undefined', () => {
-    expect(() =>
-      mapSnapshotToPayload({ ph: null, dissolvedOxygen: undefined }),
-    ).toThrow(/no recognisable numeric parameters/);
+    expect(() => mapSnapshotToPayload({ ph: null, dissolvedOxygen: undefined })).toThrow(
+      /no recognisable numeric parameters/,
+    );
   });
 
   it('throws when only unrecognised keys are present', () => {
@@ -173,6 +171,7 @@ describe('OracleProcessor', () => {
   let findOneMock: jest.Mock;
   let saveMock: jest.Mock;
   let submitReadingMock: jest.Mock;
+  let getOracleNonceMock: jest.Mock;
   let configGetMock: jest.Mock;
 
   beforeEach(async () => {
@@ -183,6 +182,7 @@ describe('OracleProcessor', () => {
       return Promise.resolve({ ...s });
     });
     submitReadingMock = jest.fn();
+    getOracleNonceMock = jest.fn().mockResolvedValue(0);
     configGetMock = jest.fn().mockReturnValue('CONTRACT_ORACLE_ID');
 
     const module: TestingModule = await Test.createTestingModule({
@@ -204,7 +204,13 @@ describe('OracleProcessor', () => {
           provide: getRepositoryToken(ReadingBatch),
           useValue: { findOne: jest.fn().mockResolvedValue(null), save: jest.fn() },
         },
-        { provide: StellarService, useValue: { submitReading: submitReadingMock } },
+        {
+          provide: StellarService,
+          useValue: {
+            submitReading: submitReadingMock,
+            getOracleNonce: getOracleNonceMock,
+          },
+        },
         { provide: ConfigService, useValue: { get: configGetMock } },
         { provide: CreditScoringService, useValue: { calculate: jest.fn() } },
       ],
@@ -232,7 +238,8 @@ describe('OracleProcessor', () => {
   });
 
   it('re-tries FAILED submissions with the same nonce', async () => {
-    findOneMock.mockResolvedValue(makeSubmission({ status: SubmissionStatus.FAILED }));
+    findOneMock.mockResolvedValue(makeSubmission({ status: SubmissionStatus.FAILED, nonce: 3 }));
+    getOracleNonceMock.mockResolvedValue(2);
     submitReadingMock.mockResolvedValue({
       txHash: 'retry-tx-hash',
       response: SUCCESS_RESPONSE,
@@ -303,7 +310,8 @@ describe('OracleProcessor', () => {
       phosphorus: 0.125,
       temperature: 18.5,
     };
-    findOneMock.mockResolvedValue(makeSubmission({ readingsSnapshot: snapshot }));
+    findOneMock.mockResolvedValue(makeSubmission({ readingsSnapshot: snapshot, nonce: 5 }));
+    getOracleNonceMock.mockResolvedValue(4);
     submitReadingMock.mockResolvedValue({ txHash: 'tx-hash', response: SUCCESS_RESPONSE });
 
     await processor.processSubmission(makeJob({ nonce: 5 }));
@@ -497,5 +505,100 @@ describe('OracleProcessor', () => {
     const failedSnapshot = savedSnapshots.find((s) => s.status === SubmissionStatus.FAILED)!;
 
     expect(failedSnapshot.txHash).toBe(''); // unchanged from initial empty string
+  });
+
+  // Nonce drift, re-sequencing, and idempotency
+  describe('processing-time nonce drift handling', () => {
+    it('marks as CONFIRMED directly if submission nonce equals on-chain nonce', async () => {
+      findOneMock.mockResolvedValue(makeSubmission({ nonce: 5 }));
+      getOracleNonceMock.mockResolvedValue(5);
+
+      await processor.processSubmission(makeJob({ nonce: 5 }));
+
+      expect(submitReadingMock).not.toHaveBeenCalled();
+      expect(savedSnapshots).toHaveLength(1);
+      expect(savedSnapshots[0].status).toBe(SubmissionStatus.CONFIRMED);
+      expect(savedSnapshots[0].txHash).toBe('reconciled-on-chain');
+    });
+
+    it('fails cleanly if submission nonce is strictly less than on-chain nonce', async () => {
+      findOneMock.mockResolvedValue(makeSubmission({ nonce: 4 }));
+      getOracleNonceMock.mockResolvedValue(5);
+
+      await processor.processSubmission(makeJob({ nonce: 4 }));
+
+      expect(submitReadingMock).not.toHaveBeenCalled();
+      expect(savedSnapshots).toHaveLength(1);
+      expect(savedSnapshots[0].status).toBe(SubmissionStatus.FAILED);
+      expect(savedSnapshots[0].result).toMatchObject({
+        error: expect.stringContaining('Stale submission'),
+      });
+    });
+
+    it('re-sequences to expected on-chain nonce if submission nonce is higher and no newer confirmed exists', async () => {
+      findOneMock.mockResolvedValueOnce(makeSubmission({ nonce: 10 })).mockResolvedValueOnce(null);
+      getOracleNonceMock.mockResolvedValue(5);
+      submitReadingMock.mockResolvedValue({ txHash: 'tx-hash', response: SUCCESS_RESPONSE });
+
+      await processor.processSubmission(makeJob({ nonce: 10 }));
+
+      expect(submitReadingMock).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(String),
+        expect.any(Object),
+        6,
+      );
+      expect(savedSnapshots).toHaveLength(3);
+      expect(savedSnapshots[0].nonce).toBe(6);
+      expect(savedSnapshots[2].status).toBe(SubmissionStatus.CONFIRMED);
+    });
+
+    it('fails cleanly if submission nonce is higher but a newer confirmed submission already exists', async () => {
+      const oldSubmission = makeSubmission({ nonce: 10, createdAt: new Date('2026-08-20') });
+      const newSubmission = makeSubmission({
+        nonce: 8,
+        createdAt: new Date('2026-08-21'),
+        status: SubmissionStatus.CONFIRMED,
+      });
+
+      findOneMock.mockResolvedValue(oldSubmission);
+      getOracleNonceMock.mockResolvedValue(5);
+
+      const originalFindOne = findOneMock;
+      findOneMock = jest.fn().mockImplementation((options) => {
+        if (options?.where?.id) {
+          return Promise.resolve(oldSubmission);
+        }
+        return Promise.resolve(newSubmission);
+      });
+      processor['submissionRepo'].findOne = findOneMock;
+
+      await processor.processSubmission(makeJob({ nonce: 10 }));
+
+      expect(submitReadingMock).not.toHaveBeenCalled();
+      expect(savedSnapshots).toHaveLength(1);
+      expect(savedSnapshots[0].status).toBe(SubmissionStatus.FAILED);
+      expect(savedSnapshots[0].result).toMatchObject({
+        error: expect.stringContaining('newer submission sub-1 already confirmed'),
+      });
+
+      findOneMock = originalFindOne;
+    });
+
+    it('does not wedge the queue when simulating an advanced on-chain nonce + a retried stale submission', async () => {
+      // Stale submission (nonce 4), but on-chain nonce is already advanced to 5
+      findOneMock.mockResolvedValue(makeSubmission({ nonce: 4 }));
+      getOracleNonceMock.mockResolvedValue(5);
+
+      // Processing must resolve successfully (not throw) so the job completes rather than wedging the queue
+      await expect(processor.processSubmission(makeJob({ nonce: 4 }))).resolves.toBeUndefined();
+
+      expect(submitReadingMock).not.toHaveBeenCalled();
+      expect(savedSnapshots).toHaveLength(1);
+      expect(savedSnapshots[0].status).toBe(SubmissionStatus.FAILED);
+      expect(savedSnapshots[0].result).toMatchObject({
+        error: expect.stringContaining('Stale submission'),
+      });
+    });
   });
 });

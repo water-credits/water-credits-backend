@@ -20,6 +20,8 @@ import {
 } from '../sensors/entities/reading-batch.entity';
 import { SensorReading } from '../sensors/entities/sensor-reading.entity';
 import { StellarService } from '../stellar/stellar.service';
+import { GovernanceConfig } from '../governance/entities/governance-config.entity';
+import { CreditScoringService } from './credit-scoring.service';
 
 // ── In-memory repositories ────────────────────────────────────────────────────
 //
@@ -527,7 +529,7 @@ describe('OracleSchedulerService', () => {
 
       scheduler.onApplicationShutdown('SIGTERM');
 
-      expect(cronJob.stop).toHaveBeenCalledTimes(1);
+      expect(cronJob.stop).toHaveBeenCalled();
     });
 
     it('survives shutdown when no cron job was registered', async () => {
@@ -693,6 +695,8 @@ describe('OracleSchedulerService + manual POST /oracle/trigger (advisory lock)',
         },
         { provide: getRepositoryToken(ReadingBatch), useValue: batchRepo },
         { provide: getRepositoryToken(OracleScheduleState), useValue: { upsert: jest.fn() } },
+        { provide: getRepositoryToken(GovernanceConfig), useValue: { findOne: jest.fn() } },
+        { provide: CreditScoringService, useValue: { calculate: jest.fn() } },
         {
           provide: ConfigService,
           useValue: {

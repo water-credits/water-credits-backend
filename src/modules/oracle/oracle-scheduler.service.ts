@@ -53,6 +53,31 @@ export function resolveCronExpression(): string {
   return raw;
 }
 
+/** Name the cron job is registered under in the SchedulerRegistry for reconciliation. */
+export const ORACLE_RECONCILIATION_CRON_NAME = 'oracle-reconciliation-cycle';
+
+/**
+ * Resolves the reconciliation cron expression at decoration time.
+ */
+export function resolveReconciliationCronExpression(): string {
+  const raw = (process.env.ORACLE_RECONCILIATION_INTERVAL_CRON || '').trim();
+  if (!raw) {
+    return '30 * * * *';
+  }
+
+  const fieldCount = raw.split(/\s+/).length;
+  if (fieldCount < 5 || fieldCount > 6) {
+    Logger.warn(
+      `Ignoring malformed ORACLE_RECONCILIATION_INTERVAL_CRON="${raw}" ` +
+        `(expected 5 or 6 fields); falling back to "30 * * * *"`,
+      'OracleSchedulerService',
+    );
+    return '30 * * * *';
+  }
+
+  return raw;
+}
+
 export interface SubmissionCycleResult {
   /** Number of ACTIVE projects inspected. */
   projectsScanned: number;
@@ -99,6 +124,8 @@ export class OracleSchedulerService implements OnModuleInit, OnApplicationShutdo
     );
     if (this.isEnabled()) {
       this.logger.log(`Oracle submission cycle scheduled with cron "${expression}"`);
+      const reconExpression = resolveReconciliationCronExpression();
+      this.logger.log(`Oracle reconciliation cycle scheduled with cron "${reconExpression}"`);
     } else {
       this.logger.warn('Oracle submission cycle is DISABLED (ORACLE_SCHEDULER_ENABLED=false)');
     }
@@ -116,11 +143,22 @@ export class OracleSchedulerService implements OnModuleInit, OnApplicationShutdo
     } catch {
       // Job was never registered (e.g. ScheduleModule absent in a unit test).
     }
+    try {
+      this.schedulerRegistry.getCronJob(ORACLE_RECONCILIATION_CRON_NAME).stop();
+      this.logger.log(`Oracle reconciliation cron stopped (signal: ${signal ?? 'none'})`);
+    } catch {
+      // Job was never registered.
+    }
   }
 
   @Cron(resolveCronExpression(), { name: ORACLE_SUBMISSION_CRON_NAME })
   async handleCron(): Promise<SubmissionCycleResult> {
     return this.runSubmissionCycle();
+  }
+
+  @Cron(resolveReconciliationCronExpression(), { name: ORACLE_RECONCILIATION_CRON_NAME })
+  async handleReconciliationCron(): Promise<void> {
+    await this.runReconciliation();
   }
 
   /**
@@ -338,5 +376,30 @@ export class OracleSchedulerService implements OnModuleInit, OnApplicationShutdo
 
   private isEnabled(): boolean {
     return this.configService.get<boolean>('oracle.schedulerEnabled', true);
+  }
+
+  async runReconciliation(): Promise<void> {
+    if (!this.isEnabled() || this.shuttingDown) {
+      return;
+    }
+
+    const oracleContractId = this.configService.get<string>('oracle.contractId');
+    if (!oracleContractId) {
+      this.logger.warn('Skipping scheduled reconciliation: oracle contract ID is not configured');
+      return;
+    }
+
+    const oracleAddresses = await this.oracleService.getUniqueOracleAddresses();
+    if (oracleAddresses.length === 0) {
+      return;
+    }
+
+    this.logger.log(`Starting oracle reconciliation cycle for ${oracleAddresses.length} oracle(s)`);
+    for (const oracleAddress of oracleAddresses) {
+      if (this.shuttingDown) {
+        break;
+      }
+      await this.oracleService.reconcile(oracleContractId, oracleAddress);
+    }
   }
 }
