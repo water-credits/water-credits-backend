@@ -1,18 +1,28 @@
-import { IsOptional, IsInt, Min, Max } from 'class-validator';
+import { IsOptional, IsInt, Min, Max, IsString } from 'class-validator';
 import { Type } from 'class-transformer';
 
 /**
  * Standard query-string pagination parameters.
+ *
+ * Supports two mutually-compatible modes on the same endpoint:
+ *
+ *   • Offset mode  — `?page=2&limit=20` (the original, backwards-compatible
+ *     contract). Simple, exposes a `total`, but duplicates/skips rows under
+ *     concurrent writes and degrades on large tables.
+ *
+ *   • Cursor mode  — `?cursor=<opaque>&limit=20` (keyset/seek pagination).
+ *     Stable under concurrent inserts and O(limit) regardless of depth.
+ *     When `cursor` is present it takes precedence over `page`.
  *
  * Usage in a controller:
  *   @Get()
  *   findAll(@Query() pagination: PaginationDto) { ... }
  *
  * Usage in a service (TypeORM):
- *   qb.skip(pagination.skip).take(pagination.take)
+ *   paginate(qb, { alias: 'x', sortColumn: 'x.created_at', sortProperty: 'createdAt' }, pagination)
  */
 export class PaginationDto {
-  /** 1-indexed page number (default: 1) */
+  /** 1-indexed page number for offset mode (default: 1). Ignored when `cursor` is set. */
   @IsOptional()
   @IsInt()
   @Min(1)
@@ -28,6 +38,15 @@ export class PaginationDto {
   limit: number = 20;
 
   /**
+   * Opaque keyset cursor from a previous response's `meta.nextCursor`.
+   * When present, the endpoint uses cursor (keyset) pagination and `page` is
+   * ignored. Treat the value as opaque — do not construct or mutate it.
+   */
+  @IsOptional()
+  @IsString()
+  cursor?: string;
+
+  /**
    * Row offset for use with TypeORM's `.skip()`.
    * Derived from `page` and `limit`.
    */
@@ -40,47 +59,5 @@ export class PaginationDto {
    */
   get take(): number {
     return this.limit;
-  }
-
-  /**
-   * Build a pagination meta object for the response envelope.
-   *
-   * @param total - total number of matching records
-   */
-  meta(total: number): PaginationMeta {
-    return {
-      page: this.page,
-      limit: this.limit,
-      total,
-      totalPages: Math.ceil(total / this.limit),
-      hasNextPage: this.page < Math.ceil(total / this.limit),
-      hasPrevPage: this.page > 1,
-    };
-  }
-}
-
-export interface PaginationMeta {
-  page: number;
-  limit: number;
-  total: number;
-  totalPages: number;
-  hasNextPage: boolean;
-  hasPrevPage: boolean;
-}
-
-/**
- * Generic paginated result wrapper used by service methods.
- */
-export class PaginatedResult<T> {
-  data: T[];
-  meta: PaginationMeta;
-
-  constructor(data: T[], meta: PaginationMeta) {
-    this.data = data;
-    this.meta = meta;
-  }
-
-  static of<T>(data: T[], total: number, pagination: PaginationDto): PaginatedResult<T> {
-    return new PaginatedResult(data, pagination.meta(total));
   }
 }

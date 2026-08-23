@@ -6,6 +6,7 @@ import { Queue } from 'bull';
 import { ConfigService } from '@nestjs/config';
 import { StellarClient } from '../stellar/stellar.client';
 import { IndexerService } from '../indexer/indexer.service';
+import { RedisService } from '../auth/redis.service';
 import {
   GLOBAL_SCHEDULE_SCOPE,
   OracleScheduleState,
@@ -19,6 +20,10 @@ export interface ComponentHealth {
   status: 'ok' | 'degraded' | 'down';
   latency_ms?: number;
   detail?: string;
+}
+
+export interface StellarHealth extends ComponentHealth {
+  signing_ready: boolean;
 }
 
 export interface QueueHealth {
@@ -59,7 +64,8 @@ export interface HealthReport {
   checks: {
     database: ComponentHealth;
     redis: ComponentHealth;
-    stellar: ComponentHealth;
+    authRedis: ComponentHealth;
+    stellar: StellarHealth;
     oracle: OracleHealth;
     indexer: IndexerHealth;
     queues: Record<string, QueueHealth>;
@@ -85,19 +91,27 @@ export class HealthService {
     private readonly configService: ConfigService,
     private readonly stellarClient: StellarClient,
     private readonly indexerService: IndexerService,
+    private readonly authRedisService: RedisService,
   ) {}
 
   async getHealth(): Promise<HealthReport> {
-    const [database, redis, stellar, oracle, indexer, queues] = await Promise.all([
+    const [database, redis, authRedis, stellar, oracle, indexer, queues] = await Promise.all([
       this.checkDatabase(),
       this.checkRedis(),
+      this.checkAuthRedis(),
       this.checkStellar(),
       this.checkOracleFreshness(),
       this.indexerService.getIndexerStatus(),
       this.checkQueues(),
     ]);
 
-    const componentStatuses = [database.status, redis.status, stellar.status, oracle.status];
+    const componentStatuses = [
+      database.status,
+      redis.status,
+      authRedis.status,
+      stellar.status,
+      oracle.status,
+    ];
     const queueStatuses = Object.values(queues).map((q) => q.status);
     const allStatuses = [...componentStatuses, ...queueStatuses];
 
@@ -116,7 +130,7 @@ export class HealthService {
       status: overallStatus,
       timestamp: new Date().toISOString(),
       uptime_s: Math.floor((Date.now() - this.startTime) / 1000),
-      checks: { database, redis, stellar, oracle, indexer, queues },
+      checks: { database, redis, authRedis, stellar, oracle, indexer, queues },
     };
   }
 
@@ -144,19 +158,55 @@ export class HealthService {
     }
   }
 
-  private async checkStellar(): Promise<ComponentHealth> {
+  /**
+   * The wallet-auth challenge store is a *separate* Redis instance/DB from
+   * the Bull queues checked above (see `RedisService`) — a healthy job queue
+   * says nothing about whether login/register can currently work. Reported
+   * as its own component so an outage here surfaces as auth-specific
+   * degradation rather than being invisible or lumped into `redis` (#88).
+   */
+  private async checkAuthRedis(): Promise<ComponentHealth> {
     const start = Date.now();
+    try {
+      await this.authRedisService.ping();
+      return { status: 'ok', latency_ms: Date.now() - start };
+    } catch (err) {
+      this.logger.warn(`Auth Redis health check failed: ${(err as Error).message}`);
+      return { status: 'down', detail: (err as Error).message };
+    }
+  }
+
+  private async checkStellar(): Promise<StellarHealth> {
+    const start = Date.now();
+    const signingReady = this.stellarClient.isSigningReady();
+
     try {
       const server = this.stellarClient.getServer();
       const ledger = await server.getLatestLedger();
+      const latency = Date.now() - start;
+
+      if (!signingReady) {
+        return {
+          status: 'degraded',
+          latency_ms: latency,
+          signing_ready: false,
+          detail: `latest_ledger=${ledger.sequence}; STELLAR_BACKEND_SECRET not configured`,
+        };
+      }
+
       return {
         status: 'ok',
-        latency_ms: Date.now() - start,
+        latency_ms: latency,
+        signing_ready: true,
         detail: `latest_ledger=${ledger.sequence}`,
       };
     } catch (err) {
       this.logger.warn(`Stellar RPC health check failed: ${(err as Error).message}`);
-      return { status: 'degraded', detail: (err as Error).message };
+      return {
+        status: 'degraded',
+        signing_ready: signingReady,
+        detail: (err as Error).message,
+      };
     }
   }
 

@@ -5,6 +5,7 @@ import { CreateProjectDto } from './dto/create-project.dto';
 import { UpdateProjectDto } from './dto/update-project.dto';
 import { QueryProjectsDto } from './dto/query-projects.dto';
 import { Project, ProjectStatus } from './entities/project.entity';
+import { UserRole } from '../users/entities/user.entity';
 describe('ProjectsController', () => {
   let controller: ProjectsController;
   let service: jest.Mocked<ProjectsService>;
@@ -137,12 +138,12 @@ describe('ProjectsController', () => {
   });
 
   describe('remove', () => {
-    it('should call service.remove with id and userId', async () => {
+    it('should call service.remove with id, userId and callerRole', async () => {
       service.remove.mockResolvedValue(undefined);
 
-      const result = await controller.remove('proj-1', 'user-1');
+      const result = await controller.remove('proj-1', 'user-1', UserRole.FARMER);
 
-      expect(service.remove).toHaveBeenCalledWith('proj-1', 'user-1');
+      expect(service.remove).toHaveBeenCalledWith('proj-1', 'user-1', UserRole.FARMER);
       expect(result).toBeUndefined();
     });
   });

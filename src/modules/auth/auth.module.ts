@@ -28,6 +28,6 @@ import { UsersModule } from '../users/users.module';
   ],
   controllers: [AuthController],
   providers: [AuthService, JwtStrategy, StellarWalletStrategy, RateLimitGuard, RedisService],
-  exports: [AuthService, JwtModule],
+  exports: [AuthService, JwtModule, RedisService],
 })
 export class AuthModule {}

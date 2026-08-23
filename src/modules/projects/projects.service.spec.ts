@@ -6,6 +6,7 @@ import { Project, ProjectStatus } from './entities/project.entity';
 import { CreateProjectDto } from './dto/create-project.dto';
 import { UpdateProjectDto } from './dto/update-project.dto';
 import { QueryProjectsDto, SortOrder } from './dto/query-projects.dto';
+import { UserRole } from '../users/entities/user.entity';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -537,22 +538,50 @@ describe('ProjectsService', () => {
       projectRepo.findOne.mockResolvedValue(project);
       projectRepo.remove.mockResolvedValue(undefined);
 
-      await service.remove('proj-uuid-1', 'user-uuid-1');
+      await service.remove('proj-uuid-1', 'user-uuid-1', UserRole.FARMER);
 
       expect(projectRepo.findOne).toHaveBeenCalledWith({ where: { id: 'proj-uuid-1' } });
       expect(projectRepo.remove).toHaveBeenCalledWith(project);
     });
 
-    it('throws ForbiddenException when user is not the owner', async () => {
+    it('throws ForbiddenException when a non-admin caller is not the owner', async () => {
       const project = makeProject({ ownerId: 'other-user' });
       projectRepo.findOne.mockResolvedValue(project);
 
-      await expect(service.remove('proj-uuid-1', 'different-user')).rejects.toThrow(
-        ForbiddenException,
-      );
-      await expect(service.remove('proj-uuid-1', 'different-user')).rejects.toThrow(
-        'You can only delete your own projects',
-      );
+      await expect(
+        service.remove('proj-uuid-1', 'different-user', UserRole.FARMER),
+      ).rejects.toThrow(ForbiddenException);
+      await expect(
+        service.remove('proj-uuid-1', 'different-user', UserRole.FARMER),
+      ).rejects.toThrow('You can only delete your own projects');
+      expect(projectRepo.remove).not.toHaveBeenCalled();
+    });
+
+    it('allows an admin to delete a project they do not own (ownership bypass)', async () => {
+      const project = makeProject({ ownerId: 'other-user' });
+      projectRepo.findOne.mockResolvedValue(project);
+      projectRepo.remove.mockResolvedValue(undefined);
+
+      await service.remove('proj-uuid-1', 'admin-user', UserRole.ADMIN);
+
+      expect(projectRepo.remove).toHaveBeenCalledWith(project);
+    });
+
+    it('allows a super admin to delete a project they do not own', async () => {
+      const project = makeProject({ ownerId: 'other-user' });
+      projectRepo.findOne.mockResolvedValue(project);
+      projectRepo.remove.mockResolvedValue(undefined);
+
+      await service.remove('proj-uuid-1', 'super-admin-user', UserRole.SUPER_ADMIN);
+
+      expect(projectRepo.remove).toHaveBeenCalledWith(project);
+    });
+
+    it('still enforces ownership for an admin who is not privileged via role param absence', async () => {
+      const project = makeProject({ ownerId: 'other-user' });
+      projectRepo.findOne.mockResolvedValue(project);
+
+      await expect(service.remove('proj-uuid-1', 'some-user')).rejects.toThrow(ForbiddenException);
       expect(projectRepo.remove).not.toHaveBeenCalled();
     });
 

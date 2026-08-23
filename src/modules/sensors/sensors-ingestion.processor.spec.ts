@@ -1,9 +1,13 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
+import { ConfigService } from '@nestjs/config';
 import { SensorsIngestionProcessor, SensorIngestionJobData } from './sensors-ingestion.processor';
 import { SensorReading } from './entities/sensor-reading.entity';
 import { GovernanceConfig } from '../governance/entities/governance-config.entity';
 import { SensorsGateway } from './sensors.gateway';
+import { SensorAlertDebounceService } from './sensor-alert-debounce.service';
+import { SensorAlertRecipientsService } from './sensor-alert-recipients.service';
+import { NotificationsService } from '../notifications/notifications.service';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -69,11 +73,17 @@ describe('SensorsIngestionProcessor', () => {
   let readingRepo: { findOne: jest.Mock; save: jest.Mock };
   let configRepo: { findOne: jest.Mock };
   let gateway: { emitReading: jest.Mock; emitAlert: jest.Mock };
+  let debounce: { shouldSuppress: jest.Mock };
+  let recipients: { resolveRecipients: jest.Mock };
+  let notifications: { notifySensorAlert: jest.Mock };
 
   beforeEach(async () => {
     readingRepo = { findOne: jest.fn(), save: jest.fn() };
     configRepo = { findOne: jest.fn() };
     gateway = { emitReading: jest.fn(), emitAlert: jest.fn() };
+    debounce = { shouldSuppress: jest.fn().mockResolvedValue(false) };
+    recipients = { resolveRecipients: jest.fn().mockResolvedValue(['owner-1', 'verifier-1']) };
+    notifications = { notifySensorAlert: jest.fn().mockResolvedValue(undefined) };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -81,6 +91,10 @@ describe('SensorsIngestionProcessor', () => {
         { provide: getRepositoryToken(SensorReading), useValue: readingRepo },
         { provide: getRepositoryToken(GovernanceConfig), useValue: configRepo },
         { provide: SensorsGateway, useValue: gateway },
+        { provide: SensorAlertDebounceService, useValue: debounce },
+        { provide: SensorAlertRecipientsService, useValue: recipients },
+        { provide: NotificationsService, useValue: notifications },
+        { provide: ConfigService, useValue: { get: jest.fn() } },
       ],
     }).compile();
 
@@ -278,6 +292,84 @@ describe('SensorsIngestionProcessor', () => {
 
       expect(gateway.emitReading).not.toHaveBeenCalled();
       expect(gateway.emitAlert).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('persisted alert notifications', () => {
+    it('notifies every resolved recipient for a threshold breach', async () => {
+      readingRepo.findOne.mockResolvedValue(makeReading({ ph: 5.5 }));
+      configRepo.findOne.mockResolvedValue(makeConfig({ phMin: 6.5, phMax: 8.5 }));
+
+      await processor.processReading(makeJob());
+
+      expect(recipients.resolveRecipients).toHaveBeenCalledWith('proj-1');
+      expect(notifications.notifySensorAlert).toHaveBeenCalledTimes(2);
+      expect(notifications.notifySensorAlert).toHaveBeenCalledWith(
+        'owner-1',
+        'proj-1',
+        expect.objectContaining({ parameter: 'ph', direction: 'below' }),
+      );
+      expect(notifications.notifySensorAlert).toHaveBeenCalledWith(
+        'verifier-1',
+        'proj-1',
+        expect.objectContaining({ parameter: 'ph', direction: 'below' }),
+      );
+    });
+
+    it('still emits the WS alert but skips persisted notifications when debounced', async () => {
+      debounce.shouldSuppress.mockResolvedValue(true);
+      readingRepo.findOne.mockResolvedValue(makeReading({ ph: 5.5 }));
+      configRepo.findOne.mockResolvedValue(makeConfig({ phMin: 6.5, phMax: 8.5 }));
+
+      await processor.processReading(makeJob());
+
+      expect(gateway.emitAlert).toHaveBeenCalledTimes(1);
+      expect(recipients.resolveRecipients).not.toHaveBeenCalled();
+      expect(notifications.notifySensorAlert).not.toHaveBeenCalled();
+    });
+
+    it('debounces each breached parameter independently', async () => {
+      debounce.shouldSuppress.mockImplementation((key: string) =>
+        Promise.resolve(key.includes(':ph:')),
+      );
+      readingRepo.findOne.mockResolvedValue(makeReading({ ph: 5.5, dissolvedOxygen: 3.0 }));
+      configRepo.findOne.mockResolvedValue(
+        makeConfig({ phMin: 6.5, phMax: 8.5, doThreshold: 5.0 }),
+      );
+
+      await processor.processReading(makeJob());
+
+      // Both breaches still hit the WS gateway...
+      expect(gateway.emitAlert).toHaveBeenCalledTimes(2);
+      // ...but only the non-debounced (dissolvedOxygen) one persists.
+      expect(notifications.notifySensorAlert).toHaveBeenCalledTimes(2); // 2 recipients, 1 parameter
+      expect(notifications.notifySensorAlert).toHaveBeenCalledWith(
+        expect.any(String),
+        'proj-1',
+        expect.objectContaining({ parameter: 'dissolvedOxygen' }),
+      );
+    });
+
+    it('still emits the WS alert when the debounce backend throws', async () => {
+      debounce.shouldSuppress.mockRejectedValue(new Error('redis down'));
+      readingRepo.findOne.mockResolvedValue(makeReading({ ph: 5.5 }));
+      configRepo.findOne.mockResolvedValue(makeConfig({ phMin: 6.5, phMax: 8.5 }));
+
+      await expect(processor.processReading(makeJob())).resolves.toBeUndefined();
+
+      expect(gateway.emitAlert).toHaveBeenCalledTimes(1);
+      // Fails open: notification still attempted despite the debounce error.
+      expect(notifications.notifySensorAlert).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not fail the job when notification persistence throws', async () => {
+      notifications.notifySensorAlert.mockRejectedValue(new Error('db down'));
+      readingRepo.findOne.mockResolvedValue(makeReading({ ph: 5.5 }));
+      configRepo.findOne.mockResolvedValue(makeConfig({ phMin: 6.5, phMax: 8.5 }));
+
+      await expect(processor.processReading(makeJob())).resolves.toBeUndefined();
+
+      expect(gateway.emitAlert).toHaveBeenCalledTimes(1);
     });
   });
 

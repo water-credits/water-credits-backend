@@ -24,6 +24,7 @@ import {
 import { SensorReading } from '../sensors/entities/sensor-reading.entity';
 import { StellarService } from '../stellar/stellar.service';
 import { IndexerService } from '../indexer/indexer.service';
+import { RedisService } from '../auth/redis.service';
 
 /**
  * Outside-in proof for Issue #44.
@@ -170,6 +171,7 @@ describe('GET /health (oracle freshness + scheduler-added jobs)', () => {
           provide: StellarClient,
           useValue: {
             getServer: () => ({ getLatestLedger: async () => ({ sequence: 4242 }) }),
+            isSigningReady: () => true,
           },
         },
         {
@@ -192,6 +194,10 @@ describe('GET /health (oracle freshness + scheduler-added jobs)', () => {
             onModuleInit: jest.fn(),
             onModuleDestroy: jest.fn(),
           },
+        },
+        {
+          provide: RedisService,
+          useValue: { ping: jest.fn().mockResolvedValue(undefined) },
         },
       ],
     }).compile();

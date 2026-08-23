@@ -1,8 +1,9 @@
-import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { InjectQueue } from '@nestjs/bull';
+import { ConfigService } from '@nestjs/config';
 import { Queue } from 'bull';
-import { DataSource, Repository } from 'typeorm';
+import { DataSource, Repository, QueryFailedError } from 'typeorm';
 import { Keypair } from '@stellar/stellar-sdk';
 import { SensorDevice } from './entities/sensor-device.entity';
 import { SensorReading } from './entities/sensor-reading.entity';
@@ -12,6 +13,7 @@ import { QueryReadingsDto } from './dto/query-readings.dto';
 import { RegisterDeviceDto } from './dto/register-device.dto';
 import { generateDeviceApiKey } from '../../common/utils/api-key.util';
 import { SensorProjectAccessService } from './sensor-project-access.service';
+import { paginate, PaginatedList } from '../../common/pagination';
 
 interface ParameterRange {
   min: number;
@@ -51,6 +53,8 @@ function buildReadingPayload(
 
 @Injectable()
 export class SensorsService {
+  private readonly logger = new Logger(SensorsService.name);
+
   constructor(
     @InjectRepository(SensorDevice)
     private readonly deviceRepo: Repository<SensorDevice>,
@@ -62,12 +66,18 @@ export class SensorsService {
     private readonly sensorIngestionQueue: Queue,
     private readonly dataSource: DataSource,
     private readonly projectAccess: SensorProjectAccessService,
+    private readonly configService: ConfigService,
   ) {}
 
   async registerDevice(
     projectId: string,
     dto: RegisterDeviceDto,
+    userId: string,
+    role?: string,
   ): Promise<SensorDevice & { apiKeyPlaintext: string }> {
+    // Verify the caller owns the project (or holds a privileged role)
+    await this.projectAccess.assertProjectAccess(userId, role, projectId);
+
     const existing = await this.deviceRepo.findOne({ where: { deviceId: dto.deviceId } });
     if (existing) {
       throw new BadRequestException('Device with this deviceId already registered');
@@ -134,6 +144,9 @@ export class SensorsService {
   async ingestReading(dto: CreateReadingDto): Promise<SensorReading> {
     const device = await this.getDeviceByDeviceId(dto.deviceId);
 
+    const readingTimestamp = new Date(dto.timestamp);
+    this.validateTimestamp(readingTimestamp);
+
     const params: Record<string, number | undefined | null> = {
       ph: dto.ph ?? null,
       turbidity: dto.turbidity ?? null,
@@ -154,27 +167,57 @@ export class SensorsService {
 
     const batch = await this.resolveBatch(device.projectId);
 
-    const reading = this.readingRepo.create({
-      deviceId: device.id,
-      projectId: device.projectId,
-      timestamp: new Date(dto.timestamp),
-      ph: dto.ph ?? null,
-      turbidity: dto.turbidity ?? null,
-      dissolvedOxygen: dto.dissolvedOxygen ?? null,
-      flowRate: dto.flowRate ?? null,
-      nitrogen: dto.nitrogen ?? null,
-      phosphorus: dto.phosphorus ?? null,
-      temperature: dto.temperature ?? null,
-      signature: dto.signature,
-      isVerified: true,
-      batchId: batch.id,
-    });
-
-    const saved = await this.readingRepo.save(reading);
+    // Wrap reading insertion and batch count increment in a transaction
+    // to ensure transactional consistency. If the reading insertion fails
+    // due to replay protection (unique constraint), we return the existing
+    // reading as idempotency ensures the caller gets the same result.
+    let saved: SensorReading;
+    try {
+      saved = await this.dataSource.transaction(async (entityManager) => {
+        const reading = this.readingRepo.create({
+          deviceId: device.id,
+          projectId: device.projectId,
+          timestamp: readingTimestamp,
+          ph: dto.ph ?? null,
+          turbidity: dto.turbidity ?? null,
+          dissolvedOxygen: dto.dissolvedOxygen ?? null,
+          flowRate: dto.flowRate ?? null,
+          nitrogen: dto.nitrogen ?? null,
+          phosphorus: dto.phosphorus ?? null,
+          temperature: dto.temperature ?? null,
+          signature: dto.signature,
+          isVerified: true,
+          batchId: batch.id,
+        });
+        const saved = await entityManager.save(reading);
+        // Increment batch count atomically
+        await entityManager.increment(ReadingBatch, { id: batch.id }, 'readingCount', 1);
+        return saved;
+      });
+    } catch (error) {
+      // Handle duplicate reading (replay protection)
+      if (error instanceof QueryFailedError && (error as any).code === '23505') {
+        // Unique constraint violation - reading already exists
+        // Return the existing reading for idempotency
+        const existing = await this.readingRepo.findOne({
+          where: {
+            deviceId: device.id,
+            timestamp: readingTimestamp,
+            signature: dto.signature,
+          },
+        });
+        if (existing) {
+          this.logger.warn(
+            `Duplicate reading rejected for device ${device.id} at ${readingTimestamp.toISOString()}. Returning existing reading for idempotency.`,
+          );
+          return existing;
+        }
+        throw new BadRequestException('Duplicate reading detected (replay protection)');
+      }
+      throw error;
+    }
 
     await this.deviceRepo.update(device.id, { lastReadingAt: new Date() });
-
-    await this.batchRepo.increment({ id: batch.id }, 'readingCount', 1);
 
     // Fan the reading out asynchronously: SensorsIngestionProcessor loads the
     // saved reading, broadcasts it via SensorsGateway (sensor:reading) and
@@ -191,6 +234,28 @@ export class SensorsService {
     });
 
     return saved;
+  }
+
+  private validateTimestamp(timestamp: Date): void {
+    const now = new Date();
+    const maxAgeSeconds = this.configService.get<number>('sensor.maxAgeSeconds') || 24 * 60 * 60;
+    const futureOffsetSeconds =
+      this.configService.get<number>('sensor.futureOffsetSeconds') || 5 * 60;
+
+    const maxAge = new Date(now.getTime() - maxAgeSeconds * 1000);
+    const maxFuture = new Date(now.getTime() + futureOffsetSeconds * 1000);
+
+    if (timestamp < maxAge) {
+      throw new BadRequestException(
+        `Reading timestamp is too old. Maximum age: ${maxAgeSeconds} seconds.`,
+      );
+    }
+
+    if (timestamp > maxFuture) {
+      throw new BadRequestException(
+        `Reading timestamp is too far in the future. Maximum offset: ${futureOffsetSeconds} seconds.`,
+      );
+    }
   }
 
   private validateParameters(params: Record<string, number | undefined | null>): void {
@@ -305,12 +370,7 @@ export class SensorsService {
     query: QueryReadingsDto,
     userId: string,
     role: string | undefined,
-  ): Promise<{
-    data: SensorReading[];
-    total: number;
-    page: number;
-    limit: number;
-  }> {
+  ): Promise<PaginatedList<SensorReading>> {
     const qb = this.readingRepo.createQueryBuilder('reading');
 
     if (query.projectId) {
@@ -335,11 +395,14 @@ export class SensorsService {
       qb.andWhere('reading.timestamp <= :endDate', { endDate: query.endDate });
     }
 
-    qb.orderBy('reading.timestamp', 'DESC');
-    qb.skip(query.skip).take(query.limit);
-
-    const [data, total] = await qb.getManyAndCount();
-    return { data, total, page: query.page ?? 1, limit: query.limit ?? 20 };
+    // Order by (timestamp, id) so pages are a strict total order. Cursor mode
+    // (query.cursor) seeks past the last row for consistency under concurrent
+    // ingestion; otherwise legacy page/limit offset mode is used.
+    return paginate(
+      qb,
+      { alias: 'reading', sortColumn: 'reading.timestamp', sortProperty: 'timestamp' },
+      query,
+    );
   }
 
   /**

@@ -38,7 +38,7 @@ describe('CreditsController', () => {
   describe('getPortfolio', () => {
     it('should call creditsService.getPortfolio with the userId from @CurrentUser', async () => {
       const userId = 'user-123';
-      const expected = { totalRetired: 100, totalValue: 0, projects: [] };
+      const expected = { totalRetired: 100, totalValue: 100, projects: [] };
       creditsService.getPortfolio.mockResolvedValue(expected);
 
       const result = await controller.getPortfolio(userId);
@@ -84,7 +84,7 @@ describe('CreditsController', () => {
       expect(result).toEqual({
         success: true,
         data: retirements,
-        meta: { total: 1, page: 1, limit: 20, totalPages: 1 },
+        meta: { mode: 'offset', total: 1, page: 1, limit: 20, totalPages: 1 },
         timestamp: expect.any(String),
       });
     });

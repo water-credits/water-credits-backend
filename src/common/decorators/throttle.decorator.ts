@@ -25,3 +25,19 @@ export const ThrottleOracle = () => Throttle({ default: { limit: 30, ttl: 60000 
 export const ThrottleAdmin = () => Throttle({ default: { limit: 20, ttl: 60000 } });
 
 export { SkipThrottle };
+
+/**
+ * WebSocket rate-limit profiles for SensorsGateway.
+ *
+ * These are not applied with `@Throttle()` — Nest's `ThrottlerGuard` reads an
+ * Express/Fastify response to attach rate-limit headers, which a socket.io
+ * execution context doesn't have. Instead, the gateway calls the shared
+ * `ThrottlerStorage` provider directly with these limits, so WS and HTTP
+ * bursts are tracked through the same rate-limit backend.
+ */
+
+/** 20 connection attempts / 60 s per client IP */
+export const WS_CONNECTION_THROTTLE = { limit: 20, ttl: 60000 };
+
+/** 30 subscribe/unsubscribe messages / 60 s per socket (shared counter) */
+export const WS_SUBSCRIBE_THROTTLE = { limit: 30, ttl: 60000 };

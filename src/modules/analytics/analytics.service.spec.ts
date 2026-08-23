@@ -91,6 +91,68 @@ describe('AnalyticsService', () => {
     expect(service).toBeDefined();
   });
 
+  // ── Cache behaviour ─────────────────────────────────────────────────────
+
+  describe('caching', () => {
+    beforeEach(() => {
+      service.clearCache();
+    });
+
+    it('serves getOverview from cache on second call', async () => {
+      projectRepo.count.mockResolvedValueOnce(10);
+      projectRepo.count.mockResolvedValueOnce(5);
+
+      const batchQb = makeQueryBuilder();
+      batchQb.getRawOne.mockResolvedValue({ total: '1000' });
+      readingBatchRepo.createQueryBuilder.mockReturnValueOnce(batchQb);
+
+      const retirementQb = makeQueryBuilder();
+      retirementQb.getRawOne.mockResolvedValue({ total: '500' });
+      retirementRepo.createQueryBuilder.mockReturnValueOnce(retirementQb);
+
+      const first = await service.getOverview();
+      expect(projectRepo.count).toHaveBeenCalledTimes(2);
+
+      const second = await service.getOverview();
+      expect(second).toEqual(first);
+      // Repos should NOT be called again — cache hit
+      expect(projectRepo.count).toHaveBeenCalledTimes(2);
+    });
+
+    it('clearCache forces a fresh DB query', async () => {
+      projectRepo.count.mockResolvedValueOnce(1);
+      projectRepo.count.mockResolvedValueOnce(0);
+
+      const batchQb = makeQueryBuilder();
+      batchQb.getRawOne.mockResolvedValue({ total: '0' });
+      readingBatchRepo.createQueryBuilder.mockReturnValueOnce(batchQb);
+
+      const retirementQb = makeQueryBuilder();
+      retirementQb.getRawOne.mockResolvedValue({ total: '0' });
+      retirementRepo.createQueryBuilder.mockReturnValueOnce(retirementQb);
+
+      await service.getOverview();
+      expect(projectRepo.count).toHaveBeenCalledTimes(2);
+
+      service.clearCache();
+
+      projectRepo.count.mockResolvedValueOnce(2);
+      projectRepo.count.mockResolvedValueOnce(1);
+
+      const batchQb2 = makeQueryBuilder();
+      batchQb2.getRawOne.mockResolvedValue({ total: '500' });
+      readingBatchRepo.createQueryBuilder.mockReturnValueOnce(batchQb2);
+
+      const retirementQb2 = makeQueryBuilder();
+      retirementQb2.getRawOne.mockResolvedValue({ total: '200' });
+      retirementRepo.createQueryBuilder.mockReturnValueOnce(retirementQb2);
+
+      const fresh = await service.getOverview();
+      expect(projectRepo.count).toHaveBeenCalledTimes(4);
+      expect(fresh.totalProjects).toBe(2);
+    });
+  });
+
   // ── getOverview ──────────────────────────────────────────────────────────
 
   describe('getOverview', () => {

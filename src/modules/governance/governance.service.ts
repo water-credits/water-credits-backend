@@ -30,6 +30,7 @@ import {
 } from './dto/update-governance-config.dto';
 import { PendingConfigChangeDto } from './dto/pending-config-change.dto';
 import { StellarService } from '../stellar/stellar.service';
+import { paginate, PaginatedList } from '../../common/pagination';
 
 const PG_UNIQUE_VIOLATION = '23505';
 
@@ -120,17 +121,44 @@ export class GovernanceService {
     private readonly stellarService: StellarService,
   ) {}
 
+  // ── Config (read) ─────────────────────────────────────────────────────────
+  //
+  // governance_config is a singleton: row id = 1 is the only row that can ever
+  // exist (enforced by a CHECK(id = 1) constraint alongside the primary key —
+  // see the GovernanceConfig entity and migration
+  // 016_governance_config_singleton.sql). Querying by that fixed id, rather
+  // than an unfiltered findOne(), makes getConfig() deterministic even if
+  // duplicate rows somehow existed.
+  //
+  // Auto-provisioning on cold start (no row yet) is race-safe: if two
+  // requests both miss the SELECT below, both attempt the INSERT, and
+  // ON CONFLICT DO NOTHING lets the loser silently no-op instead of throwing
+  // — the DB constraint guarantees only one of them actually creates the row.
+
   async getConfig(): Promise<GovernanceConfig> {
-    let config = await this.configRepo.findOne({ where: {} as Record<string, never> });
-    if (!config) {
-      config = this.configRepo.create({
+    const existing = await this.configRepo.findOne({ where: { id: 1 } });
+    if (existing) {
+      return existing;
+    }
+
+    await this.configRepo
+      .createQueryBuilder()
+      .insert()
+      .into(GovernanceConfig)
+      .values({
+        id: 1,
         protocolFeeBps: 100,
         minOracleConfirmations: 3,
         votingPeriod: 604800,
         timelockPeriod: 86400,
         quorum: 3,
-      });
-      config = await this.configRepo.save(config);
+      })
+      .orIgnore()
+      .execute();
+
+    const config = await this.configRepo.findOne({ where: { id: 1 } });
+    if (!config) {
+      throw new InternalServerErrorException('Governance config singleton row is missing');
     }
     return config;
   }
@@ -404,12 +432,7 @@ export class GovernanceService {
 
   // ── Proposals ─────────────────────────────────────────────────────────────
 
-  async getProposals(query: GovernanceQueryDto): Promise<{
-    data: Proposal[];
-    total: number;
-    page: number;
-    limit: number;
-  }> {
+  async getProposals(query: GovernanceQueryDto): Promise<PaginatedList<Proposal>> {
     const qb = this.proposalRepo.createQueryBuilder('proposal');
 
     if (query.status) {
@@ -422,11 +445,11 @@ export class GovernanceService {
       qb.andWhere('proposal.action_type = :actionType', { actionType: query.actionType });
     }
 
-    qb.orderBy('proposal.created_at', 'DESC');
-    qb.skip(query.skip).take(query.limit);
-
-    const [data, total] = await qb.getManyAndCount();
-    return { data, total, page: query.page ?? 1, limit: query.limit ?? 20 };
+    return paginate(
+      qb,
+      { alias: 'proposal', sortColumn: 'proposal.created_at', sortProperty: 'createdAt' },
+      query,
+    );
   }
 
   async getProposalById(id: string): Promise<Proposal> {

@@ -3,6 +3,7 @@ import { UsersController } from './users.controller';
 import { UsersService } from './users.service';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { UpdateRoleDto } from './dto/update-role.dto';
+import { AdminUpdateUserDto } from './dto/admin-update-user.dto';
 import { User, UserRole } from './entities/user.entity';
 import { PaginationDto } from '../../common/dto/pagination.dto';
 describe('UsersController', () => {
@@ -33,6 +34,7 @@ describe('UsersController', () => {
             findAll: jest.fn(),
             updateRole: jest.fn(),
             softDelete: jest.fn(),
+            updateKycStatus: jest.fn(),
           },
         },
       ],
@@ -75,35 +77,48 @@ describe('UsersController', () => {
 
       const result = await controller.findAll(pagination);
 
-      expect(service.findAll).toHaveBeenCalledWith(2, 10);
+      expect(service.findAll).toHaveBeenCalledWith(pagination);
       expect(result).toMatchObject({
         success: true,
         data,
-        meta: { total: 1, page: 2, limit: 10, totalPages: 1 },
+        meta: { mode: 'offset', total: 1, page: 2, limit: 10, totalPages: 1 },
       });
     });
   });
 
   describe('updateRole', () => {
-    it('should call service.updateRole with id and dto', async () => {
+    it('should call service.updateRole with actorUserId, id and dto', async () => {
       const dto: UpdateRoleDto = { role: UserRole.ADMIN };
       const updated = { ...mockUser, role: UserRole.ADMIN };
       service.updateRole.mockResolvedValue(updated);
 
-      const result = await controller.updateRole('user-1', dto);
+      const result = await controller.updateRole('actor-1', 'user-1', dto);
 
-      expect(service.updateRole).toHaveBeenCalledWith('user-1', dto);
+      expect(service.updateRole).toHaveBeenCalledWith('actor-1', 'user-1', dto);
+      expect(result).toEqual(updated);
+    });
+  });
+
+  describe('updateKyc', () => {
+    it('should call service.updateKycStatus with actorUserId, target id and dto', async () => {
+      const dto: AdminUpdateUserDto = { isKycVerified: true };
+      const updated = { ...mockUser, isKycVerified: true };
+      service.updateKycStatus.mockResolvedValue(updated);
+
+      const result = await controller.updateKyc('actor-1', 'user-1', dto);
+
+      expect(service.updateKycStatus).toHaveBeenCalledWith('actor-1', 'user-1', dto);
       expect(result).toEqual(updated);
     });
   });
 
   describe('deactivate', () => {
-    it('should call service.softDelete with the user id', async () => {
+    it('should call service.softDelete with the actor and target user ids', async () => {
       service.softDelete.mockResolvedValue(undefined);
 
-      const result = await controller.deactivate('user-1');
+      const result = await controller.deactivate('actor-1', 'user-1');
 
-      expect(service.softDelete).toHaveBeenCalledWith('user-1');
+      expect(service.softDelete).toHaveBeenCalledWith('actor-1', 'user-1');
       expect(result).toBeUndefined();
     });
   });

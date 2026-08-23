@@ -2,10 +2,15 @@ import { Process, Processor } from '@nestjs/bull';
 import { Job } from 'bull';
 import { Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
+import { ConfigService } from '@nestjs/config';
 import { Repository } from 'typeorm';
 import { SensorReading } from './entities/sensor-reading.entity';
 import { GovernanceConfig } from '../governance/entities/governance-config.entity';
 import { SensorsGateway } from './sensors.gateway';
+import { SensorAlertDebounceService } from './sensor-alert-debounce.service';
+import { SensorAlertRecipientsService } from './sensor-alert-recipients.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { DEFAULT_SENSOR_ALERT_DEBOUNCE_MS } from '../../config/sensor.config';
 
 export interface SensorIngestionJobData {
   readingId: string;
@@ -68,6 +73,10 @@ export class SensorsIngestionProcessor {
     @InjectRepository(GovernanceConfig)
     private readonly configRepo: Repository<GovernanceConfig>,
     private readonly gateway: SensorsGateway,
+    private readonly debounce: SensorAlertDebounceService,
+    private readonly recipients: SensorAlertRecipientsService,
+    private readonly notifications: NotificationsService,
+    private readonly configService: ConfigService,
   ) {}
 
   @Process({
@@ -119,9 +128,9 @@ export class SensorsIngestionProcessor {
       }
 
       if (range.min !== undefined && value < range.min) {
-        this.emitAlert(reading, parameter, value, range.min, 'below');
+        await this.emitAlert(reading, parameter, value, range.min, 'below');
       } else if (range.max !== undefined && value > range.max) {
-        this.emitAlert(reading, parameter, value, range.max, 'above');
+        await this.emitAlert(reading, parameter, value, range.max, 'above');
       }
     }
 
@@ -188,23 +197,68 @@ export class SensorsIngestionProcessor {
     };
   }
 
-  private emitAlert(
+  private async emitAlert(
     reading: SensorReading,
     parameter: string,
     value: number,
     threshold: number,
     direction: 'below' | 'above',
-  ): void {
+  ): Promise<void> {
     this.logger.warn(
       `Threshold breach on reading ${reading.id}: ${parameter}=${value} is ${direction} threshold ${threshold}`,
     );
-    this.gateway.emitAlert(reading.projectId, {
+    const alert = {
       projectId: reading.projectId,
       deviceId: reading.deviceId,
       parameter,
       value,
       threshold,
       direction,
-    });
+    };
+
+    // WS fan-out is not debounced — live viewers should always see the raw
+    // breach. Only the persisted notification (which fans out to every
+    // owner/verifier) is subject to the debounce, since that's what would
+    // actually flood people's inboxes.
+    this.gateway.emitAlert(reading.projectId, alert);
+    await this.notifyRecipients(reading.deviceId, reading.projectId, parameter, direction, alert);
+  }
+
+  /** Debounced fan-out of a persisted notification to project owners/verifiers. */
+  private async notifyRecipients(
+    deviceId: string,
+    projectId: string,
+    parameter: string,
+    direction: string,
+    alert: Record<string, unknown>,
+  ): Promise<void> {
+    const debounceMs =
+      this.configService.get<number>('sensor.alertDebounceMs') ?? DEFAULT_SENSOR_ALERT_DEBOUNCE_MS;
+    const debounceKey = `${deviceId}:${parameter}:${direction}`;
+
+    try {
+      if (await this.debounce.shouldSuppress(debounceKey, debounceMs)) {
+        this.logger.debug(`Suppressing duplicate alert notification for ${debounceKey}`);
+        return;
+      }
+    } catch (err) {
+      // Debounce is a courtesy, not a correctness guarantee — if the storage
+      // backend is unavailable we'd rather over-notify than silently drop
+      // an anomaly.
+      this.logger.warn(
+        `Alert debounce check failed for ${debounceKey}, proceeding without it: ${(err as Error).message}`,
+      );
+    }
+
+    try {
+      const userIds = await this.recipients.resolveRecipients(projectId);
+      await Promise.all(
+        userIds.map((userId) => this.notifications.notifySensorAlert(userId, projectId, alert)),
+      );
+    } catch (err) {
+      this.logger.error(
+        `Failed to persist notifications for alert ${debounceKey}: ${(err as Error).message}`,
+      );
+    }
   }
 }

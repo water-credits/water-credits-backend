@@ -135,9 +135,12 @@ src/
 │   │   └── transform.interceptor.ts      # Response envelope (data, meta)
 │   ├── pipes/
 │   │   └── validation.pipe.ts            # Class-validator global pipe
-│   └── dto/
-│       ├── pagination.dto.ts             # PaginationParams, PaginatedResult
-│       └── api-response.dto.ts           # ApiResponse<T>, ApiError
+│   ├── dto/
+│   │   ├── pagination.dto.ts             # PaginationDto (page/limit/cursor)
+│   │   └── api-response.dto.ts           # ApiResponse<T>, PaginatedResponseDto
+│   └── pagination/
+│       ├── cursor.util.ts                # Opaque keyset cursor encode/decode
+│       └── keyset-paginator.ts           # paginate() — cursor + offset modes
 │
 ├── config/
 │   ├── app.config.ts                     # App configuration (env-based)
@@ -823,12 +826,8 @@ All API responses follow a consistent envelope:
 {
   "success": true,
   "data": { ... },
-  "meta": {
-    "page": 1,
-    "limit": 20,
-    "total": 100,
-    "totalPages": 5
-  }
+  "meta": { ... },          // present on list endpoints (see Pagination)
+  "timestamp": "2026-08-22T10:00:00.000Z"
 }
 
 // Error
@@ -843,6 +842,53 @@ All API responses follow a consistent envelope:
   }
 }
 ```
+
+### Pagination
+
+List endpoints support **two pagination modes** on the same route. The `meta.mode`
+field tells clients which one produced the page.
+
+| Mode | Query params | `meta` fields | When to use |
+|---|---|---|---|
+| **Cursor** (keyset) | `?cursor=<opaque>&limit=` | `mode`, `limit`, `count`, `nextCursor`, `hasMore` | **Preferred.** Stable under concurrent writes, O(limit) at any depth. |
+| **Offset** (legacy) | `?page=&limit=` | `mode`, `limit`, `total`, `page`, `totalPages` | Backwards-compatible; needs a total count. Can duplicate/skip rows under concurrent inserts. |
+
+If `cursor` is supplied it takes precedence over `page`. `limit` defaults to 20 (max 100).
+
+**Cursor (keyset) pagination** seeks past an opaque `(sortValue, id)` cursor instead
+of counting from the top with `OFFSET`. Because the sort column (`created_at`,
+`timestamp`, `retired_at`) is paired with the immutable `id` as a tiebreaker, paging
+is a strict total order that neither duplicates nor skips rows when new rows are
+inserted mid-pagination — the failure mode `OFFSET` exhibits on this platform's
+high-volume tables (sensor readings, oracle submissions, retirements).
+
+```jsonc
+// GET /sensors/readings?limit=2   → first page
+{
+  "success": true,
+  "data": [ /* 2 readings, newest first */ ],
+  "meta": {
+    "mode": "cursor",
+    "limit": 2,
+    "count": 2,
+    "nextCursor": "eyJ2IjoiMjAyNi0wOC0yMlQxMDowMDowMC4wMDBaIiwiaWQiOiIuLi4ifQ",
+    "hasMore": true
+  },
+  "timestamp": "2026-08-22T10:00:00.000Z"
+}
+
+// GET /sensors/readings?cursor=eyJ2Ijoi...&limit=2   → next page
+// Walk until meta.hasMore === false (meta.nextCursor is then null).
+```
+
+Treat `nextCursor` as **opaque** — do not construct or mutate it. A malformed or
+tampered cursor returns `400 Bad Request`.
+
+Cursor pagination is available on: `GET /sensors/readings`, `GET /oracle/submissions`,
+`GET /credits/retirements`, `GET /governance/proposals`, `GET /notifications`, and
+`GET /users`. Each is backed by a composite `(filter?, sortColumn, id)` index
+(migration `018_add_keyset_pagination_indexes.sql`) so the seek resolves as an
+index range scan.
 
 ### Rate Limiting
 
@@ -1130,8 +1176,14 @@ STELLAR_RPC_URL=https://soroban-testnet.stellar.org
 STELLAR_NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
 
 # ── Stellar Backend Account ──
-STELLAR_BACKEND_SECRET=SXXX...YYY        # Backend Stellar account secret
-STELLAR_BACKEND_PUBLIC=GABC...DEF        # Backend Stellar account public
+# Required for on-chain writes (oracle submit, retire, governance).
+# Empty / placeholder (SDN...TODO) / invalid → GET /health reports
+# checks.stellar.signing_ready=false and status=degraded.
+STELLAR_BACKEND_SECRET=SXXX...YYY        # Backend Stellar account secret (S…)
+STELLAR_BACKEND_PUBLIC=GABC...DEF        # Backend Stellar account public (G…)
+# Fail boot if the backend secret is missing/placeholder/invalid.
+# Set true in production. Default false so local/dev can still start.
+STELLAR_REQUIRE_SIGNING_KEY=false
 
 # ── Contract Addresses (deployed on Stellar) ──
 CONTRACT_CREDIT_FACTORY=C...
@@ -1368,20 +1420,27 @@ GET /health
 ```json
 {
   "status": "ok",
-  "timestamp": 1700000000,
-  "uptime": 3600,
+  "timestamp": "2024-01-01T00:00:00.000Z",
+  "uptime_s": 3600,
   "checks": {
     "database": { "status": "ok", "latency_ms": 2 },
     "redis": { "status": "ok", "latency_ms": 1 },
-    "stellar": { "status": "ok", "latest_ledger": 12345678 },
+    "stellar": {
+      "status": "ok",
+      "latency_ms": 12,
+      "signing_ready": true,
+      "detail": "latest_ledger=12345678"
+    },
     "queues": {
-      "sensor-ingestion": { "waiting": 0, "active": 2, "failed": 0 },
-      "oracle-submit": { "waiting": 1, "active": 0, "failed": 0 },
-      "retirements": { "waiting": 0, "active": 0, "failed": 0 }
+      "sensor-ingestion": { "status": "ok", "waiting": 0, "active": 2, "failed": 0 },
+      "oracle-submit": { "status": "ok", "waiting": 1, "active": 0, "failed": 0 },
+      "retirements": { "status": "ok", "waiting": 0, "active": 0, "failed": 0 }
     }
   }
 }
 ```
+
+If `STELLAR_BACKEND_SECRET` is missing or invalid, `checks.stellar.signing_ready` is `false` and both `checks.stellar.status` and top-level `status` become `degraded` (HTTP still 200). Set `STELLAR_REQUIRE_SIGNING_KEY=true` to refuse startup instead.
 
 ### Metrics (Prometheus)
 

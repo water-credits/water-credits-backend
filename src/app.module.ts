@@ -25,12 +25,13 @@ import stellarConfig from './config/stellar.config';
 import jwtConfig from './config/jwt.config';
 import queueConfig from './config/queue.config';
 import oracleConfig from './config/oracle.config';
+import sensorConfig from './config/sensor.config';
 
 @Module({
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
-      load: [appConfig, databaseConfig, stellarConfig, jwtConfig, queueConfig, oracleConfig],
+      load: [appConfig, databaseConfig, stellarConfig, jwtConfig, queueConfig, oracleConfig, sensorConfig],
     }),
     TypeOrmModule.forRootAsync({
       useFactory: (configService: ConfigService) => ({

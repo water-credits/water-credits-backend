@@ -20,6 +20,11 @@ export enum SubmissionStatus {
 
 @Entity('oracle_submissions')
 @Unique(['projectId', 'oracleAddress', 'nonce'])
+// Composite indexes backing keyset (created_at, id) pagination of
+// GET /oracle/submissions, including its project/status filter variants.
+@Index('idx_oracle_submissions_created_at_id', ['createdAt', 'id'])
+@Index('idx_oracle_submissions_project_created_at_id', ['projectId', 'createdAt', 'id'])
+@Index('idx_oracle_submissions_status_created_at_id', ['status', 'createdAt', 'id'])
 export class OracleSubmission {
   @PrimaryGeneratedColumn('uuid')
   id: string;

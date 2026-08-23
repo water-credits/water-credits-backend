@@ -6,6 +6,7 @@ import helmet from 'helmet';
 import { WinstonModule } from 'nest-winston';
 import * as winston from 'winston';
 import { AppModule } from './app.module';
+import { corsOptions } from './config/cors.config';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
 import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
@@ -61,9 +62,8 @@ async function bootstrap() {
   );
 
   app.enableCors({
-    origin: nodeEnv === 'production' ? process.env.CORS_ORIGIN : '*',
+    ...corsOptions,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
-    credentials: true,
   });
 
   if (nodeEnv !== 'production') {

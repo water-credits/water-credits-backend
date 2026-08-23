@@ -6,12 +6,20 @@ import {
   ManyToOne,
   JoinColumn,
   Index,
+  Unique,
 } from 'typeorm';
 import { SensorDevice } from './sensor-device.entity';
 import { Project } from '../../projects/entities/project.entity';
 import { ReadingBatch } from './reading-batch.entity';
 
 @Entity('sensor_readings')
+@Unique('idx_device_timestamp_signature_unique', ['deviceId', 'timestamp', 'signature'])
+// Composite indexes backing keyset (timestamp, id) pagination of GET /sensors/readings.
+// The leading filter column lets the same index serve both the filtered and
+// unfiltered list variants with an index-only range scan.
+@Index('idx_sensor_readings_timestamp_id', ['timestamp', 'id'])
+@Index('idx_sensor_readings_project_timestamp_id', ['projectId', 'timestamp', 'id'])
+@Index('idx_sensor_readings_device_timestamp_id', ['deviceId', 'timestamp', 'id'])
 export class SensorReading {
   @PrimaryGeneratedColumn('uuid')
   id: string;

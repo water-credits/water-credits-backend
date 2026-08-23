@@ -10,6 +10,7 @@ import { CreditQueryDto } from './dto/credit-query.dto';
 import { Project, ProjectStatus } from '../projects/entities/project.entity';
 import { User } from '../users/entities/user.entity';
 import { StellarService } from '../stellar/stellar.service';
+import { paginate, PaginatedList } from '../../common/pagination';
 
 // Shape of the response for GET /credits
 export interface CreditOverview {
@@ -95,9 +96,12 @@ export class CreditsService {
       projectMap.set(r.projectId, entry);
     }
 
+    const creditPrice = this.configService.get<number>('CREDIT_PRICE_PER_UNIT') ?? 1;
+    const totalValue = totalRetired * creditPrice;
+
     return {
       totalRetired,
-      totalValue: 0,
+      totalValue,
       projects: Array.from(projectMap.values()),
     };
   }
@@ -162,10 +166,7 @@ export class CreditsService {
     return saved;
   }
 
-  async getRetirements(
-    userId: string,
-    query: CreditQueryDto,
-  ): Promise<{ data: Retirement[]; total: number; page: number; limit: number }> {
+  async getRetirements(userId: string, query: CreditQueryDto): Promise<PaginatedList<Retirement>> {
     const qb = this.retirementRepo
       .createQueryBuilder('retirement')
       .leftJoinAndSelect('retirement.project', 'project')
@@ -181,11 +182,11 @@ export class CreditsService {
       qb.andWhere('retirement.retired_at <= :endDate', { endDate: query.endDate });
     }
 
-    qb.orderBy('retirement.retired_at', 'DESC');
-    qb.skip(query.skip).take(query.limit);
-
-    const [data, total] = await qb.getManyAndCount();
-    return { data, total, page: query.page ?? 1, limit: query.limit ?? 20 };
+    return paginate(
+      qb,
+      { alias: 'retirement', sortColumn: 'retirement.retired_at', sortProperty: 'retiredAt' },
+      query,
+    );
   }
 
   async getCertificate(id: string, userId: string): Promise<Retirement> {

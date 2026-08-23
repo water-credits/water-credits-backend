@@ -79,7 +79,11 @@ export class ProjectsController {
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Soft-delete a project' })
-  async remove(@Param('id') id: string, @CurrentUser('id') userId: string): Promise<void> {
-    return this.projectsService.remove(id, userId);
+  async remove(
+    @Param('id') id: string,
+    @CurrentUser('id') userId: string,
+    @CurrentUser('role') callerRole: UserRole,
+  ): Promise<void> {
+    return this.projectsService.remove(id, userId, callerRole);
   }
 }

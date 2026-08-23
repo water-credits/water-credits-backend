@@ -14,6 +14,7 @@ import Redis from 'ioredis';
 import { User, UserRole } from '../users/entities/user.entity';
 import { Keypair } from '@stellar/stellar-sdk';
 import { RedisService } from './redis.service';
+import { AuthUnavailableException } from './exceptions/auth-unavailable.exception';
 
 const CHALLENGE_TTL_SECONDS = 5 * 60; // 5 minutes
 const CHALLENGE_KEY_PREFIX = 'auth:challenge:';
@@ -36,41 +37,76 @@ export class AuthService {
 
   // ── Challenge ─────────────────────────────────────────────────────────────
 
-  generateChallenge(wallet: string): { challenge: string; expiresAt: Date } {
+  generateChallenge(wallet: string): Promise<{ challenge: string; expiresAt: Date }> {
     const challenge = crypto.randomBytes(32).toString('hex');
     const expiresAt = new Date(Date.now() + CHALLENGE_TTL_SECONDS * 1000);
-
-    // Persist asynchronously — fire and forget (errors logged above)
     const key = `${CHALLENGE_KEY_PREFIX}${wallet.toLowerCase()}`;
-    this.redis
-      .set(key, challenge, 'EX', CHALLENGE_TTL_SECONDS)
-      .catch((err) => this.logger.error(`Failed to store challenge in Redis: ${err.message}`));
 
-    return { challenge, expiresAt };
+    // Previously fire-and-forget: a failed store here was invisible to the
+    // caller, who'd get back a challenge that could never be redeemed and
+    // would then see a plain "invalid credentials" on login — indistinguishable
+    // from actually getting the signature wrong. Await it and fail loudly
+    // instead (#88).
+    return this.redis
+      .set(key, challenge, 'EX', CHALLENGE_TTL_SECONDS)
+      .then(() => ({ challenge, expiresAt }))
+      .catch((err) => {
+        this.logger.error(`Failed to store challenge in Redis: ${err.message}`);
+        throw new AuthUnavailableException();
+      });
   }
 
   // ── Signature validation ───────────────────────────────────────────────────
+
+  /**
+   * Atomically fetch + delete the stored challenge for `wallet` (GETDEL is
+   * Redis ≥ 6.2, with a GET+DEL fallback for older versions).
+   *
+   * Distinguishes "Redis is up but doesn't support GETDEL" (a normal,
+   * expected fallback) from every other failure mode (connection refused,
+   * timeout, offline queue disabled) — the latter is a genuine outage and
+   * must not be swallowed into a `null` that callers would otherwise read as
+   * "no such challenge" and turn into a misleading 401 (#88).
+   */
+  private async consumeChallenge(wallet: string): Promise<string | null> {
+    const key = `${CHALLENGE_KEY_PREFIX}${wallet.toLowerCase()}`;
+
+    try {
+      return await this.redis.getdel(key);
+    } catch (err) {
+      if (!this.isUnsupportedCommandError(err)) {
+        this.logger.error(`Redis unavailable during challenge lookup: ${(err as Error).message}`);
+        throw new AuthUnavailableException();
+      }
+
+      this.logger.warn(`GETDEL unsupported, falling back to GET+DEL: ${(err as Error).message}`);
+      try {
+        const value = await this.redis.get(key);
+        if (value) {
+          await this.redis.del(key);
+        }
+        return value;
+      } catch (fallbackErr) {
+        this.logger.error(
+          `Redis unavailable during GET+DEL fallback: ${(fallbackErr as Error).message}`,
+        );
+        throw new AuthUnavailableException();
+      }
+    }
+  }
+
+  /** True only for the "server doesn't know this command" class of error (old Redis). */
+  private isUnsupportedCommandError(err: unknown): boolean {
+    const message = err instanceof Error ? err.message : String(err);
+    return /unknown command/i.test(message);
+  }
 
   async validateStellarSignature(
     wallet: string,
     signature: string,
     challenge: string,
   ): Promise<User | null> {
-    const key = `${CHALLENGE_KEY_PREFIX}${wallet.toLowerCase()}`;
-
-    // Atomically fetch + delete so the challenge can only be used once,
-    // even under concurrent requests (GETDEL is Redis ≥ 6.2)
-    let storedChallenge: string | null;
-    try {
-      storedChallenge = await this.redis.getdel(key);
-    } catch (err) {
-      // Fall back to GET + DEL on older Redis versions
-      this.logger.warn(`GETDEL failed, falling back to GET+DEL: ${(err as Error).message}`);
-      storedChallenge = await this.redis.get(key);
-      if (storedChallenge) {
-        await this.redis.del(key);
-      }
-    }
+    const storedChallenge = await this.consumeChallenge(wallet);
 
     if (!storedChallenge || storedChallenge !== challenge) {
       return null;
@@ -123,17 +159,7 @@ export class AuthService {
     email?: string,
     displayName?: string,
   ): Promise<{ accessToken: string; refreshToken: string; user: Partial<User> }> {
-    const key = `${CHALLENGE_KEY_PREFIX}${wallet.toLowerCase()}`;
-
-    let storedChallenge: string | null;
-    try {
-      storedChallenge = await this.redis.getdel(key);
-    } catch {
-      storedChallenge = await this.redis.get(key);
-      if (storedChallenge) {
-        await this.redis.del(key);
-      }
-    }
+    const storedChallenge = await this.consumeChallenge(wallet);
 
     if (!storedChallenge || storedChallenge !== challenge) {
       throw new BadRequestException('Invalid or expired challenge');

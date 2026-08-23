@@ -64,6 +64,19 @@ function makeConfig(overrides: Partial<GovernanceConfig> = {}): GovernanceConfig
   } as GovernanceConfig;
 }
 
+// Chainable mock for configRepo.createQueryBuilder().insert().into(...).values(...).orIgnore().execute()
+// — the race-free upsert getConfig() falls back to when the singleton row (id = 1) doesn't exist yet.
+function makeInsertQb() {
+  const qb = {
+    insert: jest.fn().mockReturnThis(),
+    into: jest.fn().mockReturnThis(),
+    values: jest.fn().mockReturnThis(),
+    orIgnore: jest.fn().mockReturnThis(),
+    execute: jest.fn().mockResolvedValue(undefined),
+  };
+  return qb;
+}
+
 // ── Factory for a fake QueryRunner ───────────────────────────────────────────
 
 function makeQueryRunner(opts: {
@@ -152,6 +165,7 @@ describe('GovernanceService', () => {
         skip: jest.fn().mockReturnThis(),
         take: jest.fn().mockReturnThis(),
         orderBy: jest.fn().mockReturnThis(),
+        addOrderBy: jest.fn().mockReturnThis(),
         execute: jest.fn().mockResolvedValue(undefined),
         getManyAndCount: jest.fn().mockResolvedValue([[], 0]),
       })),
@@ -167,6 +181,7 @@ describe('GovernanceService', () => {
       findOne: jest.fn().mockResolvedValue(makeConfig()),
       create: jest.fn(),
       save: jest.fn(),
+      createQueryBuilder: jest.fn().mockReturnValue(makeInsertQb()),
     };
 
     configChangeRepo = {
@@ -688,26 +703,15 @@ describe('GovernanceService', () => {
     });
   });
 
-  // ── getConfig ── no existing config ──────────────────────────────────────
+  // ── getConfig ── singleton determinism & race-free upsert ────────────────
+  //
+  // governance_config is a singleton enforced by CHECK(id = 1) + the primary
+  // key (see the GovernanceConfig entity and migration
+  // 016_governance_config_singleton.sql). getConfig() must always resolve to
+  // that one row, and must not be able to create a second row even when two
+  // callers race on an empty table.
 
-  describe('getConfig — default creation', () => {
-    it('creates and returns a default config when none exists', async () => {
-      configRepo.findOne.mockResolvedValue(null);
-      const defaultConfig = makeConfig();
-      configRepo.create.mockReturnValue(defaultConfig);
-      configRepo.save.mockResolvedValue(defaultConfig);
-
-      const result = await service.getConfig();
-
-      expect(configRepo.create).toHaveBeenCalled();
-      expect(configRepo.save).toHaveBeenCalled();
-      expect(result).toEqual(defaultConfig);
-    });
-  });
-
-  // ── getConfig ── no existing config ──────────────────────────────────────
-
-  describe('getConfig — default creation', () => {
+  describe('getConfig — singleton determinism & race-free upsert', () => {
     let proposalRepo: jest.Mocked<Record<string, jest.Mock>>;
     let voteRepo: jest.Mocked<Record<string, jest.Mock>>;
     let configRepo: jest.Mocked<Record<string, jest.Mock>>;
@@ -725,7 +729,12 @@ describe('GovernanceService', () => {
         createQueryBuilder: jest.fn(),
       } as never;
       voteRepo = { findOne: jest.fn(), create: jest.fn(), save: jest.fn() } as never;
-      configRepo = { findOne: jest.fn(), create: jest.fn(), save: jest.fn() } as never;
+      configRepo = {
+        findOne: jest.fn(),
+        create: jest.fn(),
+        save: jest.fn(),
+        createQueryBuilder: jest.fn().mockReturnValue(makeInsertQb()),
+      } as never;
       dataSource = {
         createQueryRunner: jest.fn(),
         query: jest.fn().mockResolvedValue(undefined),
@@ -757,17 +766,67 @@ describe('GovernanceService', () => {
       service = module.get<GovernanceService>(GovernanceService);
     });
 
-    it('creates and returns a default config when none exists', async () => {
-      configRepo.findOne.mockResolvedValue(null);
-      const defaultConfig = makeConfig();
-      configRepo.create.mockReturnValue(defaultConfig);
-      configRepo.save.mockResolvedValue(defaultConfig);
+    it('always queries the fixed singleton row (id = 1), not an unfiltered findOne', async () => {
+      const config = makeConfig();
+      configRepo.findOne.mockResolvedValue(config);
 
       const result = await service.getConfig();
 
-      expect(configRepo.create).toHaveBeenCalled();
-      expect(configRepo.save).toHaveBeenCalled();
+      expect(configRepo.findOne).toHaveBeenCalledWith({ where: { id: 1 } });
+      expect(result).toEqual(config);
+    });
+
+    it('returns the existing row without attempting an insert when id = 1 already exists', async () => {
+      configRepo.findOne.mockResolvedValue(makeConfig());
+
+      await service.getConfig();
+
+      expect(configRepo.createQueryBuilder).not.toHaveBeenCalled();
+    });
+
+    it('auto-provisions the singleton via INSERT ... ON CONFLICT DO NOTHING when no row exists', async () => {
+      const defaultConfig = makeConfig();
+      configRepo.findOne
+        .mockResolvedValueOnce(null) // initial read: table empty
+        .mockResolvedValueOnce(defaultConfig); // re-read after the upsert
+
+      const insertQb = makeInsertQb();
+      configRepo.createQueryBuilder.mockReturnValue(insertQb);
+
+      const result = await service.getConfig();
+
+      expect(insertQb.insert).toHaveBeenCalled();
+      expect(insertQb.values).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }));
+      expect(insertQb.orIgnore).toHaveBeenCalled();
+      expect(insertQb.execute).toHaveBeenCalled();
+      expect(configRepo.findOne).toHaveBeenLastCalledWith({ where: { id: 1 } });
       expect(result).toEqual(defaultConfig);
+    });
+
+    it('two concurrent cold-start calls both resolve to the same singleton row and never both insert', async () => {
+      // Simulates two requests racing on an empty table: both miss the initial
+      // SELECT, both attempt the upsert, but ON CONFLICT DO NOTHING means only
+      // one row is ever created — both callers must observe the same result.
+      const winningConfig = makeConfig();
+      let readCount = 0;
+      configRepo.findOne.mockImplementation(async () => {
+        readCount++;
+        // Both callers miss on their first read (racing on an empty table);
+        // every read after either upsert attempt sees the winner's row.
+        return readCount <= 2 ? null : winningConfig;
+      });
+
+      const [first, second] = await Promise.all([service.getConfig(), service.getConfig()]);
+
+      expect(first).toEqual(winningConfig);
+      expect(second).toEqual(winningConfig);
+      expect(configRepo.createQueryBuilder).toHaveBeenCalledTimes(2);
+    });
+
+    it('throws if the singleton row is still missing immediately after the upsert', async () => {
+      configRepo.findOne.mockResolvedValue(null);
+
+      await expect(service.getConfig()).rejects.toThrow(InternalServerErrorException);
     });
   });
 
@@ -856,6 +915,112 @@ describe('GovernanceService', () => {
     });
   });
 
+  // ── emergencyConfigUpdate ── the "updateConfig" write path ───────────────
+  //
+  // This is the code path the issue describes as "updateConfig does
+  // Object.assign + save on whatever row [getConfig] returns". Now that
+  // getConfig() always resolves the fixed singleton (id = 1), every write
+  // here lands on that same row — save() updates by primary key, it can
+  // never insert a second row.
+
+  describe('emergencyConfigUpdate — concurrent calls cannot create duplicate rows', () => {
+    let proposalRepo: jest.Mocked<Record<string, jest.Mock>>;
+    let voteRepo: jest.Mocked<Record<string, jest.Mock>>;
+    let configRepo: jest.Mocked<Record<string, jest.Mock>>;
+    let configChangeRepo: jest.Mocked<Record<string, jest.Mock>>;
+    let dataSource: { createQueryRunner: jest.Mock; query: jest.Mock };
+    let stellarService: { execute: jest.Mock };
+    let configService: { get: jest.Mock };
+    let service: GovernanceService;
+
+    beforeEach(async () => {
+      proposalRepo = {
+        find: jest.fn(),
+        findOne: jest.fn(),
+        create: jest.fn(),
+        save: jest.fn(),
+        createQueryBuilder: jest.fn(),
+      } as never;
+      voteRepo = { findOne: jest.fn(), create: jest.fn(), save: jest.fn() } as never;
+      configRepo = {
+        // The singleton row (id = 1) — CHECK(id = 1) + the primary key mean
+        // this is the only row that can ever exist, so every findOne resolves
+        // to it regardless of how many callers race on getConfig().
+        findOne: jest.fn().mockResolvedValue(makeConfig({ id: 1 })),
+        create: jest.fn(),
+        save: jest.fn().mockImplementation(async (entity: GovernanceConfig) => entity),
+        createQueryBuilder: jest.fn().mockReturnValue(makeInsertQb()),
+      } as never;
+      configChangeRepo = {
+        find: jest.fn().mockResolvedValue([]),
+        findOne: jest.fn().mockResolvedValue(null),
+        create: jest.fn().mockImplementation((data: unknown) => data),
+        save: jest.fn().mockImplementation(async (data: unknown) => ({
+          id: 'change-uuid',
+          ...(data as object),
+        })),
+      } as never;
+      dataSource = { createQueryRunner: jest.fn(), query: jest.fn().mockResolvedValue(undefined) };
+      stellarService = { execute: jest.fn() };
+      configService = { get: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          GovernanceService,
+          { provide: getRepositoryToken(Proposal), useValue: proposalRepo },
+          { provide: getRepositoryToken(ProposalVote), useValue: voteRepo },
+          { provide: getRepositoryToken(GovernanceConfig), useValue: configRepo },
+          { provide: getRepositoryToken(GovernanceConfigChange), useValue: configChangeRepo },
+          { provide: ConfigService, useValue: configService },
+          { provide: DataSource, useValue: dataSource },
+          { provide: StellarService, useValue: stellarService },
+        ],
+      }).compile();
+
+      service = module.get<GovernanceService>(GovernanceService);
+    });
+
+    it('applies the update directly to the live config row and records an EMERGENCY change', async () => {
+      const result = await service.emergencyConfigUpdate('GSUPERADMIN', { quorum: 9 } as never);
+
+      expect(result.id).toBe(1);
+      expect(result.quorum).toBe(9);
+      expect(configChangeRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({ status: ConfigChangeStatus.EMERGENCY }),
+      );
+    });
+
+    it('throws BadRequestException when no config fields are provided', async () => {
+      await expect(service.emergencyConfigUpdate('GSUPERADMIN', {} as never)).rejects.toThrow(
+        BadRequestException,
+      );
+      expect(configRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('two concurrent emergency updates both write to id = 1 — never to a second row', async () => {
+      // Simulates two admins racing a force=true PATCH /governance/config at
+      // the same time. Both calls resolve getConfig() to the same singleton
+      // row; the assertion below is the crux of the fix: save() must never
+      // be asked to persist any row other than id = 1.
+      const [first, second] = await Promise.all([
+        service.emergencyConfigUpdate('GADMIN_A', { quorum: 5 } as never),
+        service.emergencyConfigUpdate('GADMIN_B', { protocolFeeBps: 250 } as never),
+      ]);
+
+      expect(first.id).toBe(1);
+      expect(second.id).toBe(1);
+
+      expect(configRepo.save).toHaveBeenCalledTimes(2);
+      for (const call of configRepo.save.mock.calls) {
+        expect((call[0] as GovernanceConfig).id).toBe(1);
+      }
+
+      // Neither concurrent call ever attempted the cold-start INSERT path —
+      // getConfig() found the singleton row on its first read both times.
+      expect(configRepo.createQueryBuilder).not.toHaveBeenCalled();
+    });
+  });
+
   // ── getProposals with filters ────────────────────────────────────────────
 
   describe('getProposals — filters', () => {
@@ -916,6 +1081,7 @@ describe('GovernanceService', () => {
       const qb = {
         andWhere: jest.fn().mockReturnThis(),
         orderBy: jest.fn().mockReturnThis(),
+        addOrderBy: jest.fn().mockReturnThis(),
         skip: jest.fn().mockReturnThis(),
         take: jest.fn().mockReturnThis(),
         getManyAndCount: jest.fn().mockResolvedValue([[], 0]),

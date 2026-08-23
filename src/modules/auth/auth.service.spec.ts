@@ -7,6 +7,7 @@ import { Keypair } from '@stellar/stellar-sdk';
 import * as crypto from 'crypto';
 import { AuthService } from './auth.service';
 import { RedisService } from './redis.service';
+import { AuthUnavailableException } from './exceptions/auth-unavailable.exception';
 import { User, UserRole } from '../users/entities/user.entity';
 
 // ── Redis isolation strategy ──────────────────────────────────────────────────
@@ -169,59 +170,48 @@ describe('AuthService', () => {
   // ── generateChallenge ────────────────────────────────────────────────────
 
   describe('generateChallenge', () => {
-    it('returns a non-empty challenge string and an expiresAt date in the future', () => {
+    it('returns a non-empty challenge string and an expiresAt date in the future', async () => {
       mockRedis.set.mockResolvedValue('OK');
 
       const before = Date.now();
-      const { challenge, expiresAt } = service.generateChallenge('GTEST123');
+      const { challenge, expiresAt } = await service.generateChallenge('GTEST123');
 
       expect(typeof challenge).toBe('string');
       expect(challenge.length).toBeGreaterThan(0);
       expect(expiresAt.getTime()).toBeGreaterThan(before);
     });
 
-    it('returns a different challenge on each call', () => {
+    it('returns a different challenge on each call', async () => {
       mockRedis.set.mockResolvedValue('OK');
 
-      const { challenge: c1 } = service.generateChallenge('GTEST123');
-      const { challenge: c2 } = service.generateChallenge('GTEST123');
+      const { challenge: c1 } = await service.generateChallenge('GTEST123');
+      const { challenge: c2 } = await service.generateChallenge('GTEST123');
 
       expect(c1).not.toBe(c2);
     });
 
-    it('stores the challenge in Redis with a TTL (fire-and-forget; no await required)', () => {
+    it('stores the challenge in Redis with a TTL before resolving', async () => {
       mockRedis.set.mockResolvedValue('OK');
-      service.generateChallenge('GTEST123');
-      // Allow the unhandled promise to settle before asserting.
-      return new Promise<void>((resolve) => {
-        setImmediate(() => {
-          expect(mockRedis.set).toHaveBeenCalledWith(
-            expect.stringContaining('auth:challenge:gtest123'),
-            expect.any(String),
-            'EX',
-            300, // 5 minutes = 300 seconds
-          );
-          resolve();
-        });
-      });
+
+      await service.generateChallenge('GTEST123');
+
+      expect(mockRedis.set).toHaveBeenCalledWith(
+        expect.stringContaining('auth:challenge:gtest123'),
+        expect.any(String),
+        'EX',
+        300, // 5 minutes = 300 seconds
+      );
     });
 
-    it('swallows Redis set errors silently (fire-and-forget error path)', () => {
-      // When redis.set rejects, the .catch() handler logs the error and does not
-      // propagate — generateChallenge must still return normally.
+    it('throws AuthUnavailableException (503) instead of silently swallowing a Redis write failure', async () => {
+      // Previously: the .catch() handler logged the error and the challenge
+      // was returned anyway, so the caller had no way to know it could never
+      // be redeemed. Now the failure must surface immediately (#88).
       mockRedis.set.mockRejectedValue(new Error('Redis write failure'));
 
-      let result: ReturnType<typeof service.generateChallenge> | undefined;
-      expect(() => {
-        result = service.generateChallenge('GTEST456');
-      }).not.toThrow();
-
-      expect(result).toBeDefined();
-      expect(typeof result!.challenge).toBe('string');
-
-      // Let the rejected promise settle so the .catch() handler fires and the
-      // unhandled rejection doesn't bleed into later tests.
-      return new Promise<void>((resolve) => setImmediate(resolve));
+      await expect(service.generateChallenge('GTEST456')).rejects.toBeInstanceOf(
+        AuthUnavailableException,
+      );
     });
   });
 
@@ -368,6 +358,33 @@ describe('AuthService', () => {
       expect(mockRedis.get).toHaveBeenCalled();
       expect(mockRedis.del).toHaveBeenCalled();
     });
+
+    // ── Redis outage (#88) ──────────────────────────────────────────────
+
+    it('throws AuthUnavailableException instead of returning null when getdel fails with a connection error', async () => {
+      const realWallet = testKeypair.publicKey();
+      const signature = buildSignature(testKeypair, CHALLENGE);
+
+      // Not an "unknown command" error — a genuine outage, distinct from the
+      // GETDEL-unsupported fallback case above.
+      mockRedis.getdel.mockRejectedValue(new Error('connect ECONNREFUSED 127.0.0.1:6379'));
+
+      await expect(
+        service.validateStellarSignature(realWallet, signature, CHALLENGE),
+      ).rejects.toBeInstanceOf(AuthUnavailableException);
+    });
+
+    it('throws AuthUnavailableException when the GET+DEL fallback also fails', async () => {
+      const realWallet = testKeypair.publicKey();
+      const signature = buildSignature(testKeypair, CHALLENGE);
+
+      mockRedis.getdel.mockRejectedValue(new Error('ERR unknown command'));
+      mockRedis.get.mockRejectedValue(new Error('connect ECONNREFUSED 127.0.0.1:6379'));
+
+      await expect(
+        service.validateStellarSignature(realWallet, signature, CHALLENGE),
+      ).rejects.toBeInstanceOf(AuthUnavailableException);
+    });
   });
 
   // ── login ────────────────────────────────────────────────────────────────
@@ -400,6 +417,14 @@ describe('AuthService', () => {
 
       await expect(service.login('GSOME_WALLET', 'bad-sig', CHALLENGE)).rejects.toThrow(
         UnauthorizedException,
+      );
+    });
+
+    it('propagates AuthUnavailableException (not a misleading UnauthorizedException) on a Redis outage', async () => {
+      mockRedis.getdel.mockRejectedValue(new Error('connect ECONNREFUSED 127.0.0.1:6379'));
+
+      await expect(service.login('GSOME_WALLET', 'some-sig', CHALLENGE)).rejects.toBeInstanceOf(
+        AuthUnavailableException,
       );
     });
   });
@@ -535,6 +560,17 @@ describe('AuthService', () => {
       expect(result.accessToken).toBe('signed-jwt-token');
       expect(mockRedis.get).toHaveBeenCalled();
       expect(mockRedis.del).toHaveBeenCalled();
+    });
+
+    it('throws AuthUnavailableException instead of BadRequestException on a genuine Redis outage', async () => {
+      const realWallet = testKeypair.publicKey();
+      const signature = Buffer.from(testKeypair.sign(Buffer.from(CHALLENGE))).toString('hex');
+
+      mockRedis.getdel.mockRejectedValue(new Error('connect ECONNREFUSED 127.0.0.1:6379'));
+
+      await expect(service.register(realWallet, signature, CHALLENGE)).rejects.toBeInstanceOf(
+        AuthUnavailableException,
+      );
     });
   });
 
