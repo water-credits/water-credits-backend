@@ -13,6 +13,10 @@ function randomContractId(): string {
   return StrKey.encodeContract(randomBytes(32));
 }
 
+function randomAccountId(): string {
+  return StrKey.encodeEd25519PublicKey(randomBytes(32));
+}
+
 function makeConfigService(): ConfigService {
   return {
     get: jest.fn((key: string) => {
@@ -275,5 +279,77 @@ describe('StellarService.submitReading', () => {
 
     const result = await service.submitReading(oracleContractId, 'proj-abc', payload, 1);
     expect(result.txHash).toBe('mock-tx-hash');
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// batch ledger read tests
+// ---------------------------------------------------------------------------
+
+describe('StellarService batch ledger reads', () => {
+  let service: StellarService;
+  let getLedgerEntries: jest.Mock;
+
+  const ledgerEntry = (key: xdr.LedgerKey, value: bigint) => ({
+    key,
+    val: {
+      contractData: () => ({
+        val: () => nativeToScVal(value, { type: 'i128' }),
+      }),
+    },
+  });
+
+  beforeEach(() => {
+    getLedgerEntries = jest.fn();
+    service = new StellarService(
+      makeConfigService(),
+      { getLedgerEntries } as unknown as StellarClient,
+    );
+  });
+
+  it('reads all token totals in one RPC call and defaults missing entries to zero', async () => {
+    getLedgerEntries.mockImplementation(async (...keys: xdr.LedgerKey[]) => ({
+      entries: [ledgerEntry(keys[0], 1000n), ledgerEntry(keys[1], 200n), ledgerEntry(keys[2], 3000n)],
+      latestLedger: 1,
+    }));
+
+    const result = await service.batchGetTokenStats([
+      randomContractId(),
+      randomContractId(),
+    ]);
+
+    expect(getLedgerEntries).toHaveBeenCalledTimes(1);
+    expect(getLedgerEntries.mock.calls[0]).toHaveLength(4);
+    expect(result.size).toBe(2);
+    const firstStats = [...result.values()][0];
+    expect(firstStats.totalSupply.toNumber()).toBe(1000);
+    expect(firstStats.totalRetired.toNumber()).toBe(200);
+    expect([...result.values()][1].totalSupply.toNumber()).toBe(3000);
+    expect([...result.values()][1].totalRetired.toNumber()).toBe(0);
+
+    const firstKey = getLedgerEntries.mock.calls[0][0] as xdr.LedgerKey;
+    expect(firstKey.contractData().key().sym()).toBe('TotalSupply');
+  });
+
+  it('reads a project balance and totals in one RPC call', async () => {
+    getLedgerEntries.mockImplementation(async (...keys: xdr.LedgerKey[]) => ({
+      entries: [ledgerEntry(keys[0], 50n), ledgerEntry(keys[1], 1000n), ledgerEntry(keys[2], 200n)],
+      latestLedger: 1,
+    }));
+
+    const tokenId = randomContractId();
+    const wallet = randomAccountId();
+    const result = await service.getTokenCreditDetails(tokenId, wallet);
+
+    expect(getLedgerEntries).toHaveBeenCalledTimes(1);
+    expect(getLedgerEntries.mock.calls[0]).toHaveLength(3);
+    expect(result.balance?.toNumber()).toBe(50);
+    expect(result.totalSupply.toNumber()).toBe(1000);
+    expect(result.totalRetired.toNumber()).toBe(200);
+
+    const balanceKey = getLedgerEntries.mock.calls[0][0] as xdr.LedgerKey;
+    const balanceParts = balanceKey.contractData().key().vec();
+    expect(balanceParts?.[0]?.sym()).toBe('Balance');
   });
 });
