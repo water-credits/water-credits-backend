@@ -15,6 +15,7 @@ import { ReadingBatch, BatchStatus } from '../sensors/entities/reading-batch.ent
 export interface OracleSubmitJobData {
   submissionId: string;
   projectId: string;
+  batchId?: string | null;
   oracleAddress: string;
   nonce: number;
   /**

@@ -146,6 +146,7 @@ export class OracleService {
 
       const submission = queryRunner.manager.create(OracleSubmission, {
         projectId: dto.projectId,
+        batchId: dto.batchId ?? null,
         oracleAddress: dto.oracleAddress,
         nonce,
         txHash: '',
@@ -167,6 +168,7 @@ export class OracleService {
       {
         submissionId: saved.id,
         projectId: dto.projectId,
+        batchId: saved.batchId,
         oracleAddress: dto.oracleAddress,
         nonce: saved.nonce,
       },
@@ -369,6 +371,7 @@ export class OracleService {
           {
             submissionId: sub.id,
             projectId: sub.projectId,
+            batchId: sub.batchId,
             oracleAddress: sub.oracleAddress,
             nonce: sub.nonce,
           },
