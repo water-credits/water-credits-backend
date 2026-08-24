@@ -2,7 +2,7 @@ import { Process, Processor } from '@nestjs/bull';
 import { Job } from 'bull';
 import { Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, MoreThan, Not, Repository } from 'typeorm';
+import { MoreThan, Not, Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { SorobanRpc } from '@stellar/stellar-sdk';
 import { OracleSubmission, SubmissionStatus } from './entities/oracle-submission.entity';
@@ -349,13 +349,7 @@ export class OracleProcessor {
           Number(project.areaHectares),
         );
 
-        const batch = await this.batchRepo.findOne({
-          where: {
-            projectId,
-            status: In([BatchStatus.PENDING, BatchStatus.SUBMITTED]),
-          },
-          order: { createdAt: 'DESC' },
-        });
+        const batch = await this.findSubmittedBatch(submission, projectId);
 
         if (batch) {
           batch.status = BatchStatus.CONFIRMED;
@@ -364,7 +358,7 @@ export class OracleProcessor {
           await this.batchRepo.save(batch);
           this.logger.log(`Calculated ${batch.creditsGenerated} credits for batch ${batch.id}`);
         } else {
-          this.logger.warn(`No pending batch found for project ${projectId} to assign credits`);
+          this.logger.warn(`No submitted batch found for project ${projectId} to assign credits`);
         }
       } else {
         this.logger.warn(`Could not calculate credits: Project or Config missing`);
@@ -372,6 +366,34 @@ export class OracleProcessor {
     } catch (err) {
       this.logger.error(`Error calculating credits for submission ${submission.id}`, err);
     }
+  }
+
+  private async findSubmittedBatch(
+    submission: OracleSubmission,
+    projectId: string,
+  ): Promise<ReadingBatch | null> {
+    if (!submission.batchId) {
+      this.logger.warn(
+        `Oracle submission ${submission.id} has no batchId; skipping batch credit update for legacy job`,
+      );
+      return null;
+    }
+
+    const batch = await this.batchRepo.findOne({
+      where: {
+        id: submission.batchId,
+        projectId,
+        status: BatchStatus.SUBMITTED,
+      },
+    });
+
+    if (!batch) {
+      this.logger.warn(
+        `Batch ${submission.batchId} for oracle submission ${submission.id} was not found in SUBMITTED status`,
+      );
+    }
+
+    return batch;
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
