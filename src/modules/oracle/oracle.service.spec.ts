@@ -10,7 +10,7 @@ import { StellarService } from '../stellar/stellar.service';
 import { SensorReading } from '../sensors/entities/sensor-reading.entity';
 import { Project } from '../projects/entities/project.entity';
 import { GovernanceConfig } from '../governance/entities/governance-config.entity';
-import { ReadingBatch } from '../sensors/entities/reading-batch.entity';
+import { BatchStatus, ReadingBatch } from '../sensors/entities/reading-batch.entity';
 import { CreditScoringService } from './credit-scoring.service';
 
 // ── Typed mock factory ────────────────────────────────────────────────────────
@@ -128,6 +128,7 @@ function makeSubmission(overrides: Partial<OracleSubmission> = {}): OracleSubmis
   return {
     id: 'sub-1',
     projectId: 'proj-1',
+    batchId: 'batch-1',
     oracleAddress: 'GABC123',
     nonce: 1,
     txHash: '',
@@ -137,6 +138,7 @@ function makeSubmission(overrides: Partial<OracleSubmission> = {}): OracleSubmis
     createdAt: new Date(),
     updatedAt: new Date(),
     project: undefined as never,
+    batch: undefined as never,
     ...overrides,
   };
 }
@@ -231,6 +233,7 @@ describe('OracleService', () => {
       await service.triggerSubmission({
         projectId: 'proj-abc',
         oracleAddress: 'GORACLE',
+        batchId: 'batch-abc',
         readings: {},
       });
 
@@ -239,6 +242,7 @@ describe('OracleService', () => {
         expect.objectContaining({
           submissionId: 'sub-uuid-1',
           projectId: 'proj-abc',
+          batchId: 'batch-abc',
           oracleAddress: 'GORACLE',
           nonce: 1,
         }),
@@ -861,6 +865,7 @@ describe('OracleService', () => {
         id: 'sub-gap',
         nonce: 4,
         projectId: 'proj-1',
+        batchId: 'batch-1',
         oracleAddress: 'GABC',
       });
 
@@ -870,7 +875,7 @@ describe('OracleService', () => {
 
       const mockProject = { id: 'proj-1', areaHectares: 10 };
       const mockConfig = { id: 1 };
-      const mockBatch = { id: 'batch-1', status: 'PENDING' };
+      const mockBatch = { id: 'batch-1', status: BatchStatus.SUBMITTED };
 
       const projectRepo = service['projectRepo'];
       const configRepo = service['governanceConfigRepo'];
@@ -888,7 +893,13 @@ describe('OracleService', () => {
       expect(gapSub.txHash).toBe('reconciled-on-chain');
       expect(gapSub.result).toMatchObject({ reconciled: true });
 
-      expect(batchRepo.findOne).toHaveBeenCalled();
+      expect(batchRepo.findOne).toHaveBeenCalledWith({
+        where: {
+          id: 'batch-1',
+          projectId: 'proj-1',
+          status: BatchStatus.SUBMITTED,
+        },
+      });
       expect(batchRepo.save).toHaveBeenCalledWith(
         expect.objectContaining({
           id: 'batch-1',

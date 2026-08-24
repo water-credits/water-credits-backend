@@ -39,7 +39,7 @@ async function bootstrap() {
 
   app.setGlobalPrefix('api/v1');
 
-  app.useGlobalFilters(new AllExceptionsFilter(logger));
+  app.useGlobalFilters(new AllExceptionsFilter(logger, nodeEnv === 'production'));
   app.useGlobalInterceptors(new LoggingInterceptor(logger, nodeEnv), new TransformInterceptor());
 
   app.useGlobalPipes(

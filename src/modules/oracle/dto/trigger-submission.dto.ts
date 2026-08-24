@@ -1,4 +1,4 @@
-import { IsString, IsOptional, IsObject } from 'class-validator';
+import { IsString, IsOptional, IsObject, IsUUID } from 'class-validator';
 
 export class TriggerSubmissionDto {
   @IsString()
@@ -6,6 +6,10 @@ export class TriggerSubmissionDto {
 
   @IsString()
   oracleAddress: string;
+
+  @IsOptional()
+  @IsUUID()
+  batchId?: string;
 
   @IsOptional()
   @IsObject()

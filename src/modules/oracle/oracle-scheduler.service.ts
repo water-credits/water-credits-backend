@@ -272,6 +272,7 @@ export class OracleSchedulerService implements OnModuleInit, OnApplicationShutdo
         await this.oracleService.triggerSubmission({
           projectId,
           oracleAddress,
+          batchId: batch.id,
           readings: this.toReadingsSnapshot(aggregate),
         });
 

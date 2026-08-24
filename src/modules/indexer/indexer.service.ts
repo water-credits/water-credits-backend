@@ -16,6 +16,7 @@ import { NotificationsGateway } from '../notifications/notifications.gateway';
 import { OracleSubmission, SubmissionStatus } from '../oracle/entities/oracle-submission.entity';
 import { ReadingBatch, BatchStatus } from '../sensors/entities/reading-batch.entity';
 import { Retirement } from '../credits/entities/retirement.entity';
+import { User } from '../users/entities/user.entity';
 import { Proposal, ProposalStatus } from '../governance/entities/proposal.entity';
 import { IndexerCursor, MAIN_CURSOR_KEY } from './entities/indexer-cursor.entity';
 import {
@@ -80,6 +81,8 @@ export class IndexerService implements OnModuleInit, OnModuleDestroy {
     private readonly batchRepo: Repository<ReadingBatch>,
     @InjectRepository(Retirement)
     private readonly retirementRepo: Repository<Retirement>,
+    @InjectRepository(User)
+    private readonly userRepo: Repository<User>,
     @InjectRepository(Proposal)
     private readonly proposalRepo: Repository<Proposal>,
   ) {}
@@ -457,23 +460,80 @@ export class IndexerService implements OnModuleInit, OnModuleDestroy {
     );
     const projectId = projectRow[0]?.id;
 
-    // Update any retirement that:
-    //   - belongs to this project
-    //   - has the matching amount
-    //   - has not yet been confirmed (no real txHash)
     if (projectId) {
-      await this.dataSource
-        .createQueryBuilder()
-        .update(Retirement)
-        .set({
-          retiredAt: () => `COALESCE(retired_at, NOW())`,
-        })
-        .where('project_id = :projectId', { projectId })
-        .andWhere('amount = :amount', { amount: Number(event.amount) })
-        .andWhere(
-          `(tx_hash = '' OR tx_hash LIKE 'tx-pending-%' OR tx_hash IS NULL)`,
-        )
-        .execute();
+      const user = await this.userRepo.findOne({
+        where: { wallet: event.from },
+      });
+
+      if (!user) {
+        this.logger.warn(
+          JSON.stringify({
+            level: 'warn',
+            context: 'IndexerService',
+            event: 'credit:retire',
+            message: 'No user found for retirement wallet; skipping confirmation',
+            wallet: event.from,
+            projectId,
+            amount: event.amount.toString(),
+            ledger: event.ledger,
+          }),
+        );
+      } else {
+        const candidates = await this.retirementRepo.find({
+          where: {
+            projectId,
+            userId: user.id,
+            amount: Number(event.amount),
+          },
+          order: {
+            retiredAt: 'ASC',
+            createdAt: 'ASC',
+            id: 'ASC',
+          },
+        });
+        const pending = candidates.filter(
+          (retirement) =>
+            retirement.txHash === null ||
+            retirement.txHash === '' ||
+            retirement.txHash.startsWith('tx-pending-'),
+        );
+        const candidate = pending[0];
+
+        if (pending.length > 1) {
+          this.logger.warn(
+            JSON.stringify({
+              level: 'warn',
+              context: 'IndexerService',
+              event: 'credit:retire',
+              message: 'Multiple pending retirements matched; selecting oldest',
+              wallet: event.from,
+              projectId,
+              userId: user.id,
+              amount: event.amount.toString(),
+              candidateCount: pending.length,
+              selectedRetirementId: candidate?.id,
+              ledger: event.ledger,
+            }),
+          );
+        }
+
+        if (candidate) {
+          await this.dataSource
+            .createQueryBuilder()
+            .update(Retirement)
+            .set({
+              retiredAt: () => `COALESCE(retired_at, NOW())`,
+            })
+            .where('id = :id', { id: candidate.id })
+            .andWhere('project_id = :projectId', { projectId })
+            .andWhere('user_id = :userId', { userId: user.id })
+            .andWhere('amount = :amount', { amount: Number(event.amount) })
+            .andWhere(
+              `(tx_hash = '' OR tx_hash LIKE 'tx-pending-%' OR tx_hash IS NULL)`,
+            )
+            .execute();
+        }
+      }
     }
 
     // Broadcast regardless of whether a matching DB row was found — another

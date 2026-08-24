@@ -8,6 +8,7 @@ import { DecodedEvent } from './indexer.types';
 import { OracleSubmission } from '../oracle/entities/oracle-submission.entity';
 import { ReadingBatch } from '../sensors/entities/reading-batch.entity';
 import { Retirement } from '../credits/entities/retirement.entity';
+import { User } from '../users/entities/user.entity';
 import { Proposal } from '../governance/entities/proposal.entity';
 import { StellarClient } from '../stellar/stellar.client';
 import { NotificationsService } from '../notifications/notifications.service';
@@ -38,6 +39,7 @@ describe('IndexerService', () => {
   let submissionRepo: MockRepo;
   let batchRepo: MockRepo;
   let retirementRepo: MockRepo;
+  let userRepo: MockRepo;
   let proposalRepo: MockRepo;
   let mockServer: { getLatestLedger: jest.Mock; getEvents: jest.Mock };
   let mockDataSource: { query: jest.Mock; createQueryBuilder: jest.Mock };
@@ -54,6 +56,7 @@ describe('IndexerService', () => {
     submissionRepo = mockRepo();
     batchRepo = mockRepo();
     retirementRepo = mockRepo();
+    userRepo = mockRepo();
     proposalRepo = mockRepo();
     mockNotificationsGateway = { broadcast: jest.fn() };
     mockSensorsGateway = { emitReading: jest.fn() };
@@ -111,6 +114,7 @@ describe('IndexerService', () => {
         { provide: getRepositoryToken(OracleSubmission), useValue: submissionRepo },
         { provide: getRepositoryToken(ReadingBatch), useValue: batchRepo },
         { provide: getRepositoryToken(Retirement), useValue: retirementRepo },
+        { provide: getRepositoryToken(User), useValue: userRepo },
         { provide: getRepositoryToken(Proposal), useValue: proposalRepo },
       ],
     }).compile();
@@ -343,8 +347,119 @@ describe('IndexerService', () => {
     });
   });
 
-  // ── WebSocket broadcast ─────────────────────────────────────────────
+    // ── Retirement confirmation matching ─────────────────────────────────
 
+  describe('credit:retire confirmation matching', () => {
+    const retireDecoded: DecodedEvent = {
+      id: 'ev-retire-101',
+      ledger: 901,
+      contractId: 'CONTRACT3',
+      topics: ['retire', 'GFROM...'],
+      value: { amount: 50n, purpose: 'voluntary', metadata_uri: '' },
+    };
+
+    function createRetirementQueryBuilder() {
+      return {
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ affected: 1 }),
+      };
+    }
+
+    it('matches the retirement by wallet-resolved user and amount', async () => {
+      const qbMock = createRetirementQueryBuilder();
+      (mockDataSource.query as jest.Mock).mockResolvedValue([{ id: 'project-1' }]);
+      (userRepo.findOne as jest.Mock).mockResolvedValue({
+        id: 'user-1',
+        wallet: 'GFROM...',
+      });
+      (retirementRepo.find as jest.Mock).mockResolvedValue([
+        {
+          id: 'retirement-1',
+          txHash: 'tx-pending-1',
+          retiredAt: new Date('2026-08-24T00:00:00Z'),
+          createdAt: new Date('2026-08-23T00:00:00Z'),
+        },
+      ]);
+      (mockDataSource.createQueryBuilder as jest.Mock).mockReturnValue(qbMock);
+
+      await (service as unknown as { processEvents: (events: DecodedEvent[]) => Promise<void> })
+        .processEvents([retireDecoded]);
+
+      expect(userRepo.findOne).toHaveBeenCalledWith({
+        where: { wallet: 'GFROM...' },
+      });
+      expect(retirementRepo.find).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { projectId: 'project-1', userId: 'user-1', amount: 50 },
+          order: { retiredAt: 'ASC', createdAt: 'ASC', id: 'ASC' },
+        }),
+      );
+      expect(qbMock.where).toHaveBeenCalledWith('id = :id', {
+        id: 'retirement-1',
+      });
+      expect(qbMock.execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('logs a structured warning and skips the update when the wallet has no user', async () => {
+      const warnSpy = jest.spyOn(service['logger'], 'warn').mockImplementation(() => {});
+      (mockDataSource.query as jest.Mock).mockResolvedValue([{ id: 'project-1' }]);
+      (userRepo.findOne as jest.Mock).mockResolvedValue(null);
+
+      await (service as unknown as { processEvents: (events: DecodedEvent[]) => Promise<void> })
+        .processEvents([retireDecoded]);
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('No user found for retirement wallet'),
+      );
+      expect(retirementRepo.find).not.toHaveBeenCalled();
+      expect(mockDataSource.createQueryBuilder).not.toHaveBeenCalled();
+      expect(mockNotificationsGateway.broadcast).toHaveBeenCalledWith(
+        'credit:retired',
+        expect.objectContaining({ from: 'GFROM...' }),
+      );
+    });
+
+    it('selects the oldest pending row and logs ambiguity when multiple rows match', async () => {
+      const warnSpy = jest.spyOn(service['logger'], 'warn').mockImplementation(() => {});
+      const qbMock = createRetirementQueryBuilder();
+      (mockDataSource.query as jest.Mock).mockResolvedValue([{ id: 'project-1' }]);
+      (userRepo.findOne as jest.Mock).mockResolvedValue({
+        id: 'user-1',
+        wallet: 'GFROM...',
+      });
+      (retirementRepo.find as jest.Mock).mockResolvedValue([
+        {
+          id: 'oldest-retirement',
+          txHash: 'tx-pending-old',
+          retiredAt: new Date('2026-08-23T00:00:00Z'),
+          createdAt: new Date('2026-08-22T00:00:00Z'),
+        },
+        {
+          id: 'newer-retirement',
+          txHash: 'tx-pending-new',
+          retiredAt: new Date('2026-08-24T00:00:00Z'),
+          createdAt: new Date('2026-08-23T00:00:00Z'),
+        },
+      ]);
+      (mockDataSource.createQueryBuilder as jest.Mock).mockReturnValue(qbMock);
+
+      await (service as unknown as { processEvents: (events: DecodedEvent[]) => Promise<void> })
+        .processEvents([retireDecoded]);
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Multiple pending retirements matched'),
+      );
+      expect(qbMock.where).toHaveBeenCalledWith('id = :id', {
+        id: 'oldest-retirement',
+      });
+      expect(qbMock.execute).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ── WebSocket broadcast ─────────────────────────────────────────────
   describe('WebSocket broadcasts', () => {
     /** Helper: bypasses scValToNative by directly injecting decoded events into processEvents. */
     type ProcessEvents = (events: DecodedEvent[]) => Promise<void>;
