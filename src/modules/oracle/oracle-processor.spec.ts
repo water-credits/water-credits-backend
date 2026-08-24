@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { Logger } from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { ConfigService } from '@nestjs/config';
 import { SorobanRpc } from '@stellar/stellar-sdk';
@@ -8,7 +9,7 @@ import { GovernanceConfig } from '../governance/entities/governance-config.entit
 import { StellarService } from '../stellar/stellar.service';
 import { CreditScoringService } from './credit-scoring.service';
 import { Project } from '../projects/entities/project.entity';
-import { ReadingBatch } from '../sensors/entities/reading-batch.entity';
+import { BatchStatus, ReadingBatch } from '../sensors/entities/reading-batch.entity';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -18,6 +19,7 @@ function makeSubmission(overrides: Partial<OracleSubmission> = {}): OracleSubmis
   return {
     id: 'sub-1',
     projectId: 'proj-1',
+    batchId: 'batch-linked',
     oracleAddress: 'GABC123',
     nonce: 1,
     txHash: '',
@@ -35,6 +37,7 @@ function makeSubmission(overrides: Partial<OracleSubmission> = {}): OracleSubmis
     createdAt: new Date(),
     updatedAt: new Date(),
     project: undefined as never,
+    batch: undefined as never,
     ...overrides,
   };
 }
@@ -170,6 +173,11 @@ describe('OracleProcessor', () => {
 
   let findOneMock: jest.Mock;
   let saveMock: jest.Mock;
+  let projectFindOneMock: jest.Mock;
+  let configFindOneMock: jest.Mock;
+  let batchFindOneMock: jest.Mock;
+  let batchSaveMock: jest.Mock;
+  let calculateMock: jest.Mock;
   let submitReadingMock: jest.Mock;
   let getOracleNonceMock: jest.Mock;
   let configGetMock: jest.Mock;
@@ -181,6 +189,11 @@ describe('OracleProcessor', () => {
       savedSnapshots.push({ ...s });
       return Promise.resolve({ ...s });
     });
+    projectFindOneMock = jest.fn().mockResolvedValue(null);
+    configFindOneMock = jest.fn().mockResolvedValue(null);
+    batchFindOneMock = jest.fn().mockResolvedValue(null);
+    batchSaveMock = jest.fn();
+    calculateMock = jest.fn();
     submitReadingMock = jest.fn();
     getOracleNonceMock = jest.fn().mockResolvedValue(0);
     configGetMock = jest.fn().mockReturnValue('CONTRACT_ORACLE_ID');
@@ -194,15 +207,15 @@ describe('OracleProcessor', () => {
         },
         {
           provide: getRepositoryToken(GovernanceConfig),
-          useValue: { findOne: jest.fn().mockResolvedValue(null) },
+          useValue: { findOne: configFindOneMock },
         },
         {
           provide: getRepositoryToken(Project),
-          useValue: { findOne: jest.fn().mockResolvedValue(null) },
+          useValue: { findOne: projectFindOneMock },
         },
         {
           provide: getRepositoryToken(ReadingBatch),
-          useValue: { findOne: jest.fn().mockResolvedValue(null), save: jest.fn() },
+          useValue: { findOne: batchFindOneMock, save: batchSaveMock },
         },
         {
           provide: StellarService,
@@ -212,7 +225,7 @@ describe('OracleProcessor', () => {
           },
         },
         { provide: ConfigService, useValue: { get: configGetMock } },
-        { provide: CreditScoringService, useValue: { calculate: jest.fn() } },
+        { provide: CreditScoringService, useValue: { calculate: calculateMock } },
       ],
     }).compile();
 
@@ -296,6 +309,65 @@ describe('OracleProcessor', () => {
       nonce: 1,
       ledger: 12345,
     });
+  });
+
+  it('updates exactly the batch linked by submission.batchId after confirmation', async () => {
+    const linkedBatch = {
+      id: 'batch-linked',
+      projectId: 'proj-1',
+      status: BatchStatus.SUBMITTED,
+      confirmedAt: null,
+      creditsGenerated: null,
+    } as ReadingBatch;
+
+    findOneMock.mockResolvedValue(makeSubmission({ batchId: 'batch-linked' }));
+    projectFindOneMock.mockResolvedValue({ id: 'proj-1', areaHectares: 10 });
+    configFindOneMock.mockResolvedValue({ id: 1 });
+    batchFindOneMock.mockResolvedValue(linkedBatch);
+    calculateMock.mockReturnValue({ toNumber: () => 42.5 });
+    submitReadingMock.mockResolvedValue({
+      txHash: 'real-tx-hash-abc',
+      response: SUCCESS_RESPONSE,
+    });
+
+    await processor.processSubmission(makeJob());
+
+    expect(batchFindOneMock).toHaveBeenCalledWith({
+      where: {
+        id: 'batch-linked',
+        projectId: 'proj-1',
+        status: BatchStatus.SUBMITTED,
+      },
+    });
+    expect(batchSaveMock).toHaveBeenCalledTimes(1);
+    expect(batchSaveMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'batch-linked',
+        status: BatchStatus.CONFIRMED,
+        creditsGenerated: 42.5,
+      }),
+    );
+  });
+
+  it('warns and does not throw when a confirmed legacy submission has no batchId', async () => {
+    const warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+
+    findOneMock.mockResolvedValue(makeSubmission({ batchId: null }));
+    projectFindOneMock.mockResolvedValue({ id: 'proj-1', areaHectares: 10 });
+    configFindOneMock.mockResolvedValue({ id: 1 });
+    calculateMock.mockReturnValue({ toNumber: () => 42.5 });
+    submitReadingMock.mockResolvedValue({
+      txHash: 'real-tx-hash-abc',
+      response: SUCCESS_RESPONSE,
+    });
+
+    await expect(processor.processSubmission(makeJob())).resolves.toBeUndefined();
+
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('has no batchId'));
+    expect(batchFindOneMock).not.toHaveBeenCalled();
+    expect(batchSaveMock).not.toHaveBeenCalled();
+
+    warnSpy.mockRestore();
   });
 
   // ── multi-parameter mapping ───────────────────────────────────────────────

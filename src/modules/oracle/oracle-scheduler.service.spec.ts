@@ -222,6 +222,7 @@ describe('OracleSchedulerService', () => {
       expect(triggerSubmission).toHaveBeenCalledWith({
         projectId: 'project-active',
         oracleAddress: ORACLE_ADDRESS,
+        batchId: 'batch-closed',
         readings: {
           oracleCount: 5,
           ph: 7.1,
@@ -299,6 +300,7 @@ describe('OracleSchedulerService', () => {
       expect(result.projectsScanned).toBe(1);
       expect(triggerSubmission).toHaveBeenCalledTimes(1);
       expect(triggerSubmission.mock.calls[0][0].projectId).toBe('project-active');
+      expect(triggerSubmission.mock.calls[0][0].batchId).toBe('batch-active');
     });
 
     it('submits older batches first', async () => {

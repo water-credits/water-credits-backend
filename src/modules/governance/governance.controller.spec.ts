@@ -1,9 +1,11 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { ForbiddenException } from '@nestjs/common';
 import { GovernanceController } from './governance.controller';
 import { GovernanceService } from './governance.service';
 import { CreateProposalDto } from './dto/create-proposal.dto';
 import { VoteDto } from './dto/vote.dto';
 import { GovernanceQueryDto } from './dto/governance-query.dto';
+import { UserRole } from '../users/entities/user.entity';
 
 describe('GovernanceController', () => {
   let controller: GovernanceController;
@@ -104,10 +106,46 @@ describe('GovernanceController', () => {
       };
       service.proposeConfigChange.mockResolvedValue(pendingChange as any);
 
-      const result = await controller.updateConfig(updates as any, 'GADMIN');
+      const result = await controller.updateConfig(updates as any, 'GADMIN', UserRole.ADMIN);
 
       expect(service.proposeConfigChange).toHaveBeenCalledWith('GADMIN', updates);
       expect(result).toEqual(pendingChange);
+    });
+
+    it('delegates force=true to emergencyConfigUpdate with caller role', async () => {
+      const updates = { quorum: 9 };
+      service.emergencyConfigUpdate.mockResolvedValue(mockConfig);
+
+      const result = await controller.updateConfig(
+        updates as any,
+        'GSUPERADMIN',
+        UserRole.SUPER_ADMIN,
+        'true',
+      );
+
+      expect(service.emergencyConfigUpdate).toHaveBeenCalledWith(
+        'GSUPERADMIN',
+        updates,
+        UserRole.SUPER_ADMIN,
+      );
+      expect(result).toEqual(mockConfig);
+    });
+
+    it('returns 403 for ADMIN when force=true', async () => {
+      const updates = { quorum: 9 };
+      service.emergencyConfigUpdate.mockRejectedValue(
+        new ForbiddenException('Emergency config updates require SUPER_ADMIN'),
+      );
+
+      await expect(
+        controller.updateConfig(updates as any, 'GADMIN', UserRole.ADMIN, 'true'),
+      ).rejects.toThrow(ForbiddenException);
+
+      expect(service.emergencyConfigUpdate).toHaveBeenCalledWith(
+        'GADMIN',
+        updates,
+        UserRole.ADMIN,
+      );
     });
   });
 

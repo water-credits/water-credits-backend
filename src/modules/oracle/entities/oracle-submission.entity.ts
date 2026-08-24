@@ -10,6 +10,7 @@ import {
   Unique,
 } from 'typeorm';
 import { Project } from '../../projects/entities/project.entity';
+import { ReadingBatch } from '../../sensors/entities/reading-batch.entity';
 
 export enum SubmissionStatus {
   PENDING = 'pending',
@@ -36,6 +37,14 @@ export class OracleSubmission {
   @ManyToOne(() => Project, { onDelete: 'CASCADE' })
   @JoinColumn({ name: 'project_id' })
   project: Project;
+
+  @Column({ name: 'batch_id', type: 'uuid', nullable: true })
+  @Index()
+  batchId: string | null;
+
+  @ManyToOne(() => ReadingBatch, { nullable: true, onDelete: 'SET NULL' })
+  @JoinColumn({ name: 'batch_id' })
+  batch: ReadingBatch | null;
 
   @Column({ name: 'oracle_address', type: 'varchar', length: 56 })
   oracleAddress: string;

@@ -1,5 +1,60 @@
 import { PaginatedList } from '../pagination';
 
+/**
+ * Machine-readable error codes exposed in the API error envelope.
+ *
+ * Codes are stable identifiers clients can branch on; never expose internal
+ * class names, driver errors, or SQL in this field.
+ */
+export enum ApiErrorCode {
+  BAD_REQUEST = 'BAD_REQUEST',
+  VALIDATION_ERROR = 'VALIDATION_ERROR',
+  UNAUTHORIZED = 'UNAUTHORIZED',
+  FORBIDDEN = 'FORBIDDEN',
+  NOT_FOUND = 'NOT_FOUND',
+  CONFLICT = 'CONFLICT',
+  TOO_MANY_REQUESTS = 'TOO_MANY_REQUESTS',
+  DATABASE_ERROR = 'DATABASE_ERROR',
+  INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR',
+}
+
+/** Payload carried under the `error` key of every failed response. */
+export interface ApiErrorPayload<TDetails = unknown> {
+  code: ApiErrorCode;
+  message: string;
+  requestId: string;
+  details?: TDetails;
+}
+
+/**
+ * Error half of the documented response envelope (see README → Response Envelope):
+ *
+ *   { success: false, error: { code, message, requestId, details? } }
+ */
+export class ApiErrorDto<TDetails = unknown> {
+  success: boolean;
+  error: ApiErrorPayload<TDetails>;
+
+  static of<TDetails = unknown>(params: {
+    code: ApiErrorCode;
+    message: string;
+    requestId: string;
+    details?: TDetails;
+  }): ApiErrorDto<TDetails> {
+    const error: ApiErrorPayload<TDetails> = {
+      code: params.code,
+      message: params.message,
+      requestId: params.requestId,
+    };
+
+    if (params.details !== undefined) {
+      error.details = params.details;
+    }
+
+    return { success: false, error };
+  }
+}
+
 export class ApiResponseDto<T = unknown> {
   success: boolean;
   data: T;
