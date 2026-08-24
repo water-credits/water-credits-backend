@@ -251,11 +251,12 @@ export class CreditsService {
     }
 
     try {
+      const tokenStats = await this.stellarService.batchGetTokenStats(tokenAddresses);
       let totalMinted = 0;
       let totalRetired = 0;
-      for (const tokenAddress of tokenAddresses) {
-        totalMinted += (await this.stellarService.getTotalSupply(tokenAddress)).toNumber();
-        totalRetired += (await this.stellarService.getTotalRetired(tokenAddress)).toNumber();
+      for (const { totalSupply, totalRetired: retired } of tokenStats.values()) {
+        totalMinted += totalSupply.toNumber();
+        totalRetired += retired.toNumber();
       }
       overview.onChainData = { totalMinted, totalRetired };
       overview.totalMinted = totalMinted;
@@ -308,17 +309,13 @@ export class CreditsService {
     }
 
     try {
-      const balance = project.owner?.wallet
-        ? (
-            await this.stellarService.getBalance(project.creditTokenAddress, project.owner.wallet)
-          ).toNumber()
-        : null;
-      const totalMinted = (
-        await this.stellarService.getTotalSupply(project.creditTokenAddress)
-      ).toNumber();
-      const totalRetired = (
-        await this.stellarService.getTotalRetired(project.creditTokenAddress)
-      ).toNumber();
+      const tokenDetails = await this.stellarService.getTokenCreditDetails(
+        project.creditTokenAddress,
+        project.owner?.wallet ?? null,
+      );
+      const balance = tokenDetails.balance?.toNumber() ?? null;
+      const totalMinted = tokenDetails.totalSupply.toNumber();
+      const totalRetired = tokenDetails.totalRetired.toNumber();
 
       detail.onChainData = { balance, totalMinted, totalRetired };
       detail.onChainBalance = balance;

@@ -24,6 +24,7 @@ import { GovernanceQueryDto } from './dto/governance-query.dto';
 import { UpdateGovernanceConfigDto } from './dto/update-governance-config.dto';
 import { PendingConfigChangeDto } from './dto/pending-config-change.dto';
 import { StellarService } from '../stellar/stellar.service';
+import { UserRole } from '../users/entities/user.entity';
 import { paginate, PaginatedList } from '../../common/pagination';
 
 // PostgreSQL unique-violation error code
@@ -180,12 +181,17 @@ export class GovernanceService {
   // ── Emergency override ────────────────────────────────────────────────────
   //
   // Bypasses the timelock entirely and writes directly to governance_config.
-  // Gated behind SUPER_ADMIN role (enforced in the controller).
+  // Gated behind SUPER_ADMIN role (enforced here at the service boundary).
 
   async emergencyConfigUpdate(
     actor: string,
     dto: UpdateGovernanceConfigDto,
+    callerRole: UserRole,
   ): Promise<GovernanceConfig> {
+    if (callerRole !== UserRole.SUPER_ADMIN) {
+      throw new ForbiddenException('Emergency config updates require SUPER_ADMIN');
+    }
+
     const { reason, ...rawValues } = dto;
 
     const updates = Object.fromEntries(
@@ -220,6 +226,7 @@ export class GovernanceService {
       changeId: savedChange.id,
       appliedValues: updates,
       reason: reason ?? null,
+      callerRole,
     });
 
     this.logger.warn(`Emergency config update by ${actor}: ${JSON.stringify(updates)}`);

@@ -5,6 +5,7 @@ import { IndexerCursor } from './entities/indexer-cursor.entity';
 import { OracleSubmission } from '../oracle/entities/oracle-submission.entity';
 import { ReadingBatch } from '../sensors/entities/reading-batch.entity';
 import { Retirement } from '../credits/entities/retirement.entity';
+import { User } from '../users/entities/user.entity';
 import { Proposal } from '../governance/entities/proposal.entity';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { SensorsModule } from '../sensors/sensors.module';
@@ -26,6 +27,7 @@ import { SensorsModule } from '../sensors/sensors.module';
       OracleSubmission,
       ReadingBatch,
       Retirement,
+      User,
       Proposal,
     ]),
     NotificationsModule,

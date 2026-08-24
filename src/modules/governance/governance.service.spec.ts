@@ -17,6 +17,7 @@ import {
   ConfigChangeStatus,
 } from './entities/governance-config-change.entity';
 import { StellarService } from '../stellar/stellar.service';
+import { UserRole } from '../users/entities/user.entity';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -981,7 +982,11 @@ describe('GovernanceService', () => {
     });
 
     it('applies the update directly to the live config row and records an EMERGENCY change', async () => {
-      const result = await service.emergencyConfigUpdate('GSUPERADMIN', { quorum: 9 } as never);
+      const result = await service.emergencyConfigUpdate(
+        'GSUPERADMIN',
+        { quorum: 9 } as never,
+        UserRole.SUPER_ADMIN,
+      );
 
       expect(result.id).toBe(1);
       expect(result.quorum).toBe(9);
@@ -991,9 +996,9 @@ describe('GovernanceService', () => {
     });
 
     it('throws BadRequestException when no config fields are provided', async () => {
-      await expect(service.emergencyConfigUpdate('GSUPERADMIN', {} as never)).rejects.toThrow(
-        BadRequestException,
-      );
+      await expect(
+        service.emergencyConfigUpdate('GSUPERADMIN', {} as never, UserRole.SUPER_ADMIN),
+      ).rejects.toThrow(BadRequestException);
       expect(configRepo.save).not.toHaveBeenCalled();
     });
 
@@ -1003,8 +1008,12 @@ describe('GovernanceService', () => {
       // row; the assertion below is the crux of the fix: save() must never
       // be asked to persist any row other than id = 1.
       const [first, second] = await Promise.all([
-        service.emergencyConfigUpdate('GADMIN_A', { quorum: 5 } as never),
-        service.emergencyConfigUpdate('GADMIN_B', { protocolFeeBps: 250 } as never),
+        service.emergencyConfigUpdate('GADMIN_A', { quorum: 5 } as never, UserRole.SUPER_ADMIN),
+        service.emergencyConfigUpdate(
+          'GADMIN_B',
+          { protocolFeeBps: 250 } as never,
+          UserRole.SUPER_ADMIN,
+        ),
       ]);
 
       expect(first.id).toBe(1);
@@ -1018,6 +1027,87 @@ describe('GovernanceService', () => {
       // Neither concurrent call ever attempted the cold-start INSERT path —
       // getConfig() found the singleton row on its first read both times.
       expect(configRepo.createQueryBuilder).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('emergencyConfigUpdate — SUPER_ADMIN role enforcement', () => {
+    let proposalRepo: jest.Mocked<Record<string, jest.Mock>>;
+    let voteRepo: jest.Mocked<Record<string, jest.Mock>>;
+    let configRepo: jest.Mocked<Record<string, jest.Mock>>;
+    let configChangeRepo: jest.Mocked<Record<string, jest.Mock>>;
+    let dataSource: { createQueryRunner: jest.Mock; query: jest.Mock };
+    let stellarService: { execute: jest.Mock };
+    let configService: { get: jest.Mock };
+    let service: GovernanceService;
+
+    beforeEach(async () => {
+      proposalRepo = {
+        find: jest.fn(),
+        findOne: jest.fn(),
+        create: jest.fn(),
+        save: jest.fn(),
+        createQueryBuilder: jest.fn(),
+      } as never;
+      voteRepo = { findOne: jest.fn(), create: jest.fn(), save: jest.fn() } as never;
+      configRepo = {
+        findOne: jest.fn().mockResolvedValue(makeConfig({ id: 1 })),
+        create: jest.fn(),
+        save: jest.fn().mockImplementation(async (entity: GovernanceConfig) => entity),
+        createQueryBuilder: jest.fn().mockReturnValue(makeInsertQb()),
+      } as never;
+      configChangeRepo = {
+        find: jest.fn().mockResolvedValue([]),
+        findOne: jest.fn().mockResolvedValue(null),
+        create: jest.fn().mockImplementation((data: unknown) => data),
+        save: jest.fn().mockImplementation(async (data: unknown) => ({
+          id: 'change-uuid',
+          ...(data as object),
+        })),
+      } as never;
+      dataSource = { createQueryRunner: jest.fn(), query: jest.fn().mockResolvedValue(undefined) };
+      stellarService = { execute: jest.fn() };
+      configService = { get: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          GovernanceService,
+          { provide: getRepositoryToken(Proposal), useValue: proposalRepo },
+          { provide: getRepositoryToken(ProposalVote), useValue: voteRepo },
+          { provide: getRepositoryToken(GovernanceConfig), useValue: configRepo },
+          { provide: getRepositoryToken(GovernanceConfigChange), useValue: configChangeRepo },
+          { provide: ConfigService, useValue: configService },
+          { provide: DataSource, useValue: dataSource },
+          { provide: StellarService, useValue: stellarService },
+        ],
+      }).compile();
+
+      service = module.get<GovernanceService>(GovernanceService);
+    });
+
+    it('throws ForbiddenException when callerRole is ADMIN', async () => {
+      await expect(
+        service.emergencyConfigUpdate('GADMIN', { quorum: 9 } as never, UserRole.ADMIN),
+      ).rejects.toThrow(ForbiddenException);
+
+      expect(configRepo.save).not.toHaveBeenCalled();
+      expect(dataSource.query).not.toHaveBeenCalled();
+    });
+
+    it('succeeds for SUPER_ADMIN and records callerRole in the audit event', async () => {
+      await service.emergencyConfigUpdate(
+        'GSUPERADMIN',
+        { quorum: 9 } as never,
+        UserRole.SUPER_ADMIN,
+      );
+
+      expect(dataSource.query).toHaveBeenCalledWith(
+        expect.stringContaining('INSERT INTO governance_events'),
+        expect.arrayContaining([
+          'config_emergency_updated',
+          'GSUPERADMIN',
+          expect.stringContaining('"callerRole":"super_admin"'),
+        ]),
+      );
     });
   });
 

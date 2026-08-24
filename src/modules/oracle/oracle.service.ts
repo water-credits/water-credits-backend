@@ -146,6 +146,7 @@ export class OracleService {
 
       const submission = queryRunner.manager.create(OracleSubmission, {
         projectId: dto.projectId,
+        batchId: dto.batchId ?? null,
         oracleAddress: dto.oracleAddress,
         nonce,
         txHash: '',
@@ -167,6 +168,7 @@ export class OracleService {
       {
         submissionId: saved.id,
         projectId: dto.projectId,
+        batchId: saved.batchId,
         oracleAddress: dto.oracleAddress,
         nonce: saved.nonce,
       },
@@ -335,6 +337,33 @@ export class OracleService {
     return result.map((r) => r.oracleAddress).filter(Boolean);
   }
 
+  private async findSubmittedBatchForSubmission(
+    submission: OracleSubmission,
+  ): Promise<ReadingBatch | null> {
+    if (!submission.batchId) {
+      this.logger.warn(
+        `Oracle submission ${submission.id} has no batchId; skipping reconciliation batch credit update`,
+      );
+      return null;
+    }
+
+    const batch = await this.batchRepo.findOne({
+      where: {
+        id: submission.batchId,
+        projectId: submission.projectId,
+        status: BatchStatus.SUBMITTED,
+      },
+    });
+
+    if (!batch) {
+      this.logger.warn(
+        `Batch ${submission.batchId} for oracle submission ${submission.id} was not found in SUBMITTED status during reconciliation`,
+      );
+    }
+
+    return batch;
+  }
+
   async reconcile(oracleContractId: string, oracleAddress: string): Promise<void> {
     let onChainNonce: number;
     try {
@@ -369,6 +398,7 @@ export class OracleService {
           {
             submissionId: sub.id,
             projectId: sub.projectId,
+            batchId: sub.batchId,
             oracleAddress: sub.oracleAddress,
             nonce: sub.nonce,
           },
@@ -421,13 +451,7 @@ export class OracleService {
               Number(project.areaHectares),
             );
 
-            const batch = await this.batchRepo.findOne({
-              where: {
-                projectId: sub.projectId,
-                status: In([BatchStatus.PENDING, BatchStatus.SUBMITTED]),
-              },
-              order: { createdAt: 'DESC' },
-            });
+            const batch = await this.findSubmittedBatchForSubmission(sub);
 
             if (batch) {
               batch.status = BatchStatus.CONFIRMED;
