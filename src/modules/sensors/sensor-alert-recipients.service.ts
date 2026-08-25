@@ -12,6 +12,12 @@ const ALERT_ESCALATION_ROLES: UserRole[] = [UserRole.ADMIN, UserRole.VERIFIER];
  * privileged-role set `SensorProjectAccessService` already grants
  * project-wide WS read access to).
  */
+export interface AlertRecipient {
+  userId: string;
+  isOwner: boolean;
+  email?: string;
+}
+
 @Injectable()
 export class SensorAlertRecipientsService {
   private readonly logger = new Logger(SensorAlertRecipientsService.name);
@@ -21,7 +27,7 @@ export class SensorAlertRecipientsService {
     private readonly usersService: UsersService,
   ) {}
 
-  async resolveRecipients(projectId: string): Promise<string[]> {
+  async resolveRecipients(projectId: string): Promise<AlertRecipient[]> {
     const [project, escalationUsers] = await Promise.all([
       this.projectsService.findById(projectId).catch((err) => {
         this.logger.warn(
@@ -32,10 +38,17 @@ export class SensorAlertRecipientsService {
       this.usersService.findByRoles(ALERT_ESCALATION_ROLES),
     ]);
 
-    const ids = new Set<string>(escalationUsers.map((u) => u.id));
-    if (project?.ownerId) {
-      ids.add(project.ownerId);
+    const recipients = new Map<string, AlertRecipient>();
+
+    for (const u of escalationUsers) {
+      recipients.set(u.id, { userId: u.id, email: u.email ?? undefined, isOwner: false });
     }
-    return Array.from(ids);
+
+    if (project?.ownerId) {
+      const owner = await this.usersService.findById(project.ownerId).catch(() => null);
+      recipients.set(project.ownerId, { userId: project.ownerId, email: owner?.email ?? undefined, isOwner: true });
+    }
+
+    return Array.from(recipients.values());
   }
 }

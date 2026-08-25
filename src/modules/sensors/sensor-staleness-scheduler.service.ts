@@ -141,10 +141,10 @@ export class SensorStalenessSchedulerService {
     this.gateway.emitAlert(device.projectId, alert);
 
     try {
-      const userIds = await this.recipients.resolveRecipients(device.projectId);
+      const recipients = await this.recipients.resolveRecipients(device.projectId);
       await Promise.all(
-        userIds.map((userId) =>
-          this.notifications.notifySensorAlert(userId, device.projectId, alert),
+        recipients.map((r) =>
+          this.notifications.notifySensorAlert(r.userId, device.projectId, alert, r.isOwner ? r.email : undefined),
         ),
       );
     } catch (err) {

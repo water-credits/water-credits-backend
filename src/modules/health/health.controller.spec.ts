@@ -10,6 +10,7 @@ import { HealthService, HealthReport } from './health.service';
 import { StellarClient } from '../stellar/stellar.client';
 import { OracleService } from '../oracle/oracle.service';
 import { OracleSchedulerService } from '../oracle/oracle-scheduler.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { OracleSubmission } from '../oracle/entities/oracle-submission.entity';
 import {
   GLOBAL_SCHEDULE_SCOPE,
@@ -147,6 +148,7 @@ describe('GET /health (oracle freshness + scheduler-added jobs)', () => {
         HealthService,
         OracleService,
         OracleSchedulerService,
+        { provide: NotificationsService, useValue: { notifyOracleMissedSubmissions: jest.fn() } },
         { provide: DataSource, useValue: dataSource },
         { provide: getDataSourceToken(), useValue: dataSource },
         { provide: getQueueToken('oracle-submit'), useValue: queue },

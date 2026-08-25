@@ -82,7 +82,7 @@ describe('SensorsIngestionProcessor', () => {
     configRepo = { findOne: jest.fn() };
     gateway = { emitReading: jest.fn(), emitAlert: jest.fn() };
     debounce = { shouldSuppress: jest.fn().mockResolvedValue(false) };
-    recipients = { resolveRecipients: jest.fn().mockResolvedValue(['owner-1', 'verifier-1']) };
+    recipients = { resolveRecipients: jest.fn().mockResolvedValue([{ userId: 'owner-1', isOwner: true, email: 'owner@example.com' }, { userId: 'verifier-1', isOwner: false }]) };
     notifications = { notifySensorAlert: jest.fn().mockResolvedValue(undefined) };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -308,11 +308,13 @@ describe('SensorsIngestionProcessor', () => {
         'owner-1',
         'proj-1',
         expect.objectContaining({ parameter: 'ph', direction: 'below' }),
+        'owner@example.com'
       );
       expect(notifications.notifySensorAlert).toHaveBeenCalledWith(
         'verifier-1',
         'proj-1',
         expect.objectContaining({ parameter: 'ph', direction: 'below' }),
+        undefined
       );
     });
 
@@ -347,6 +349,7 @@ describe('SensorsIngestionProcessor', () => {
         expect.any(String),
         'proj-1',
         expect.objectContaining({ parameter: 'dissolvedOxygen' }),
+        expect.anything()
       );
     });
 

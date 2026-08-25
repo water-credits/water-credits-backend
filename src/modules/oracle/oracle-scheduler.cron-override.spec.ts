@@ -7,6 +7,7 @@ import { OracleService } from './oracle.service';
 import { OracleScheduleState } from './entities/oracle-schedule-state.entity';
 import { Project } from '../projects/entities/project.entity';
 import { ReadingBatch } from '../sensors/entities/reading-batch.entity';
+import { NotificationsService } from '../notifications/notifications.service';
 
 /**
  * Acceptance: ORACLE_SUBMISSION_INTERVAL_CRON overrides the schedule expression.
@@ -43,6 +44,7 @@ describe('ORACLE_SUBMISSION_INTERVAL_CRON override', () => {
       imports: [ScheduleModule.forRoot()],
       providers: [
         OracleSchedulerService,
+        { provide: NotificationsService, useValue: { notifyOracleMissedSubmissions: jest.fn() } },
         {
           provide: OracleService,
           useValue: { aggregateReadingsForBatch: jest.fn(), triggerSubmission: jest.fn() },

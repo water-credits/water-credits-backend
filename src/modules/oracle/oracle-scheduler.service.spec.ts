@@ -6,6 +6,7 @@ import { getRepositoryToken } from '@nestjs/typeorm';
 import { getQueueToken } from '@nestjs/bull';
 import { DataSource, FindOperator } from 'typeorm';
 import { ORACLE_SUBMISSION_CRON_NAME, OracleSchedulerService } from './oracle-scheduler.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { OracleService, AggregatedReading } from './oracle.service';
 import { OracleSubmission } from './entities/oracle-submission.entity';
 import {
@@ -169,6 +170,7 @@ async function buildHarness(options: HarnessOptions = {}): Promise<Harness> {
   const module = await Test.createTestingModule({
     providers: [
       OracleSchedulerService,
+      { provide: NotificationsService, useValue: { notifyOracleMissedSubmissions: jest.fn() } },
       { provide: OracleService, useValue: oracleService },
       {
         provide: ConfigService,
@@ -677,6 +679,7 @@ describe('OracleSchedulerService + manual POST /oracle/trigger (advisory lock)',
       providers: [
         OracleService,
         OracleSchedulerService,
+        { provide: NotificationsService, useValue: { notifyOracleMissedSubmissions: jest.fn() } },
         { provide: getRepositoryToken(OracleSubmission), useValue: { find: jest.fn() } },
         {
           provide: getRepositoryToken(SensorReading),

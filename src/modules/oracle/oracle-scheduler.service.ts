@@ -10,6 +10,7 @@ import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { LessThan, MoreThan, Repository } from 'typeorm';
 import { OracleService } from './oracle.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import {
   GLOBAL_SCHEDULE_SCOPE,
   OracleScheduleState,
@@ -105,6 +106,8 @@ export class OracleSchedulerService implements OnModuleInit, OnApplicationShutdo
   /** Set on shutdown so an in-flight cycle stops between units of work. */
   private shuttingDown = false;
 
+  private consecutiveMisses = 0;
+
   constructor(
     private readonly oracleService: OracleService,
     private readonly configService: ConfigService,
@@ -115,6 +118,7 @@ export class OracleSchedulerService implements OnModuleInit, OnApplicationShutdo
     private readonly batchRepo: Repository<ReadingBatch>,
     @InjectRepository(OracleScheduleState)
     private readonly scheduleStateRepo: Repository<OracleScheduleState>,
+    private readonly notifications: NotificationsService,
   ) {}
 
   onModuleInit(): void {
@@ -218,6 +222,16 @@ export class OracleSchedulerService implements OnModuleInit, OnApplicationShutdo
       }
 
       await this.recordScheduleState(GLOBAL_SCHEDULE_SCOPE, startedAt, submitted);
+
+      if (submitted === 0 && failed > 0) {
+        this.consecutiveMisses++;
+        const threshold = this.configService.get<number>('oracle.missedSubmissionsThreshold', 3);
+        if (this.consecutiveMisses >= threshold) {
+          await this.notifications.notifyOracleMissedSubmissions(this.consecutiveMisses);
+        }
+      } else if (submitted > 0) {
+        this.consecutiveMisses = 0;
+      }
 
       this.logger.log(
         `Oracle submission cycle finished: ${projects.length} active project(s), ` +
