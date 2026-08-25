@@ -20,7 +20,7 @@ import { ApiKeyGuard } from '../../common/guards/api-key.guard';
 import { SensorReading } from './entities/sensor-reading.entity';
 import { SensorDevice } from './entities/sensor-device.entity';
 import { PaginatedResponseDto } from '../../common/dto/api-response.dto';
-import { ThrottleSensor } from '../../common/decorators/throttle.decorator';
+import { ThrottleSensor, ThrottleKeyRotation } from '../../common/decorators/throttle.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 
 @ApiTags('sensors')
@@ -108,5 +108,17 @@ export class SensorsController {
     @CurrentUser('role') role?: string,
   ): Promise<SensorDevice> {
     return this.sensorsService.getDeviceById(id, userId, role);
+  }
+
+  @Post('devices/:id/rotate-key')
+  @HttpCode(HttpStatus.OK)
+  @ThrottleKeyRotation()
+  @ApiOperation({ summary: 'Rotate a sensor device API key' })
+  async rotateDeviceApiKey(
+    @Param('id') id: string,
+    @CurrentUser('id') userId: string,
+    @CurrentUser('role') role?: string,
+  ): Promise<{ apiKeyPlaintext: string }> {
+    return this.sensorsService.rotateDeviceApiKey(id, userId, role);
   }
 }

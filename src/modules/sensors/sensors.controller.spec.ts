@@ -222,6 +222,7 @@ describe('SensorsController – ingestReading wiring', () => {
             registerDevice: jest.fn(),
             getDevices: jest.fn(),
             getDeviceById: jest.fn(),
+            rotateDeviceApiKey: jest.fn(),
           },
         },
         {
@@ -299,5 +300,17 @@ describe('SensorsController – ingestReading wiring', () => {
 
     expect(registerDevice).toHaveBeenCalledWith('proj-1', dto, 'user-a', 'farmer');
     expect(result).toBe(deviceResult);
+  });
+
+  it('delegates to sensorsService.rotateDeviceApiKey with correct params', async () => {
+    const rotateDeviceApiKey = (
+      controller as unknown as { sensorsService: { rotateDeviceApiKey: jest.Mock } }
+    ).sensorsService.rotateDeviceApiKey;
+    rotateDeviceApiKey.mockResolvedValue({ apiKeyPlaintext: 'wc_dev-001_newsecret' });
+
+    const result = await controller.rotateDeviceApiKey('device-uuid-1', 'user-a', 'farmer');
+
+    expect(rotateDeviceApiKey).toHaveBeenCalledWith('device-uuid-1', 'user-a', 'farmer');
+    expect(result).toEqual({ apiKeyPlaintext: 'wc_dev-001_newsecret' });
   });
 });

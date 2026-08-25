@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { BadRequestException, NotFoundException, ForbiddenException } from '@nestjs/common';
+import { BadRequestException, NotFoundException, ForbiddenException, ConflictException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { getQueueToken } from '@nestjs/bull';
@@ -1357,5 +1357,139 @@ describe('SensorsService — validateParameters unknown key', () => {
     } as CreateReadingDto);
 
     expect(result).toBeDefined();
+  });
+});
+
+describe('SensorsService — rotateDeviceApiKey', () => {
+  let service: SensorsService;
+  let deviceRepo: MockRepo;
+  let readingRepo: MockRepo;
+  let batchRepo: MockRepo;
+
+  beforeEach(async () => {
+    deviceRepo = makeMockRepo();
+    readingRepo = makeMockRepo();
+    batchRepo = makeMockRepo();
+
+    const mockProjectsService = {
+      findById: jest.fn().mockResolvedValue({ id: 'proj-1', ownerId: 'owner-1' }),
+    };
+    const projectAccessService = new SensorProjectAccessService(
+      mockProjectsService as unknown as import('../projects/projects.service').ProjectsService,
+    );
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        SensorsService,
+        { provide: getRepositoryToken(SensorDevice), useValue: deviceRepo },
+        { provide: getRepositoryToken(SensorReading), useValue: readingRepo },
+        { provide: getRepositoryToken(ReadingBatch), useValue: batchRepo },
+        { provide: getQueueToken('sensor-ingestion'), useValue: { add: jest.fn() } },
+        { provide: DataSource, useValue: makeMockDataSource() },
+        {
+          provide: SensorProjectAccessService,
+          useValue: projectAccessService,
+        },
+        {
+          provide: ConfigService,
+          useValue: {
+            get: jest.fn(),
+          },
+        },
+      ],
+    }).compile();
+
+    service = module.get<SensorsService>(SensorsService);
+  });
+
+  it('returns a new apiKeyPlaintext on successful rotation', async () => {
+    const device = {
+      id: 'device-uuid-1',
+      deviceId: 'dev-001',
+      projectId: 'proj-1',
+      apiKeyHash: 'old-hash',
+    } as SensorDevice;
+    deviceRepo.findOne.mockResolvedValue(device);
+    deviceRepo.update.mockResolvedValue(undefined);
+
+    const result = await service.rotateDeviceApiKey('device-uuid-1', 'owner-1', 'farmer');
+
+    expect(result.apiKeyPlaintext).toBeDefined();
+    expect(result.apiKeyPlaintext).toMatch(/^wc_dev-001_/);
+    expect(deviceRepo.update).toHaveBeenCalledWith('device-uuid-1', {
+      apiKeyHash: expect.any(String),
+    });
+  });
+
+  it('throws NotFoundException when device does not exist', async () => {
+    deviceRepo.findOne.mockResolvedValue(null);
+
+    await expect(
+      service.rotateDeviceApiKey('nonexistent', 'owner-1', 'farmer'),
+    ).rejects.toThrow(NotFoundException);
+  });
+
+  it('throws ForbiddenException when caller does not own the project', async () => {
+    const device = {
+      id: 'device-uuid-1',
+      deviceId: 'dev-001',
+      projectId: 'proj-1',
+      apiKeyHash: 'old-hash',
+    } as SensorDevice;
+    deviceRepo.findOne.mockResolvedValue(device);
+
+    await expect(
+      service.rotateDeviceApiKey('device-uuid-1', 'user-b', 'farmer'),
+    ).rejects.toThrow(ForbiddenException);
+  });
+
+  it('allows rotation when caller has a privileged role (admin)', async () => {
+    const device = {
+      id: 'device-uuid-1',
+      deviceId: 'dev-001',
+      projectId: 'proj-1',
+      apiKeyHash: 'old-hash',
+    } as SensorDevice;
+    deviceRepo.findOne.mockResolvedValue(device);
+    deviceRepo.update.mockResolvedValue(undefined);
+
+    const result = await service.rotateDeviceApiKey('device-uuid-1', 'other-user', 'admin');
+
+    expect(result.apiKeyPlaintext).toBeDefined();
+  });
+
+  it('replaces the old apiKeyHash with a new one', async () => {
+    const device = {
+      id: 'device-uuid-1',
+      deviceId: 'dev-001',
+      projectId: 'proj-1',
+      apiKeyHash: 'old-hash',
+    } as SensorDevice;
+    deviceRepo.findOne.mockResolvedValue(device);
+    deviceRepo.update.mockResolvedValue(undefined);
+
+    await service.rotateDeviceApiKey('device-uuid-1', 'owner-1', 'farmer');
+
+    const updateCall = deviceRepo.update.mock.calls[0];
+    const newHash = updateCall[1].apiKeyHash;
+    expect(newHash).not.toBe('old-hash');
+    expect(newHash).toBeDefined();
+  });
+
+  it('rate-limits rotation to once per 5 minutes per device', async () => {
+    const device = {
+      id: 'device-uuid-1',
+      deviceId: 'dev-001',
+      projectId: 'proj-1',
+      apiKeyHash: 'old-hash',
+    } as SensorDevice;
+    deviceRepo.findOne.mockResolvedValue(device);
+    deviceRepo.update.mockResolvedValue(undefined);
+
+    await service.rotateDeviceApiKey('device-uuid-1', 'owner-1', 'farmer');
+
+    await expect(
+      service.rotateDeviceApiKey('device-uuid-1', 'owner-1', 'farmer'),
+    ).rejects.toThrow(ConflictException);
   });
 });
