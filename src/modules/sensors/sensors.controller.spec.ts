@@ -280,6 +280,53 @@ describe('SensorsController – ingestReading wiring', () => {
     expect(getReadings).toHaveBeenCalledWith(query, 'user-a', 'farmer');
   });
 
+  it('wraps getDevices in the paginated envelope', async () => {
+    const query = { projectId: 'proj-1', page: 1, limit: 20 } as never;
+    const devices = [makeDevice()];
+    const getDevices = (controller as unknown as { sensorsService: { getDevices: jest.Mock } })
+      .sensorsService.getDevices;
+    getDevices.mockResolvedValue({ data: devices, total: 1, page: 1, limit: 20 });
+
+    const result = await controller.getDevices(query, 'user-a', 'farmer');
+
+    expect(getDevices).toHaveBeenCalledWith('proj-1', 'user-a', 'farmer', query);
+    expect(result).toEqual({
+      success: true,
+      data: devices,
+      meta: { mode: 'offset', total: 1, page: 1, limit: 20, totalPages: 1 },
+      timestamp: expect.any(String),
+    });
+  });
+
+  it('wraps getDevices cursor pages in the cursor meta envelope', async () => {
+    const query = { cursor: 'opaque-cursor', limit: 20 } as never;
+    const devices = [makeDevice()];
+    const getDevices = (controller as unknown as { sensorsService: { getDevices: jest.Mock } })
+      .sensorsService.getDevices;
+    getDevices.mockResolvedValue({
+      data: devices,
+      limit: 20,
+      nextCursor: 'next-opaque',
+      hasMore: true,
+    });
+
+    const result = await controller.getDevices(query, 'admin-1', 'admin');
+
+    expect(getDevices).toHaveBeenCalledWith(undefined, 'admin-1', 'admin', query);
+    expect(result).toEqual({
+      success: true,
+      data: devices,
+      meta: {
+        mode: 'cursor',
+        limit: 20,
+        count: 1,
+        nextCursor: 'next-opaque',
+        hasMore: true,
+      },
+      timestamp: expect.any(String),
+    });
+  });
+
   it('passes userId and role to registerDevice for project ownership check', async () => {
     const registerDevice = (
       controller as unknown as { sensorsService: { registerDevice: jest.Mock } }

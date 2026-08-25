@@ -13,6 +13,7 @@ import { ApiTags, ApiOperation, ApiBearerAuth, ApiSecurity } from '@nestjs/swagg
 import { SensorsService } from './sensors.service';
 import { CreateReadingDto } from './dto/create-reading.dto';
 import { QueryReadingsDto } from './dto/query-readings.dto';
+import { QueryDevicesDto } from './dto/query-devices.dto';
 import { RegisterDeviceDto } from './dto/register-device.dto';
 import { Public } from '../../common/decorators/public.decorator';
 import { ApiKeyAuth as ApiKeyAuthMetadata } from '../../common/decorators/api-key-auth.decorator';
@@ -91,13 +92,14 @@ export class SensorsController {
   }
 
   @Get('devices')
-  @ApiOperation({ summary: 'List sensor devices (optionally per project)' })
+  @ApiOperation({ summary: 'List sensor devices (paginated, optionally per project)' })
   async getDevices(
-    @Query('projectId') projectId: string | undefined,
+    @Query() query: QueryDevicesDto,
     @CurrentUser('id') userId: string,
     @CurrentUser('role') role?: string,
-  ): Promise<SensorDevice[]> {
-    return this.sensorsService.getDevices(projectId, userId, role);
+  ): Promise<PaginatedResponseDto<SensorDevice>> {
+    const result = await this.sensorsService.getDevices(query.projectId, userId, role, query);
+    return PaginatedResponseDto.fromList(result);
   }
 
   @Get('devices/:id')

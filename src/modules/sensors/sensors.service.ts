@@ -13,7 +13,7 @@ import { QueryReadingsDto } from './dto/query-readings.dto';
 import { RegisterDeviceDto } from './dto/register-device.dto';
 import { generateDeviceApiKey } from '../../common/utils/api-key.util';
 import { SensorProjectAccessService } from './sensor-project-access.service';
-import { paginate, PaginatedList } from '../../common/pagination';
+import { paginate, PaginatedList, PaginationParams } from '../../common/pagination';
 
 interface ParameterRange {
   min: number;
@@ -111,13 +111,27 @@ export class SensorsService {
     projectId: string | undefined,
     userId: string,
     role: string | undefined,
-  ): Promise<SensorDevice[]> {
+    pagination: PaginationParams = {},
+  ): Promise<PaginatedList<SensorDevice>> {
     if (projectId) {
       await this.projectAccess.assertProjectAccess(userId, role, projectId);
-      return this.deviceRepo.find({ where: { projectId } });
+    } else {
+      this.projectAccess.requirePrivilegedRole(role);
     }
-    this.projectAccess.requirePrivilegedRole(role);
-    return this.deviceRepo.find({ order: { createdAt: 'DESC' } });
+
+    const qb = this.deviceRepo.createQueryBuilder('device');
+    if (projectId) {
+      qb.andWhere('device.project_id = :projectId', { projectId });
+    }
+
+    // Newest-first by createdAt (with id tiebreaker) so both the per-project
+    // and admin-all paths share the same keyset order already supported by
+    // paginate().
+    return paginate(
+      qb,
+      { alias: 'device', sortColumn: 'device.created_at', sortProperty: 'createdAt' },
+      pagination,
+    );
   }
 
   async getDeviceById(
