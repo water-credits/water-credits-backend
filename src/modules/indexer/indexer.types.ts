@@ -102,6 +102,19 @@ export interface GovernanceProposalExecutedEvent {
   id: string;
 }
 
+export interface GovernanceVoteCastEvent {
+  kind: 'governance:vote_cast';
+  contractId: string;
+  ledger: number;
+  /** On-chain u32 proposal identifier. */
+  onChainProposalId: number;
+  /** Wallet that cast the vote. */
+  voterWallet: string;
+  /** true = vote for, false = vote against. */
+  support: boolean;
+  id: string;
+}
+
 // ── Union type ─────────────────────────────────────────────────────────────
 
 export type IndexedEvent =
@@ -109,7 +122,8 @@ export type IndexedEvent =
   | CreditRetireEvent
   | CreditTransferEvent
   | OracleReadingSubmittedEvent
-  | GovernanceProposalExecutedEvent;
+  | GovernanceProposalExecutedEvent
+  | GovernanceVoteCastEvent;
 
 // ── Decoder ───────────────────────────────────────────────────────────────
 
@@ -233,6 +247,26 @@ export function decodeEvent(raw: DecodedEvent): IndexedEvent | null {
         };
       }
 
+      case 'vote_cast': {
+        // topics: ['vote_cast', <on_chain_proposal_id u32>, <voter_address>]
+        // value:  { support: bool }
+        const onChainProposalId = asNumber(keyTopics[0]);
+        const voterWallet = asString(keyTopics[1]);
+        const payload = asMap(raw.value);
+        if (onChainProposalId === null || !voterWallet || !payload) return null;
+        const support = asBoolean(payload['support']);
+        if (support === null) return null;
+        return {
+          kind: 'governance:vote_cast',
+          contractId: raw.contractId,
+          ledger: raw.ledger,
+          onChainProposalId,
+          voterWallet,
+          support,
+          id: raw.id,
+        };
+      }
+
       default:
         return null;
     }
@@ -266,6 +300,11 @@ function asBigInt(v: unknown): bigint | null {
   if (typeof v === 'string') {
     try { return BigInt(v); } catch { return null; }
   }
+  return null;
+}
+
+function asBoolean(v: unknown): boolean | null {
+  if (typeof v === 'boolean') return v;
   return null;
 }
 

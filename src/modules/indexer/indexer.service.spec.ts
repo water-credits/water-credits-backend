@@ -42,7 +42,11 @@ describe('IndexerService', () => {
   let userRepo: MockRepo;
   let proposalRepo: MockRepo;
   let mockServer: { getLatestLedger: jest.Mock; getEvents: jest.Mock };
-  let mockDataSource: { query: jest.Mock; createQueryBuilder: jest.Mock };
+  let mockDataSource: {
+    query: jest.Mock;
+    createQueryBuilder: jest.Mock;
+    transaction: jest.Mock;
+  };
   let mockNotificationsGateway: { broadcast: jest.Mock };
   let mockSensorsGateway: { emitReading: jest.Mock };
 
@@ -70,6 +74,9 @@ describe('IndexerService', () => {
         andWhere: jest.fn().mockReturnThis(),
         execute: jest.fn().mockResolvedValue({ affected: 0 }),
       }),
+      transaction: jest.fn(async (cb: (manager: { query: jest.Mock }) => unknown) =>
+        cb({ query: jest.fn().mockResolvedValue([]) }),
+      ),
     };
 
     (cursorRepo.create as jest.Mock).mockImplementation((data) => data);
@@ -456,6 +463,159 @@ describe('IndexerService', () => {
         id: 'oldest-retirement',
       });
       expect(qbMock.execute).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ── governance:vote_cast ─────────────────────────────────────────────
+
+  describe('governance:vote_cast', () => {
+    type ProcessEvents = (events: DecodedEvent[]) => Promise<void>;
+
+    const voteDecoded: DecodedEvent = {
+      id: 'ev-vote-001',
+      ledger: 901,
+      contractId: 'CONTRACT4',
+      topics: ['vote_cast', 7, 'GVOTER...'],
+      value: { support: true },
+    };
+
+    it('upserts a ProposalVote row and increments votes_for when support is true', async () => {
+      (proposalRepo.findOne as jest.Mock).mockResolvedValue({
+        id: 'proposal-uuid-1',
+        onChainProposalId: 7,
+        votesFor: 0,
+        votesAgainst: 0,
+      });
+
+      const managerQuery = jest
+        .fn()
+        .mockResolvedValueOnce([{ id: 'vote-uuid-1' }]) // INSERT ... RETURNING id
+        .mockResolvedValueOnce([]); // UPDATE
+      (mockDataSource.transaction as jest.Mock).mockImplementation(
+        async (cb: (manager: { query: jest.Mock }) => unknown) =>
+          cb({ query: managerQuery }),
+      );
+
+      await (service as unknown as { processEvents: ProcessEvents }).processEvents([
+        voteDecoded,
+      ]);
+
+      expect(managerQuery).toHaveBeenNthCalledWith(
+        1,
+        expect.stringContaining('INSERT INTO proposal_votes'),
+        ['proposal-uuid-1', 'GVOTER...', true],
+      );
+      expect(managerQuery).toHaveBeenNthCalledWith(
+        2,
+        expect.stringContaining('UPDATE proposals SET votes_for'),
+        ['proposal-uuid-1'],
+      );
+      expect(mockNotificationsGateway.broadcast).toHaveBeenCalledWith(
+        'governance:vote_cast',
+        expect.objectContaining({ onChainProposalId: 7, voterWallet: 'GVOTER...', support: true }),
+      );
+    });
+
+    it('increments votes_against when support is false', async () => {
+      (proposalRepo.findOne as jest.Mock).mockResolvedValue({
+        id: 'proposal-uuid-1',
+        onChainProposalId: 7,
+        votesFor: 0,
+        votesAgainst: 0,
+      });
+
+      const managerQuery = jest
+        .fn()
+        .mockResolvedValueOnce([{ id: 'vote-uuid-1' }])
+        .mockResolvedValueOnce([]);
+      (mockDataSource.transaction as jest.Mock).mockImplementation(
+        async (cb: (manager: { query: jest.Mock }) => unknown) =>
+          cb({ query: managerQuery }),
+      );
+
+      const againstVote: DecodedEvent = {
+        ...voteDecoded,
+        id: 'ev-vote-002',
+        value: { support: false },
+      };
+
+      await (service as unknown as { processEvents: ProcessEvents }).processEvents([
+        againstVote,
+      ]);
+
+      expect(managerQuery).toHaveBeenNthCalledWith(
+        2,
+        expect.stringContaining('UPDATE proposals SET votes_against'),
+        ['proposal-uuid-1'],
+      );
+    });
+
+    it('is a no-op when the vote already exists (ON CONFLICT DO NOTHING returns no rows)', async () => {
+      (proposalRepo.findOne as jest.Mock).mockResolvedValue({
+        id: 'proposal-uuid-1',
+        onChainProposalId: 7,
+        votesFor: 1,
+        votesAgainst: 0,
+      });
+
+      const managerQuery = jest.fn().mockResolvedValueOnce([]); // no rows inserted — duplicate
+      (mockDataSource.transaction as jest.Mock).mockImplementation(
+        async (cb: (manager: { query: jest.Mock }) => unknown) =>
+          cb({ query: managerQuery }),
+      );
+
+      await (service as unknown as { processEvents: ProcessEvents }).processEvents([
+        voteDecoded,
+      ]);
+
+      // Only the INSERT was attempted; the UPDATE increment must be skipped.
+      expect(managerQuery).toHaveBeenCalledTimes(1);
+    });
+
+    it('applying the same vote twice only increments once (idempotent replay)', async () => {
+      (proposalRepo.findOne as jest.Mock).mockResolvedValue({
+        id: 'proposal-uuid-1',
+        onChainProposalId: 7,
+        votesFor: 0,
+        votesAgainst: 0,
+      });
+
+      // First pass: row inserted, increment runs. Second pass: conflict, no increment.
+      const managerQueryFirst = jest
+        .fn()
+        .mockResolvedValueOnce([{ id: 'vote-uuid-1' }])
+        .mockResolvedValueOnce([]);
+      const managerQuerySecond = jest.fn().mockResolvedValueOnce([]);
+
+      (mockDataSource.transaction as jest.Mock)
+        .mockImplementationOnce(async (cb: (manager: { query: jest.Mock }) => unknown) =>
+          cb({ query: managerQueryFirst }),
+        )
+        .mockImplementationOnce(async (cb: (manager: { query: jest.Mock }) => unknown) =>
+          cb({ query: managerQuerySecond }),
+        );
+
+      const processEvents = (service as unknown as { processEvents: ProcessEvents })
+        .processEvents;
+      await processEvents.call(service, [voteDecoded]);
+      await processEvents.call(service, [voteDecoded]);
+
+      expect(managerQueryFirst).toHaveBeenCalledTimes(2); // insert + update
+      expect(managerQuerySecond).toHaveBeenCalledTimes(1); // insert only, no update
+    });
+
+    it('logs a warning and skips the transaction when no matching proposal exists', async () => {
+      const warnSpy = jest.spyOn(service['logger'], 'warn').mockImplementation(() => {});
+      (proposalRepo.findOne as jest.Mock).mockResolvedValue(null);
+
+      await (service as unknown as { processEvents: ProcessEvents }).processEvents([
+        voteDecoded,
+      ]);
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('No matching proposal for onChainProposalId'),
+      );
+      expect(mockDataSource.transaction).not.toHaveBeenCalled();
     });
   });
 

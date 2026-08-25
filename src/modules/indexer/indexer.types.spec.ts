@@ -190,6 +190,70 @@ describe('decodeEvent', () => {
     });
   });
 
+  // ── governance:vote_cast ─────────────────────────────────────────────
+
+  describe('vote_cast', () => {
+    it('decodes a valid vote_cast event (support)', () => {
+      const raw: DecodedEvent = {
+        ...baseEvent,
+        topics: ['vote_cast', 7, 'GVOTER...'],
+        value: { support: true },
+      };
+      const result = decodeEvent(raw);
+      expect(result).not.toBeNull();
+      expect(result!.kind).toBe('governance:vote_cast');
+      if (result?.kind === 'governance:vote_cast') {
+        expect(result.onChainProposalId).toBe(7);
+        expect(result.voterWallet).toBe('GVOTER...');
+        expect(result.support).toBe(true);
+      } else {
+        fail('Expected governance:vote_cast event');
+      }
+    });
+
+    it('decodes a valid vote_cast event (against)', () => {
+      const raw: DecodedEvent = {
+        ...baseEvent,
+        topics: ['vote_cast', 7, 'GVOTER...'],
+        value: { support: false },
+      };
+      const result = decodeEvent(raw);
+      expect(result!.kind).toBe('governance:vote_cast');
+      if (result?.kind === 'governance:vote_cast') {
+        expect(result.support).toBe(false);
+      } else {
+        fail('Expected governance:vote_cast event');
+      }
+    });
+
+    it('returns null when proposalId is missing', () => {
+      const raw: DecodedEvent = {
+        ...baseEvent,
+        topics: ['vote_cast'],
+        value: { support: true },
+      };
+      expect(decodeEvent(raw)).toBeNull();
+    });
+
+    it('returns null when voter address is missing', () => {
+      const raw: DecodedEvent = {
+        ...baseEvent,
+        topics: ['vote_cast', 7],
+        value: { support: true },
+      };
+      expect(decodeEvent(raw)).toBeNull();
+    });
+
+    it('returns null when support is missing or not a boolean', () => {
+      const raw: DecodedEvent = {
+        ...baseEvent,
+        topics: ['vote_cast', 7, 'GVOTER...'],
+        value: { support: 'yes' },
+      };
+      expect(decodeEvent(raw)).toBeNull();
+    });
+  });
+
   // ── Unknown / malformed ──────────────────────────────────────────────
 
   it('returns null for an unrecognised event name', () => {

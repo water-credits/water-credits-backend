@@ -27,6 +27,7 @@ import {
   CreditRetireEvent,
   OracleReadingSubmittedEvent,
   GovernanceProposalExecutedEvent,
+  GovernanceVoteCastEvent,
 } from './indexer.types';
 
 /**
@@ -374,6 +375,9 @@ export class IndexerService implements OnModuleInit, OnModuleDestroy {
         case 'governance:proposal_executed':
           await this.onGovernanceProposalExecuted(event);
           break;
+        case 'governance:vote_cast':
+          await this.onGovernanceVoteCast(event);
+          break;
       }
     } catch (err) {
       // Per-event errors are logged but must not abort the overall batch.
@@ -662,6 +666,66 @@ export class IndexerService implements OnModuleInit, OnModuleDestroy {
 
     this.logger.log(
       `[indexer] governance:proposal_executed onChainProposalId=${event.onChainProposalId}`,
+    );
+  }
+
+  /**
+   * governance → vote_cast
+   *
+   * Idempotency: proposal_votes has a UNIQUE(proposal_id, voter_wallet)
+   * constraint (migration 007).  The insert uses ON CONFLICT DO NOTHING and
+   * the votes_for/votes_against increment only runs when a row was actually
+   * inserted, so replaying the same vote is a no-op.
+   */
+  private async onGovernanceVoteCast(event: GovernanceVoteCastEvent): Promise<void> {
+    const proposal = await this.proposalRepo.findOne({
+      where: { onChainProposalId: event.onChainProposalId },
+    });
+
+    if (!proposal) {
+      this.logger.warn(
+        JSON.stringify({
+          level: 'warn',
+          context: 'IndexerService',
+          event: 'governance:vote_cast',
+          message: 'No matching proposal for onChainProposalId; skipping',
+          onChainProposalId: event.onChainProposalId,
+          voterWallet: event.voterWallet,
+          ledger: event.ledger,
+        }),
+      );
+      return;
+    }
+
+    await this.dataSource.transaction(async (manager) => {
+      const inserted: unknown[] = await manager.query(
+        `INSERT INTO proposal_votes (proposal_id, voter_wallet, support, weight)
+         VALUES ($1, $2, $3, 1)
+         ON CONFLICT (proposal_id, voter_wallet) DO NOTHING
+         RETURNING id`,
+        [proposal.id, event.voterWallet, event.support],
+      );
+
+      if (inserted.length === 0) {
+        // Duplicate vote — already recorded, no-op.
+        return;
+      }
+
+      const column = event.support ? 'votes_for' : 'votes_against';
+      await manager.query(`UPDATE proposals SET ${column} = ${column} + 1 WHERE id = $1`, [
+        proposal.id,
+      ]);
+    });
+
+    this.notificationsGateway.broadcast('governance:vote_cast', {
+      onChainProposalId: event.onChainProposalId,
+      voterWallet: event.voterWallet,
+      support: event.support,
+      ledger: event.ledger,
+    });
+
+    this.logger.log(
+      `[indexer] governance:vote_cast onChainProposalId=${event.onChainProposalId} voter=${event.voterWallet} support=${event.support}`,
     );
   }
 
