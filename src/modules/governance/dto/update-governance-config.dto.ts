@@ -74,6 +74,21 @@ export class UpdateGovernanceConfigDto {
   @Max(1)
   weightPhosphorus?: number;
 
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  phPenaltyFactor?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  tempPenaltyFactor?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0.001) // Prevents division by zero
+  nutrientDivisor?: number;
+
   /** Optional human-readable note explaining why this change is being proposed. */
   @IsOptional()
   @IsString()

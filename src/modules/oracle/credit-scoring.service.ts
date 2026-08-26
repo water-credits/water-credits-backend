@@ -37,9 +37,11 @@ export class CreditScoringService {
     // Helper to clamp values between 0 and 1
     const clamp = (val: number, min: number, max: number) => Math.max(min, Math.min(max, val));
 
-    // Placeholders for reduction logic - assuming lower is better, clamping 1 - value/10
-    const nitrogenReduction = () => clamp(1 - nitrogen / 10, 0, 1);
-    const phosphorusReduction = () => clamp(1 - phosphorus / 10, 0, 1);
+    const nutrientDivisor = Number(config.nutrientDivisor);
+
+    // Placeholders for reduction logic - assuming lower is better, clamping 1 - value/divisor
+    const nitrogenReduction = () => clamp(1 - nitrogen / nutrientDivisor, 0, 1);
+    const phosphorusReduction = () => clamp(1 - phosphorus / nutrientDivisor, 0, 1);
 
     // Score Calculation
     const volumetricScore = new BigNumber(clamp(flowRate, 0, 1)).multipliedBy(
@@ -53,8 +55,8 @@ export class CreditScoringService {
     const score = volumetricScore.plus(nitrogenScore).plus(phosphorusScore);
 
     // Penalty Calculation
-    const phPenaltyFactor = 1.0; // Placeholder until defined in GovernanceConfig
-    const tempPenaltyFactor = 1.0; // Placeholder until defined in GovernanceConfig
+    const phPenaltyFactor = Number(config.phPenaltyFactor);
+    const tempPenaltyFactor = Number(config.tempPenaltyFactor);
 
     let phDeviation = 0;
     if (config.phMin !== null && ph < config.phMin) {

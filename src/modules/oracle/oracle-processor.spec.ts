@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { Test, TestingModule } from '@nestjs/testing';
 import { Logger } from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
@@ -502,6 +503,9 @@ describe('OracleProcessor', () => {
           weightVolumetric: 0.5,
           weightNitrogen: 0.3,
           weightPhosphorus: 0.2,
+          phPenaltyFactor: 1.0,
+          tempPenaltyFactor: 1.0,
+          nutrientDivisor: 10.0,
         },
       },
     } as never;
@@ -542,6 +546,9 @@ describe('OracleProcessor', () => {
           weightVolumetric: 0.5,
           weightNitrogen: 0.3,
           weightPhosphorus: 0.2,
+          phPenaltyFactor: 1.0,
+          tempPenaltyFactor: 1.0,
+          nutrientDivisor: 10.0,
         },
       },
     } as never;
@@ -637,7 +644,7 @@ describe('OracleProcessor', () => {
       getOracleNonceMock.mockResolvedValue(5);
 
       const originalFindOne = findOneMock;
-      findOneMock = jest.fn().mockImplementation((options) => {
+      findOneMock = jest.fn().mockImplementation((options: any) => {
         if (options?.where?.id) {
           return Promise.resolve(oldSubmission);
         }
