@@ -5,17 +5,11 @@ import { Project, ProjectStatus } from '../projects/entities/project.entity';
 import { Retirement } from '../credits/entities/retirement.entity';
 import { ReadingBatch, BatchStatus } from '../sensors/entities/reading-batch.entity';
 import { User } from '../users/entities/user.entity';
-
-interface CacheEntry<T> {
-  data: T;
-  expiresAt: number;
-}
+import { RedisCacheService } from './redis-cache.service';
 
 @Injectable()
 export class AnalyticsService {
   private readonly logger = new Logger(AnalyticsService.name);
-  private readonly cache = new Map<string, CacheEntry<unknown>>();
-  private readonly cacheTtlMs: number;
 
   constructor(
     @InjectRepository(Project)
@@ -26,40 +20,32 @@ export class AnalyticsService {
     private readingBatchRepository: Repository<ReadingBatch>,
     @InjectRepository(User)
     private userRepository: Repository<User>,
-  ) {
-    // TTL in seconds from env, default 60s; 0 disables caching.
-    this.cacheTtlMs = (parseInt(process.env.ANALYTICS_CACHE_TTL_S || '60', 10) || 0) * 1000;
+    private readonly cacheService: RedisCacheService,
+  ) {}
+
+  private async getFromCache<T>(key: string): Promise<T | null> {
+    return this.cacheService.get<T>(key);
   }
 
-  private getFromCache<T>(key: string): T | null {
-    if (this.cacheTtlMs <= 0) return null;
-    const entry = this.cache.get(key) as CacheEntry<T> | undefined;
-    if (!entry) return null;
-    if (Date.now() > entry.expiresAt) {
-      this.cache.delete(key);
-      return null;
-    }
-    return entry.data;
+  private async setCache(key: string, data: unknown): Promise<void> {
+    await this.cacheService.set(key, data);
   }
 
-  private setCache(key: string, data: unknown): void {
-    if (this.cacheTtlMs <= 0) return;
-    this.cache.set(key, { data, expiresAt: Date.now() + this.cacheTtlMs });
-  }
-
-  clearCache(): void {
-    this.cache.clear();
+  async clearCache(): Promise<void> {
+    await this.cacheService.clear('analytics:*');
   }
 
   async getOverview() {
     const cacheKey = 'analytics:overview';
-    const cached = this.getFromCache<{
+    const cached = await this.getFromCache<{
       totalProjects: number;
       activeProjects: number;
       totalCreditsMinted: number;
       totalCreditsRetired: number;
     }>(cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      return cached;
+    }
 
     const totalProjects = await this.projectRepository.count();
     const activeProjects = await this.projectRepository.count({
@@ -84,17 +70,19 @@ export class AnalyticsService {
       totalCreditsRetired: parseFloat(creditsRetiredResult?.total || '0'),
     };
 
-    this.setCache(cacheKey, result);
+    await this.setCache(cacheKey, result);
     return result;
   }
 
   async getCreditsOverTime() {
     const cacheKey = 'analytics:credits-over-time';
-    const cached = this.getFromCache<{
+    const cached = await this.getFromCache<{
       minted: Array<{ month: string; amount: number }>;
       retired: Array<{ month: string; amount: number }>;
     }>(cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      return cached;
+    }
 
     const last6Months = new Date();
     last6Months.setMonth(last6Months.getMonth() - 6);
@@ -123,17 +111,19 @@ export class AnalyticsService {
       retired: retired.map((r) => ({ month: r.month, amount: parseFloat(r.amount) })),
     };
 
-    this.setCache(cacheKey, result);
+    await this.setCache(cacheKey, result);
     return result;
   }
 
   async getProjectDistribution() {
     const cacheKey = 'analytics:project-distribution';
-    const cached = this.getFromCache<{
+    const cached = await this.getFromCache<{
       byStatus: Array<{ status: string; count: number }>;
       byMethodology: Array<{ methodology: string; count: number }>;
     }>(cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      return cached;
+    }
 
     const byStatus = await this.projectRepository
       .createQueryBuilder('project')
@@ -157,14 +147,16 @@ export class AnalyticsService {
       })),
     };
 
-    this.setCache(cacheKey, result);
+    await this.setCache(cacheKey, result);
     return result;
   }
 
   async getRetirementByPurpose() {
     const cacheKey = 'analytics:retirement-by-purpose';
-    const cached = this.getFromCache<Array<{ purpose: string; amount: number }>>(cacheKey);
-    if (cached) return cached;
+    const cached = await this.getFromCache<Array<{ purpose: string; amount: number }>>(cacheKey);
+    if (cached) {
+      return cached;
+    }
 
     const result = await this.retirementRepository
       .createQueryBuilder('retirement')
@@ -178,16 +170,19 @@ export class AnalyticsService {
       amount: parseFloat(r.amount),
     }));
 
-    this.setCache(cacheKey, mapped);
+    await this.setCache(cacheKey, mapped);
     return mapped;
   }
 
   async getTopProjects(limit: number = 5) {
     const cacheKey = `analytics:top-projects:${limit}`;
-    const cached = this.getFromCache<Array<{ id: string; name: string; totalGenerated: number }>>(
-      cacheKey,
-    );
-    if (cached) return cached;
+    const cached =
+      await this.getFromCache<Array<{ id: string; name: string; totalGenerated: number }>>(
+        cacheKey,
+      );
+    if (cached) {
+      return cached;
+    }
 
     const result = await this.readingBatchRepository
       .createQueryBuilder('batch')
@@ -208,16 +203,17 @@ export class AnalyticsService {
       totalGenerated: parseFloat(r.totalGenerated),
     }));
 
-    this.setCache(cacheKey, mapped);
+    await this.setCache(cacheKey, mapped);
     return mapped;
   }
 
   async getTopRetirees(limit: number = 5) {
     const cacheKey = `analytics:top-retirees:${limit}`;
-    const cached = this.getFromCache<Array<{ id: string; name: string; totalRetired: number }>>(
-      cacheKey,
-    );
-    if (cached) return cached;
+    const cached =
+      await this.getFromCache<Array<{ id: string; name: string; totalRetired: number }>>(cacheKey);
+    if (cached) {
+      return cached;
+    }
 
     const result = await this.retirementRepository
       .createQueryBuilder('retirement')
@@ -237,7 +233,7 @@ export class AnalyticsService {
       totalRetired: parseFloat(r.totalRetired),
     }));
 
-    this.setCache(cacheKey, mapped);
+    await this.setCache(cacheKey, mapped);
     return mapped;
   }
 }
