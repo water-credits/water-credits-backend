@@ -83,12 +83,9 @@ async function bootstrap() {
   // the oracle submission cron would keep firing while a pod drains.
   app.enableShutdownHooks();
 
-  // The Socket.io Redis adapter is initialised per-gateway namespace inside each
-  // gateway's afterInit() hook (NotificationsGateway, SensorsGateway).  This
-  // guarantees the adapter is attached before the first client can connect and
-  // allows each namespace to share the same Redis pub/sub channel prefix while
-  // maintaining namespace isolation.  No top-level adapter configuration is
-  // required here.
+  // WebSocket Redis adapters are owned by their gateway namespaces rather than
+  // configured globally. SensorsGateway awaits Redis readiness during module
+  // initialization and retains Socket.IO's in-process adapter on startup failure.
   await app.listen(port);
   logger.log(`Server running on port ${port} in ${nodeEnv} mode`, 'Bootstrap');
 }

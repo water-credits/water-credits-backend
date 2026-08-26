@@ -4,12 +4,11 @@ import {
   SubscribeMessage,
   OnGatewayConnection,
   OnGatewayDisconnect,
-  OnGatewayInit,
   ConnectedSocket,
   MessageBody,
 } from '@nestjs/websockets';
-import { Server, Socket } from 'socket.io';
-import { Inject, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Namespace, Socket } from 'socket.io';
+import { Inject, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { ThrottlerStorage } from '@nestjs/throttler';
@@ -22,24 +21,33 @@ import {
   WS_CONNECTION_THROTTLE,
   WS_SUBSCRIBE_THROTTLE,
 } from '../../common/decorators/throttle.decorator';
+import {
+  DEFAULT_WS_REDIS_CONNECT_TIMEOUT_MS,
+  MAX_WS_REDIS_CONNECT_TIMEOUT_MS,
+} from '../../config/sensor.config';
 
 const PROJECT_PREFIX = 'project:';
+const REDIS_RETRY_BASE_DELAY_MS = 50;
+const REDIS_RETRY_MAX_DELAY_MS = 5_000;
+const REDIS_RETRY_JITTER_MS = 200;
+
+type RedisClientRole = 'publisher' | 'subscriber';
 
 @WebSocketGateway({
   namespace: '/sensors',
   cors: corsOptions,
 })
 export class SensorsGateway
-  implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect, OnModuleDestroy
+  implements OnModuleInit, OnGatewayConnection, OnGatewayDisconnect, OnModuleDestroy
 {
   private readonly logger = new Logger(SensorsGateway.name);
 
   @WebSocketServer()
-  server: Server;
+  server: Namespace;
 
   /** Dedicated pub/sub clients — never shared with the Bull queue client. */
-  private pubClient: Redis;
-  private subClient: Redis;
+  private pubClient?: Redis;
+  private subClient?: Redis;
 
   constructor(
     private readonly jwtService: JwtService,
@@ -48,21 +56,143 @@ export class SensorsGateway
     @Inject(ThrottlerStorage) private readonly throttlerStorage: ThrottlerStorage,
   ) {}
 
-  afterInit(server: Server): void {
-    const host = this.configService.get<string>('REDIS_HOST', 'localhost');
-    const port = this.configService.get<number>('REDIS_PORT', 6379);
+  async onModuleInit(): Promise<void> {
+    const host = this.configService.get<string>('REDIS_HOST')?.trim();
+    if (!host) {
+      this.logger.log('SensorsGateway: using in-process adapter (Redis not configured)');
+      return;
+    }
+
+    const port = this.resolveRedisPort(this.configService.get<string | number>('REDIS_PORT', 6379));
     const password = this.configService.get<string>('REDIS_PASSWORD') || undefined;
+    const timeoutMs = this.resolveConnectTimeout(
+      this.configService.get<string | number>(
+        'sensor.wsRedisConnectTimeoutMs',
+        DEFAULT_WS_REDIS_CONNECT_TIMEOUT_MS,
+      ),
+    );
 
-    this.pubClient = new Redis({ host, port, password, lazyConnect: false });
-    this.subClient = this.pubClient.duplicate();
+    let pubClient: Redis | undefined;
+    let subClient: Redis | undefined;
 
-    server.adapter(createAdapter(this.pubClient, this.subClient));
-    this.logger.log('SensorsGateway: Redis adapter initialised');
+    try {
+      const publisher = new Redis({
+        host,
+        port,
+        password,
+        lazyConnect: true,
+        connectTimeout: timeoutMs,
+        retryStrategy: (attempt) => this.redisRetryDelay(attempt),
+      });
+      pubClient = publisher;
+      const subscriber = publisher.duplicate();
+      subClient = subscriber;
+
+      this.attachErrorListener(publisher, 'publisher');
+      this.attachErrorListener(subscriber, 'subscriber');
+
+      await this.withTimeout(
+        Promise.all([publisher.connect(), subscriber.connect()]).then(async () => {
+          await Promise.all([publisher.ping(), subscriber.ping()]);
+        }),
+        timeoutMs,
+      );
+
+      // A namespaced NestJS gateway receives a Socket.IO Namespace, not a
+      // Server. Replace only this namespace's adapter after both Redis clients
+      // have proven ready; otherwise its existing in-process adapter remains.
+      this.server.adapter = createAdapter(publisher, subscriber)(this.server);
+      this.pubClient = publisher;
+      this.subClient = subscriber;
+
+      this.logger.log('SensorsGateway: Redis adapter initialised');
+    } catch {
+      this.disconnectRedisClient(pubClient, 'publisher');
+      this.disconnectRedisClient(subClient, 'subscriber');
+      this.logger.warn('SensorsGateway falling back to in-process adapter');
+    }
   }
 
   async onModuleDestroy(): Promise<void> {
-    await Promise.allSettled([this.pubClient?.quit(), this.subClient?.quit()]);
-    this.logger.log('SensorsGateway: Redis pub/sub connections closed');
+    const clients = [this.pubClient, this.subClient].filter(
+      (client): client is Redis => client !== undefined,
+    );
+    this.pubClient = undefined;
+    this.subClient = undefined;
+
+    await Promise.allSettled(clients.map(async (client) => client.quit()));
+    if (clients.length > 0) {
+      this.logger.log('SensorsGateway: Redis pub/sub connections closed');
+    }
+  }
+
+  private attachErrorListener(client: Redis, role: RedisClientRole): void {
+    client.on('error', (error: Error) => this.logRedisWarning(role, error));
+  }
+
+  private logRedisWarning(role: RedisClientRole, error: Error): void {
+    const code = (error as NodeJS.ErrnoException).code;
+    this.logger.warn({
+      message: 'SensorsGateway Redis client error',
+      client: role,
+      error: {
+        name: error.name,
+        message: error.message,
+        ...(code ? { code } : {}),
+      },
+    });
+  }
+
+  private disconnectRedisClient(client: Redis | undefined, role: RedisClientRole): void {
+    if (!client) {
+      return;
+    }
+
+    try {
+      client.disconnect();
+    } catch (error) {
+      this.logRedisWarning(role, error as Error);
+    }
+  }
+
+  private redisRetryDelay(attempt: number): number {
+    const exponentialDelay = Math.min(
+      REDIS_RETRY_BASE_DELAY_MS * 2 ** Math.max(0, attempt - 1),
+      REDIS_RETRY_MAX_DELAY_MS,
+    );
+    return exponentialDelay + Math.floor(Math.random() * REDIS_RETRY_JITTER_MS);
+  }
+
+  private resolveRedisPort(value: string | number): number {
+    const port = Number(value);
+    return Number.isInteger(port) && port > 0 && port <= 65_535 ? port : 6379;
+  }
+
+  private resolveConnectTimeout(value: string | number): number {
+    const timeoutMs = Number(value);
+    return Number.isSafeInteger(timeoutMs) &&
+      timeoutMs > 0 &&
+      timeoutMs <= MAX_WS_REDIS_CONNECT_TIMEOUT_MS
+      ? timeoutMs
+      : DEFAULT_WS_REDIS_CONNECT_TIMEOUT_MS;
+  }
+
+  private async withTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timeoutHandle = setTimeout(
+        () => reject(new Error(`Redis connection timed out after ${timeoutMs}ms`)),
+        timeoutMs,
+      );
+    });
+
+    try {
+      return await Promise.race([operation, timeout]);
+    } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+    }
   }
 
   async handleConnection(client: Socket): Promise<void> {
