@@ -45,6 +45,9 @@ export interface GovernanceConfigSnapshot {
   weightVolumetric: number;
   weightNitrogen: number;
   weightPhosphorus: number;
+  phPenaltyFactor: number;
+  tempPenaltyFactor: number;
+  nutrientDivisor: number;
 }
 
 /**
@@ -212,7 +215,7 @@ export class OracleProcessor {
           };
           await this.submissionRepo.save(submission);
 
-          await this.calculateCreditsAndConfirmBatch(submission, projectId);
+          await this.calculateCreditsAndConfirmBatch(submission, projectId, govConfig);
           return;
         } else {
           this.logger.warn(
@@ -321,7 +324,7 @@ export class OracleProcessor {
 
       this.logger.log(`Oracle submission ${submissionId} confirmed on-chain (txHash: ${txHash})`);
 
-      await this.calculateCreditsAndConfirmBatch(submission, projectId);
+      await this.calculateCreditsAndConfirmBatch(submission, projectId, govConfig);
     } else {
       const message = `Unexpected terminal status from submitReading: ${txResponse.status}`;
       this.logger.error(message);
@@ -337,15 +340,16 @@ export class OracleProcessor {
   private async calculateCreditsAndConfirmBatch(
     submission: OracleSubmission,
     projectId: string,
+    snapshot: GovernanceConfigSnapshot,
   ): Promise<void> {
     try {
       const project = await this.projectRepo.findOne({ where: { id: projectId } });
-      const config = await this.governanceConfigRepo.findOne({ order: { id: 'DESC' } });
+      const config = snapshot;
 
       if (project && config) {
         const credits = this.creditScoringService.calculate(
           submission.readingsSnapshot,
-          config,
+          config as any,
           Number(project.areaHectares),
         );
 
@@ -416,6 +420,9 @@ export class OracleProcessor {
       weightVolumetric: config?.weightVolumetric ?? 0.5,
       weightNitrogen: config?.weightNitrogen ?? 0.3,
       weightPhosphorus: config?.weightPhosphorus ?? 0.2,
+      phPenaltyFactor: config?.phPenaltyFactor != null ? Number(config.phPenaltyFactor) : 1.0,
+      tempPenaltyFactor: config?.tempPenaltyFactor != null ? Number(config.tempPenaltyFactor) : 1.0,
+      nutrientDivisor: config?.nutrientDivisor != null ? Number(config.nutrientDivisor) : 10.0,
     };
   }
 

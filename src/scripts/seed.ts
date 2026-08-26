@@ -370,6 +370,9 @@ async function seed(): Promise<void> {
         weightVolumetric: 0.5,
         weightNitrogen: 0.3,
         weightPhosphorus: 0.2,
+        phPenaltyFactor: 1.0,
+        tempPenaltyFactor: 1.0,
+        nutrientDivisor: 10.0,
       }),
     );
     console.log('  created governance_config row');

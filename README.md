@@ -684,6 +684,16 @@ export class OracleProcessor {
 }
 ```
 
+#### Credit Scoring Formula
+
+When sensor readings are confirmed on-chain, the `CreditScoringService` calculates the credits generated. The formula is governance-configurable and computes a base score minus penalties for deviations from optimal water quality.
+
+- **`nutrientDivisor`** (default `10.0`): Scales down nitrogen and phosphorus concentrations. The nutrient reduction factor is calculated as `clamp(1 - (nutrient / nutrientDivisor), 0, 1)`.
+- **`phPenaltyFactor`** (default `1.0`): Multiplies the penalty when pH falls below `phMin` or exceeds `phMax`.
+- **`tempPenaltyFactor`** (default `1.0`): Multiplies the penalty when temperature exceeds `tempPenaltyDelta`.
+
+These parameters are controlled by the `GovernanceConfig`. The default values preserve legacy scoring behavior. Upon confirmation, a `configSnapshot` is saved to ensure historical auditability and deterministic retries without recalculating credits under new rules. Note: Confirmed batches with missing credits can be recalculated via the backfill script (`src/scripts/backfill-credits.ts`), which safely utilizes the historical snapshots.
+
 ---
 
 ### 7. Governance Module
@@ -804,11 +814,14 @@ In-app and email notifications for important events.
 │ description          │       │ ph_min / ph_max       │
 │ action_type          │       │ do_threshold          │
 │ action_params (jsonb)│       │ temp_penalty_delta    │
-│ votes_for            │       │ weight_volumetric     │
-│ votes_against        │       │ weight_nitrogen       │
-│ status (enum)        │       │ weight_phosphorus     │
-│ deadline             │       │ updated_by            │
-│ executed_at          │       │ updated_at            │
+│ votes_for            │       │ ph_penalty_factor     │
+│ votes_against        │       │ temp_penalty_factor   │
+│ status (enum)        │       │ nutrient_divisor      │
+│ deadline             │       │ weight_volumetric     │
+│ executed_at          │       │ weight_nitrogen       │
+│ created_at           │       │ weight_phosphorus     │
+└─────────────────────┘       │ updated_by            │
+                              │ updated_at            │
 │ created_at           │       └─────────────────────┘
 └─────────────────────┘
 ```

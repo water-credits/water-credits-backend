@@ -43,6 +43,15 @@ export class GovernanceConfig {
   @Column({ name: 'temp_penalty_delta', type: 'numeric', precision: 5, scale: 2, nullable: true })
   tempPenaltyDelta: number | null;
 
+  @Column({ name: 'ph_penalty_factor', type: 'numeric', precision: 5, scale: 2, default: 1.0 })
+  phPenaltyFactor: number;
+
+  @Column({ name: 'temp_penalty_factor', type: 'numeric', precision: 5, scale: 2, default: 1.0 })
+  tempPenaltyFactor: number;
+
+  @Column({ name: 'nutrient_divisor', type: 'numeric', precision: 5, scale: 2, default: 10.0 })
+  nutrientDivisor: number;
+
   // ── Credit-weight parameters ──
 
   @Column({ name: 'weight_volumetric', type: 'numeric', precision: 5, scale: 4, default: 0.5 })
