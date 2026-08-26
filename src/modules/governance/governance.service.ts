@@ -25,6 +25,7 @@ import { UpdateGovernanceConfigDto } from './dto/update-governance-config.dto';
 import { PendingConfigChangeDto } from './dto/pending-config-change.dto';
 import { StellarService } from '../stellar/stellar.service';
 import { UserRole } from '../users/entities/user.entity';
+import { UsersService } from '../users/users.service';
 import { paginate, PaginatedList } from '../../common/pagination';
 
 // PostgreSQL unique-violation error code
@@ -46,6 +47,7 @@ export class GovernanceService {
     private readonly configService: ConfigService,
     private readonly dataSource: DataSource,
     private readonly stellarService: StellarService,
+    private readonly usersService: UsersService,
   ) {}
 
   // ── Config (read) ─────────────────────────────────────────────────────────
@@ -79,6 +81,7 @@ export class GovernanceService {
         votingPeriod: 604800,
         timelockPeriod: 86400,
         quorum: 3,
+        quorumBasisPoints: 2000,
       })
       .orIgnore()
       .execute();
@@ -88,6 +91,59 @@ export class GovernanceService {
       throw new InternalServerErrorException('Governance config singleton row is missing');
     }
     return config;
+  }
+
+  // ── Quorum evaluation ──────────────────────────────────────────────────────
+  //
+  // Quorum is a participation threshold: enough of the eligible-voter population
+  // must have voted for a proposal's result to count. It is measured on TURNOUT
+  // (votes_for + votes_against), not on yes-votes alone — abstention should be
+  // able to defeat a proposal by starving it of quorum, and the yes/no split is
+  // what then decides PASSED vs REJECTED (handled by the caller). Eligible
+  // voters are active, KYC-verified users (see UsersService.countEligible).
+  //
+  // The percentage model applies only when it can: it needs a configured
+  // threshold (quorumBasisPoints > 0) AND a non-empty eligible population. When
+  // either is missing — the model is disabled, or the platform is still in its
+  // bootstrap period with no verified users — we fall back to the legacy
+  // absolute `quorum` integer so governance still functions and we never divide
+  // by zero.
+
+  private evaluateQuorum(
+    votesFor: number,
+    votesAgainst: number,
+    config: GovernanceConfig,
+    eligibleCount: number,
+  ): { quorumMet: boolean; mode: 'percentage' | 'absolute'; turnoutBasisPoints: number | null } {
+    const totalVotes = votesFor + votesAgainst;
+
+    if (config.quorumBasisPoints <= 0 || eligibleCount <= 0) {
+      return {
+        quorumMet: totalVotes >= config.quorum,
+        mode: 'absolute',
+        turnoutBasisPoints: null,
+      };
+    }
+
+    // Exact integer comparison of turnout share vs threshold, avoiding floating
+    // point:  totalVotes / eligibleCount >= quorumBasisPoints / 10000
+    //   ⇔     totalVotes * 10000       >= eligibleCount * quorumBasisPoints
+    const quorumMet = totalVotes * 10_000 >= eligibleCount * config.quorumBasisPoints;
+    const turnoutBasisPoints = Math.floor((totalVotes * 10_000) / eligibleCount);
+
+    return { quorumMet, mode: 'percentage', turnoutBasisPoints };
+  }
+
+  /**
+   * Resolve the eligible-voter count only when the percentage model is active.
+   * In absolute-fallback mode (quorumBasisPoints = 0) the denominator is unused,
+   * so we skip the COUNT query entirely.
+   */
+  private async resolveEligibleCount(config: GovernanceConfig): Promise<number> {
+    if (config.quorumBasisPoints <= 0) {
+      return 0;
+    }
+    return this.usersService.countEligible();
   }
 
   // ── Config (timelocked write) ─────────────────────────────────────────────
@@ -529,12 +585,17 @@ export class GovernanceService {
       }
 
       // 6. Quorum check — cast bigint columns to Number for arithmetic.
+      //    Quorum is now a share of the eligible-voter population rather than an
+      //    absolute count. The eligible count is read here, at evaluation time,
+      //    so the threshold reflects the live voter population.
       const config = await this.getConfig();
       const votesFor = Number(updated.votesFor);
       const votesAgainst = Number(updated.votesAgainst);
-      const totalVotes = votesFor + votesAgainst;
 
-      if (totalVotes >= config.quorum) {
+      const eligibleCount = await this.resolveEligibleCount(config);
+      const { quorumMet } = this.evaluateQuorum(votesFor, votesAgainst, config, eligibleCount);
+
+      if (quorumMet) {
         const newStatus = votesFor > votesAgainst ? ProposalStatus.PASSED : ProposalStatus.REJECTED;
 
         await queryRunner.manager
@@ -612,6 +673,31 @@ export class GovernanceService {
       throw new ForbiddenException(
         `Timelock not elapsed. Wait ${Math.ceil((timelockMs - elapsed) / 1000)} more seconds`,
       );
+    }
+
+    // Re-verify quorum against the CURRENT eligible-voter population before
+    // executing on-chain. A proposal is marked PASSED in vote() the moment
+    // quorum is reached, but under the percentage model the eligible set can
+    // grow between then and execution (the timelock alone can be days), so a
+    // once-sufficient turnout may no longer clear the threshold. Recomputing
+    // here anchors the check at execution time, not creation.
+    //
+    // Only relevant when the percentage model is active: in absolute mode the
+    // vote() finalization already enforced the fixed threshold and the eligible
+    // population is not part of the calculation, so there is nothing to re-check.
+    if (config.quorumBasisPoints > 0) {
+      const eligibleCount = await this.usersService.countEligible();
+      const { quorumMet } = this.evaluateQuorum(
+        Number(proposal.votesFor),
+        Number(proposal.votesAgainst),
+        config,
+        eligibleCount,
+      );
+      if (!quorumMet) {
+        throw new BadRequestException(
+          'Quorum is no longer met against the current eligible-voter population',
+        );
+      }
     }
 
     // Resolve the Soroban governance contract ID from config.

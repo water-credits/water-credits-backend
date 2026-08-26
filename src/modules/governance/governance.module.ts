@@ -8,6 +8,7 @@ import { ProposalVote } from './entities/proposal-vote.entity';
 import { GovernanceConfig } from './entities/governance-config.entity';
 import { GovernanceConfigChange } from './entities/governance-config-change.entity';
 import { StellarModule } from '../stellar/stellar.module';
+import { UsersModule } from '../users/users.module';
 
 @Module({
   imports: [
@@ -20,6 +21,10 @@ import { StellarModule } from '../stellar/stellar.module';
     // dependency is visible in the module graph and to avoid relying on
     // implicit global resolution.
     StellarModule,
+    // UsersModule exports UsersService, used to count eligible voters for the
+    // percentage-based quorum. No cycle: UsersModule does not depend on
+    // GovernanceModule.
+    UsersModule,
   ],
   controllers: [GovernanceController],
   providers: [GovernanceService],

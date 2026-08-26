@@ -17,6 +17,7 @@ import {
   ConfigChangeStatus,
 } from './entities/governance-config-change.entity';
 import { StellarService } from '../stellar/stellar.service';
+import { UsersService } from '../users/users.service';
 import { UserRole } from '../users/entities/user.entity';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -52,6 +53,10 @@ function makeConfig(overrides: Partial<GovernanceConfig> = {}): GovernanceConfig
     votingPeriod: 604800,
     timelockPeriod: 86400,
     quorum: 3,
+    // Default to the absolute-fallback path (percentage model off) so the
+    // pre-existing vote/execute tests keep asserting absolute-quorum behaviour.
+    // Percentage-model tests set quorumBasisPoints explicitly.
+    quorumBasisPoints: 0,
     phMin: null,
     phMax: null,
     doThreshold: null,
@@ -151,6 +156,7 @@ describe('GovernanceService', () => {
   let dataSource: { createQueryRunner: jest.Mock };
   let stellarService: { execute: jest.Mock; createProposal: jest.Mock };
   let configService: { get: jest.Mock };
+  let usersService: { countEligible: jest.Mock };
 
   beforeEach(async () => {
     proposalRepo = {
@@ -202,6 +208,13 @@ describe('GovernanceService', () => {
       createProposal: jest.fn(),
     };
 
+    // Default: no eligible voters resolved. Percentage-model tests override
+    // countEligible per case; absolute-fallback tests never call it because
+    // makeConfig sets quorumBasisPoints = 0.
+    usersService = {
+      countEligible: jest.fn().mockResolvedValue(0),
+    };
+
     configService = {
       get: jest.fn().mockImplementation((key: string, fallback?: unknown) => {
         if (key === 'stellar.contractGovernance') {
@@ -221,6 +234,7 @@ describe('GovernanceService', () => {
         { provide: ConfigService, useValue: configService },
         { provide: DataSource, useValue: dataSource },
         { provide: StellarService, useValue: stellarService },
+        { provide: UsersService, useValue: usersService },
       ],
     }).compile();
 
@@ -459,6 +473,178 @@ describe('GovernanceService', () => {
 
       const result = await service.vote(proposal.id, 'GVOTER', { approve: false });
       expect(result.status).toBe(ProposalStatus.REJECTED);
+    });
+  });
+
+  // ── vote() ── percentage-of-eligible-voters quorum ────────────────────────
+  //
+  // Quorum is met when turnout (votes_for + votes_against) reaches
+  // quorumBasisPoints / 10000 of the eligible-voter population, resolved live
+  // via UsersService.countEligible(). These cases pin the three acceptance
+  // scenarios: passes at 25% turnout / 20% threshold, fails at 15% turnout, and
+  // falls back to the absolute integer quorum during bootstrap (0 eligible).
+
+  describe('vote() — percentage quorum', () => {
+    // Builds a queryRunner whose reload (3rd manager.findOne) returns a proposal
+    // with the given post-increment tallies, still ACTIVE — so the assertion
+    // proves the SERVICE decided the terminal status, not the mock.
+    function makeVoteQueryRunner(reloaded: Partial<Proposal>, base: Proposal) {
+      let findCount = 0;
+      return {
+        connect: jest.fn().mockResolvedValue(undefined),
+        startTransaction: jest.fn().mockResolvedValue(undefined),
+        commitTransaction: jest.fn().mockResolvedValue(undefined),
+        rollbackTransaction: jest.fn().mockResolvedValue(undefined),
+        release: jest.fn().mockResolvedValue(undefined),
+        manager: {
+          findOne: jest.fn().mockImplementation(async () => {
+            findCount++;
+            if (findCount === 1) {
+              return base;
+            } // load proposal
+            if (findCount === 2) {
+              return null;
+            } // no existing vote
+            return { ...base, status: ProposalStatus.ACTIVE, ...reloaded }; // reload
+          }),
+          create: jest.fn().mockImplementation((_e: unknown, d: unknown) => d),
+          save: jest.fn().mockResolvedValue({}),
+          createQueryBuilder: jest.fn().mockReturnValue({
+            update: jest.fn().mockReturnThis(),
+            set: jest.fn().mockReturnThis(),
+            where: jest.fn().mockReturnThis(),
+            execute: jest.fn().mockResolvedValue(undefined),
+          }),
+        },
+      };
+    }
+
+    it('PASSES at 25% turnout against a 20% threshold', async () => {
+      // 25 for-votes out of 100 eligible = 25% turnout ≥ 20% → quorum met,
+      // and votes_for > votes_against → PASSED.
+      const proposal = makeProposal({ votesFor: 24, votesAgainst: 0 });
+      configRepo.findOne.mockResolvedValue(makeConfig({ quorumBasisPoints: 2000, quorum: 999 }));
+      usersService.countEligible.mockResolvedValue(100);
+
+      const qr = makeVoteQueryRunner({ votesFor: 25, votesAgainst: 0 }, proposal);
+      dataSource.createQueryRunner.mockReturnValue(qr);
+
+      const result = await service.vote(proposal.id, 'GVOTER', { approve: true });
+
+      expect(usersService.countEligible).toHaveBeenCalledTimes(1);
+      expect(result.status).toBe(ProposalStatus.PASSED);
+    });
+
+    it('does NOT reach quorum at 15% turnout against a 20% threshold (stays ACTIVE)', async () => {
+      // 15 votes out of 100 eligible = 15% turnout < 20% → quorum not met,
+      // so the proposal is left ACTIVE despite a for-majority. The low absolute
+      // quorum (3) is deliberately set to prove the percentage model, not the
+      // integer fallback, is what gates the decision here.
+      const proposal = makeProposal({ votesFor: 14, votesAgainst: 0 });
+      configRepo.findOne.mockResolvedValue(makeConfig({ quorumBasisPoints: 2000, quorum: 3 }));
+      usersService.countEligible.mockResolvedValue(100);
+
+      const qr = makeVoteQueryRunner({ votesFor: 15, votesAgainst: 0 }, proposal);
+      dataSource.createQueryRunner.mockReturnValue(qr);
+
+      const result = await service.vote(proposal.id, 'GVOTER', { approve: true });
+
+      expect(usersService.countEligible).toHaveBeenCalledTimes(1);
+      expect(result.status).toBe(ProposalStatus.ACTIVE);
+    });
+
+    it('falls back to the absolute quorum during bootstrap (0 eligible voters)', async () => {
+      // Percentage model is configured (bps = 2000) but there are no eligible
+      // voters yet, so evaluation falls back to the absolute quorum: total
+      // votes (3) ≥ quorum (3) → PASSED. Without the fallback this would be a
+      // divide-by-zero / permanently-unreachable quorum.
+      const proposal = makeProposal({ votesFor: 1, votesAgainst: 1 });
+      configRepo.findOne.mockResolvedValue(makeConfig({ quorumBasisPoints: 2000, quorum: 3 }));
+      usersService.countEligible.mockResolvedValue(0);
+
+      const qr = makeVoteQueryRunner({ votesFor: 2, votesAgainst: 1 }, proposal);
+      dataSource.createQueryRunner.mockReturnValue(qr);
+
+      const result = await service.vote(proposal.id, 'GVOTER', { approve: true });
+
+      expect(usersService.countEligible).toHaveBeenCalledTimes(1);
+      expect(result.status).toBe(ProposalStatus.PASSED);
+    });
+
+    it('skips the eligible-voter query entirely when the percentage model is off (bps = 0)', async () => {
+      // quorumBasisPoints = 0 → pure absolute mode → countEligible must not be
+      // queried at all (avoids a needless COUNT on every vote).
+      const proposal = makeProposal({ votesFor: 1, votesAgainst: 1 });
+      configRepo.findOne.mockResolvedValue(makeConfig({ quorumBasisPoints: 0, quorum: 3 }));
+
+      const qr = makeVoteQueryRunner({ votesFor: 2, votesAgainst: 1 }, proposal);
+      dataSource.createQueryRunner.mockReturnValue(qr);
+
+      const result = await service.vote(proposal.id, 'GVOTER', { approve: true });
+
+      expect(usersService.countEligible).not.toHaveBeenCalled();
+      expect(result.status).toBe(ProposalStatus.PASSED);
+    });
+  });
+
+  // ── executeProposal() ── execution-time quorum re-verification ─────────────
+
+  describe('executeProposal() — quorum re-verification at execution time', () => {
+    it('blocks execution when quorum is no longer met against the current eligible population', async () => {
+      // Proposal passed earlier with 5 votes, but the eligible population has
+      // since grown to 1000 → 0.5% turnout, far below the 20% threshold.
+      const oldDeadline = new Date(Date.now() - 2 * 86_400_000);
+      const proposal = makeProposal({
+        status: ProposalStatus.PASSED,
+        deadline: oldDeadline,
+        onChainProposalId: 7,
+        votesFor: 5,
+        votesAgainst: 0,
+      });
+      proposalRepo.findOne.mockResolvedValue(proposal);
+      configRepo.findOne.mockResolvedValue(
+        makeConfig({ timelockPeriod: 86400, quorumBasisPoints: 2000 }),
+      );
+      usersService.countEligible.mockResolvedValue(1000);
+
+      await expect(service.executeProposal(proposal.id, 'GADMIN')).rejects.toThrow(
+        BadRequestException,
+      );
+      // On-chain execution must never be attempted once the guard trips.
+      expect(stellarService.execute).not.toHaveBeenCalled();
+    });
+
+    it('allows execution when quorum still holds against the current eligible population', async () => {
+      // 5 of 10 eligible = 50% turnout ≥ 20% → guard passes and execution runs.
+      const oldDeadline = new Date(Date.now() - 2 * 86_400_000);
+      const proposal = makeProposal({
+        status: ProposalStatus.PASSED,
+        deadline: oldDeadline,
+        onChainProposalId: 7,
+        votesFor: 5,
+        votesAgainst: 0,
+      });
+      proposalRepo.findOne
+        .mockResolvedValueOnce(proposal)
+        .mockResolvedValueOnce({ ...proposal, status: ProposalStatus.EXECUTED });
+      configRepo.findOne.mockResolvedValue(
+        makeConfig({ timelockPeriod: 86400, quorumBasisPoints: 2000 }),
+      );
+      usersService.countEligible.mockResolvedValue(10);
+
+      proposalRepo.createQueryBuilder.mockReturnValue({
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue(undefined),
+      });
+      stellarService.execute.mockResolvedValue({ txHash: 'tx-quorum-ok' });
+
+      const result = await service.executeProposal(proposal.id, 'GADMIN');
+
+      expect(usersService.countEligible).toHaveBeenCalled();
+      expect(stellarService.execute).toHaveBeenCalledWith('CGOVERNANCE123', 7);
+      expect(result.status).toBe(ProposalStatus.EXECUTED);
     });
   });
 
@@ -761,6 +947,10 @@ describe('GovernanceService', () => {
           { provide: ConfigService, useValue: configService },
           { provide: DataSource, useValue: dataSource },
           { provide: StellarService, useValue: stellarService },
+          {
+            provide: UsersService,
+            useValue: { countEligible: jest.fn().mockResolvedValue(0) },
+          },
         ],
       }).compile();
 
@@ -877,6 +1067,10 @@ describe('GovernanceService', () => {
           { provide: ConfigService, useValue: configService },
           { provide: DataSource, useValue: dataSource },
           { provide: StellarService, useValue: stellarService },
+          {
+            provide: UsersService,
+            useValue: { countEligible: jest.fn().mockResolvedValue(0) },
+          },
         ],
       }).compile();
 
@@ -975,6 +1169,10 @@ describe('GovernanceService', () => {
           { provide: ConfigService, useValue: configService },
           { provide: DataSource, useValue: dataSource },
           { provide: StellarService, useValue: stellarService },
+          {
+            provide: UsersService,
+            useValue: { countEligible: jest.fn().mockResolvedValue(0) },
+          },
         ],
       }).compile();
 
@@ -1078,6 +1276,10 @@ describe('GovernanceService', () => {
           { provide: ConfigService, useValue: configService },
           { provide: DataSource, useValue: dataSource },
           { provide: StellarService, useValue: stellarService },
+          {
+            provide: UsersService,
+            useValue: { countEligible: jest.fn().mockResolvedValue(0) },
+          },
         ],
       }).compile();
 
@@ -1161,6 +1363,10 @@ describe('GovernanceService', () => {
           { provide: ConfigService, useValue: configService },
           { provide: DataSource, useValue: dataSource },
           { provide: StellarService, useValue: stellarService },
+          {
+            provide: UsersService,
+            useValue: { countEligible: jest.fn().mockResolvedValue(0) },
+          },
         ],
       }).compile();
 
@@ -1244,6 +1450,10 @@ describe('GovernanceService', () => {
           { provide: ConfigService, useValue: configService },
           { provide: DataSource, useValue: dataSource },
           { provide: StellarService, useValue: stellarService },
+          {
+            provide: UsersService,
+            useValue: { countEligible: jest.fn().mockResolvedValue(0) },
+          },
         ],
       }).compile();
 
@@ -1378,6 +1588,10 @@ describe('GovernanceService', () => {
           { provide: ConfigService, useValue: configService },
           { provide: DataSource, useValue: dataSource },
           { provide: StellarService, useValue: stellarService },
+          {
+            provide: UsersService,
+            useValue: { countEligible: jest.fn().mockResolvedValue(0) },
+          },
         ],
       }).compile();
 

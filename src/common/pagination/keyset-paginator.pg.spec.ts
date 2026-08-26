@@ -38,6 +38,11 @@ const COLS: KeysetColumns<PaginatedRow> = {
 const BASE = Date.parse('2026-01-01T00:00:00.000Z');
 
 describe('paginateKeyset (integration, pg-mem)', () => {
+  // pg-mem executes real SQL in-process and is CPU-bound; under full-suite
+  // parallelism these cases can exceed Jest's 5s default, so give the suite
+  // generous headroom to stay deterministic in CI.
+  jest.setTimeout(30_000);
+
   let ds: DataSource;
 
   beforeEach(async () => {

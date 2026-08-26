@@ -18,6 +18,7 @@ describe('GovernanceController', () => {
     votingPeriod: 604800,
     timelockPeriod: 86400,
     quorum: 3,
+    quorumBasisPoints: 2000,
     phMin: 6.5,
     phMax: 8.5,
     doThreshold: 5.0,
