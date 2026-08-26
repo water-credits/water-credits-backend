@@ -51,22 +51,6 @@ export class StellarService {
     this.horizon = new Horizon.Server(horizonUrl);
   }
 
-  // ── Authentication ──
-  async generateChallenge(_wallet: string): Promise<string> {
-    return `Login to Water Credits: ${Date.now()}`;
-  }
-
-  async verifySignature(wallet: string, signature: string, challenge: string): Promise<boolean> {
-    try {
-      const keypair = Keypair.fromPublicKey(wallet);
-      return keypair.verify(Buffer.from(challenge), Buffer.from(signature, 'base64'));
-    } catch (error) {
-      this.logger.error(`Signature verification failed: ${(error as Error).message}`);
-      return false;
-    }
-  }
-
-  // ── Network ──
   async getAccount(address: string): Promise<Horizon.AccountResponse> {
     return this.horizon.loadAccount(address);
   }
@@ -218,7 +202,9 @@ export class StellarService {
 
     const values = await this.readLedgerValues(keys, requests);
     return {
-      balance: address ? values.get(this.requestId(tokenId, 'balance', address)) ?? new BigNumber(0) : null,
+      balance: address
+        ? (values.get(this.requestId(tokenId, 'balance', address)) ?? new BigNumber(0))
+        : null,
       totalSupply: values.get(this.requestId(tokenId, 'totalSupply')) ?? new BigNumber(0),
       totalRetired: values.get(this.requestId(tokenId, 'totalRetired')) ?? new BigNumber(0),
     };
@@ -243,7 +229,11 @@ export class StellarService {
     );
   }
 
-  private requestId(tokenId: string, field: 'balance' | 'totalSupply' | 'totalRetired', address?: string) {
+  private requestId(
+    tokenId: string,
+    field: 'balance' | 'totalSupply' | 'totalRetired',
+    address?: string,
+  ) {
     return this.creditTokenLedgerKey(tokenId, field, address).toXDR('base64');
   }
 
