@@ -81,10 +81,17 @@ export class StellarClient {
     return this.server.prepareTransaction(tx);
   }
 
-  private isInsufficientFee(xdrStr: string): boolean {
+  private isInsufficientFee(xdrInput: string | xdr.TransactionResult): boolean {
     try {
-      const buf = Buffer.from(xdrStr, 'base64');
-      const result = xdr.TransactionResult.fromXDR(buf);
+      let result: xdr.TransactionResult;
+      
+      if (typeof xdrInput === 'string') {
+        const buf = Buffer.from(xdrInput, 'base64');
+        result = xdr.TransactionResult.fromXDR(buf);
+      } else {
+        result = xdrInput;
+      }
+      
       return result.result().switch().name === 'txInsufficientFee';
     } catch (e) {
       return false;
