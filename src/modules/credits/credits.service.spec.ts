@@ -484,6 +484,7 @@ describe('CreditsService', () => {
         projectId: 'proj-1',
         amount: 100,
         purpose: 'compliance',
+        certificateIpfsUri: 'ipfs://bafycert',
       };
       retirementRepo.findOne.mockResolvedValue(retirement as Retirement);
 
@@ -497,6 +498,20 @@ describe('CreditsService', () => {
       await expect(service.getCertificate('ret-not-mine', 'user-1')).rejects.toThrow(
         NotFoundException,
       );
+    });
+
+    it('throws NotFoundException when the retirement has no certificate (URI null)', async () => {
+      const retirement: Partial<Retirement> = {
+        id: 'ret-1',
+        userId: 'user-1',
+        projectId: 'proj-1',
+        amount: 100,
+        purpose: 'compliance',
+        certificateIpfsUri: null,
+      };
+      retirementRepo.findOne.mockResolvedValue(retirement as Retirement);
+
+      await expect(service.getCertificate('ret-1', 'user-1')).rejects.toThrow(NotFoundException);
     });
   });
 

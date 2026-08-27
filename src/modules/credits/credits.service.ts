@@ -197,6 +197,9 @@ export class CreditsService {
     if (!retirement) {
       throw new NotFoundException('Retirement not found');
     }
+    if (!retirement.certificateIpfsUri) {
+      throw new NotFoundException('Certificate not available');
+    }
     return retirement;
   }
 

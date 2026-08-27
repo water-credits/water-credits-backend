@@ -8,6 +8,7 @@ import { SorobanRpc } from '@stellar/stellar-sdk';
 import { Retirement } from './entities/retirement.entity';
 import { StellarService } from '../stellar/stellar.service';
 import { NotificationsService } from '../notifications/notifications.service';
+import { CertificateService } from './certificate.service';
 
 export interface RetirementJobData {
   retirementId: string;
@@ -28,6 +29,7 @@ export class CreditsRetirementProcessor {
     private readonly retirementRepo: Repository<Retirement>,
     private readonly stellarService: StellarService,
     private readonly notificationsService: NotificationsService,
+    private readonly certificateService: CertificateService,
   ) {}
 
   @Process({
@@ -92,6 +94,28 @@ export class CreditsRetirementProcessor {
       await this.retirementRepo.save(retirement);
 
       await this.notificationsService.notifyCreditRetired(userId, projectId, amount);
+
+      // Best-effort, independently retryable step: pin the retirement
+      // certificate to IPFS. A failed upload must NOT roll back the confirmed
+      // on-chain retirement — certificateService swallows its own errors and
+      // returns null, leaving retirement.certificateIpfsUri unset.
+      try {
+        const certificateUri =
+          await this.certificateService.uploadRetirementCertificate(retirement);
+        if (certificateUri) {
+          retirement.certificateIpfsUri = certificateUri;
+          await this.retirementRepo.save(retirement);
+        } else {
+          this.logger.warn(
+            `Retirement ${retirementId} confirmed but certificate upload returned no URI`,
+          );
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.logger.error(
+          `Certificate upload for retirement ${retirementId} failed, leaving retirement confirmed: ${message}`,
+        );
+      }
 
       this.logger.log(`Retirement ${retirementId} confirmed on-chain (txHash: ${txHash})`);
     } else {
