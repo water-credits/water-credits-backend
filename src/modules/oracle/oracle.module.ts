@@ -12,6 +12,7 @@ import { GovernanceConfig } from '../governance/entities/governance-config.entit
 import { SensorReading } from '../sensors/entities/sensor-reading.entity';
 import { Project } from '../projects/entities/project.entity';
 import { ReadingBatch } from '../sensors/entities/reading-batch.entity';
+import { NotificationsModule } from '../notifications/notifications.module';
 
 @Module({
   imports: [
@@ -42,6 +43,7 @@ import { ReadingBatch } from '../sensors/entities/reading-batch.entity';
         removeOnComplete: 50,
       },
     }),
+    NotificationsModule,
   ],
   controllers: [OracleController],
   providers: [OracleService, OracleProcessor, CreditScoringService, OracleSchedulerService],

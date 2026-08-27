@@ -206,6 +206,26 @@ describe('UsersService', () => {
     });
   });
 
+  // ── countEligible ───────────────────────────────────────────────────────────
+
+  describe('countEligible', () => {
+    it('counts only active, KYC-verified users (the governance quorum denominator)', async () => {
+      repo.count.mockResolvedValue(42);
+
+      const result = await service.countEligible();
+
+      expect(result).toBe(42);
+      expect(repo.count).toHaveBeenCalledWith({
+        where: { isActive: true, isKycVerified: true },
+      });
+    });
+
+    it('returns 0 during bootstrap when no user is eligible yet', async () => {
+      repo.count.mockResolvedValue(0);
+      await expect(service.countEligible()).resolves.toBe(0);
+    });
+  });
+
   // ── updateProfile ─────────────────────────────────────────────────────────
 
   describe('updateProfile', () => {

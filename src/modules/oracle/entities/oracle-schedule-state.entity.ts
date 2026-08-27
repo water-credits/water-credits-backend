@@ -26,6 +26,17 @@ export class OracleScheduleState {
   @Column({ name: 'last_submission_count', type: 'int', default: 0 })
   lastSubmissionCount: number;
 
+  /**
+   * Most recent nonce drift observed for this scope's oracle address.
+   *
+   * Populated by `OracleSchedulerService` after each submission cycle.
+   * `null` means no drift check has run yet or the RPC call failed.
+   * A value with `Math.abs(lastNonceDrift) > 1` triggers `degraded`
+   * status in `GET /health`.
+   */
+  @Column({ name: 'last_nonce_drift', type: 'int', nullable: true, default: null })
+  lastNonceDrift: number | null;
+
   @UpdateDateColumn({ name: 'updated_at' })
   updatedAt: Date;
 }

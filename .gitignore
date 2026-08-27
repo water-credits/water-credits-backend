@@ -17,6 +17,7 @@ Thumbs.db
 
 # Test
 test/**/*.js
+!test/__mocks__/*.js
 
 # Build artifacts
 *.tsbuildinfo

@@ -153,6 +153,16 @@ export class UpdateGovernanceConfigDto {
   @Min(1)
   quorum?: number;
 
+  /**
+   * Percentage-of-eligible-voters quorum in basis points (10000 = 100%).
+   * 0 disables the percentage model and falls back to the absolute `quorum`.
+   */
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Max(10_000)
+  quorumBasisPoints?: number;
+
   @IsOptional()
   @IsNumber()
   @Min(0)

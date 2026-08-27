@@ -40,6 +40,21 @@ export class UsersService {
     return this.userRepo.find({ where: { role: In(roles), isActive: true } });
   }
 
+  /**
+   * Count "eligible voters" for governance quorum.
+   *
+   * An eligible voter is an account that is both active and KYC-verified.
+   * These are the two gates that make a wallet a real, accountable participant:
+   * deactivated accounts cannot act, and unverified accounts are unproven
+   * identities that would let quorum be diluted (or Sybil-inflated) by throwaway
+   * registrations. This count is the denominator for percentage-based quorum in
+   * GovernanceService; it is queried at evaluation time so the threshold tracks
+   * the live voter population rather than a stale snapshot.
+   */
+  async countEligible(): Promise<number> {
+    return this.userRepo.count({ where: { isActive: true, isKycVerified: true } });
+  }
+
   async findAll(params: PaginationParams = {}): Promise<PaginatedList<User>> {
     const qb = this.userRepo.createQueryBuilder('user');
     return paginate(

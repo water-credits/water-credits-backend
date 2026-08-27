@@ -24,6 +24,9 @@ export const ThrottleOracle = () => Throttle({ default: { limit: 30, ttl: 60000 
 /** 20 req / 60 s — admin-only endpoints */
 export const ThrottleAdmin = () => Throttle({ default: { limit: 20, ttl: 60000 } });
 
+/** 1 req / 300 s — key rotation (also rate-limited per device in service) */
+export const ThrottleKeyRotation = () => Throttle({ default: { limit: 1, ttl: 300000 } });
+
 export { SkipThrottle };
 
 /**

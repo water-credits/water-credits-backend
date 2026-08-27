@@ -63,14 +63,11 @@ export class GovernanceController {
   async updateConfig(
     @Body() dto: UpdateGovernanceConfigDto,
     @CurrentUser('wallet') actor: string,
+    @CurrentUser('role') callerRole: UserRole,
     @Query('force') force?: string,
   ): Promise<PendingConfigChangeDto | GovernanceConfig> {
     if (force === 'true') {
-      // Force flag — requires SUPER_ADMIN; the @Roles guard allows both roles
-      // in but we enforce SUPER_ADMIN here at the service boundary.
-      // The controller relies on the current user's role being attached to the
-      // request by JwtStrategy.validate().  We extract it from the user object.
-      return this.governanceService.emergencyConfigUpdate(actor, dto);
+      return this.governanceService.emergencyConfigUpdate(actor, dto, callerRole);
     }
 
     return this.governanceService.proposeConfigChange(actor, dto);

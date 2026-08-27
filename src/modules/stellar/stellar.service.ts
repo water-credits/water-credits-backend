@@ -33,6 +33,11 @@ export interface OracleReadingPayload {
   temperature: number | null;
 }
 
+export interface CreditTokenStats {
+  totalSupply: BigNumber;
+  totalRetired: BigNumber;
+}
+
 @Injectable()
 export class StellarService {
   private readonly logger = new Logger(StellarService.name);
@@ -46,22 +51,6 @@ export class StellarService {
     this.horizon = new Horizon.Server(horizonUrl);
   }
 
-  // ── Authentication ──
-  async generateChallenge(_wallet: string): Promise<string> {
-    return `Login to Water Credits: ${Date.now()}`;
-  }
-
-  async verifySignature(wallet: string, signature: string, challenge: string): Promise<boolean> {
-    try {
-      const keypair = Keypair.fromPublicKey(wallet);
-      return keypair.verify(Buffer.from(challenge), Buffer.from(signature, 'base64'));
-    } catch (error) {
-      this.logger.error(`Signature verification failed: ${(error as Error).message}`);
-      return false;
-    }
-  }
-
-  // ── Network ──
   async getAccount(address: string): Promise<Horizon.AccountResponse> {
     return this.horizon.loadAccount(address);
   }
@@ -147,6 +136,130 @@ export class StellarService {
   async getTotalRetired(tokenId: string): Promise<BigNumber> {
     const result = await this.callReadOnly(tokenId, 'total_retired');
     return new BigNumber(result?.toString() || '0');
+  }
+
+  /**
+   * Snapshot of the credit-token values read from persistent Soroban storage.
+   * Missing ledger entries represent an uninitialized value and are returned as 0.
+   */
+  async batchGetTokenStats(tokenAddresses: string[]): Promise<Map<string, CreditTokenStats>> {
+    const addresses = [...new Set(tokenAddresses)];
+    const stats = new Map(
+      addresses.map((address) => [
+        address,
+        { totalSupply: new BigNumber(0), totalRetired: new BigNumber(0) },
+      ]),
+    );
+
+    if (addresses.length === 0) {
+      return stats;
+    }
+
+    const requests = new Map<string, { address: string; field: 'totalSupply' | 'totalRetired' }>();
+    const keys: xdr.LedgerKey[] = [];
+    for (const address of addresses) {
+      for (const field of ['totalSupply', 'totalRetired'] as const) {
+        const key = this.creditTokenLedgerKey(address, field);
+        requests.set(key.toXDR('base64'), { address, field });
+        keys.push(key);
+      }
+    }
+
+    const values = await this.readLedgerValues(keys, requests);
+    for (const [requestId, value] of values) {
+      const request = requests.get(requestId);
+      if (!request) {
+        continue;
+      }
+      const current = stats.get(request.address);
+      if (current) {
+        current[request.field] = value;
+      }
+    }
+
+    return stats;
+  }
+
+  /**
+   * Reads a project's balance, total supply, and total retired values in one
+   * getLedgerEntries RPC request.
+   */
+  async getTokenCreditDetails(
+    tokenId: string,
+    address: string | null,
+  ): Promise<{ balance: BigNumber | null; totalSupply: BigNumber; totalRetired: BigNumber }> {
+    const requests = new Map<string, 'balance' | 'totalSupply' | 'totalRetired'>();
+    const keys: xdr.LedgerKey[] = [];
+    const fields = address
+      ? (['balance', 'totalSupply', 'totalRetired'] as const)
+      : (['totalSupply', 'totalRetired'] as const);
+
+    for (const field of fields) {
+      const key = this.creditTokenLedgerKey(tokenId, field, address);
+      requests.set(key.toXDR('base64'), field);
+      keys.push(key);
+    }
+
+    const values = await this.readLedgerValues(keys, requests);
+    return {
+      balance: address
+        ? (values.get(this.requestId(tokenId, 'balance', address)) ?? new BigNumber(0))
+        : null,
+      totalSupply: values.get(this.requestId(tokenId, 'totalSupply')) ?? new BigNumber(0),
+      totalRetired: values.get(this.requestId(tokenId, 'totalRetired')) ?? new BigNumber(0),
+    };
+  }
+
+  private creditTokenLedgerKey(
+    tokenId: string,
+    field: 'balance' | 'totalSupply' | 'totalRetired',
+    address?: string | null,
+  ): xdr.LedgerKey {
+    const key =
+      field === 'balance'
+        ? xdr.ScVal.scvVec([xdr.ScVal.scvSymbol('Balance'), new Address(address!).toScVal()])
+        : xdr.ScVal.scvSymbol(field === 'totalSupply' ? 'TotalSupply' : 'TotalRetired');
+
+    return xdr.LedgerKey.contractData(
+      new xdr.LedgerKeyContractData({
+        contract: new Address(tokenId).toScAddress(),
+        key,
+        durability: xdr.ContractDataDurability.persistent(),
+      }),
+    );
+  }
+
+  private requestId(
+    tokenId: string,
+    field: 'balance' | 'totalSupply' | 'totalRetired',
+    address?: string,
+  ) {
+    return this.creditTokenLedgerKey(tokenId, field, address).toXDR('base64');
+  }
+
+  private async readLedgerValues<T>(
+    keys: xdr.LedgerKey[],
+    requests: Map<string, T>,
+  ): Promise<Map<string, BigNumber>> {
+    const response = await this.stellarClient.getLedgerEntries(...keys);
+    const values = new Map<string, BigNumber>();
+
+    for (const entry of response.entries) {
+      const requestId = entry.key.toXDR('base64');
+      if (!requests.has(requestId)) {
+        continue;
+      }
+
+      const contractData = entry.val.contractData();
+      if (!contractData) {
+        continue;
+      }
+
+      const value = scValToNative(contractData.val());
+      values.set(requestId, new BigNumber(value?.toString() ?? '0'));
+    }
+
+    return values;
   }
 
   async mintCredits(tokenId: string, to: string, amount: BigNumber): Promise<unknown> {

@@ -4,6 +4,10 @@ import { Repository } from 'typeorm';
 import { Notification, NotificationType } from './entities/notification.entity';
 import { NotificationsGateway } from './notifications.gateway';
 import { paginate, PaginatedList, PaginationParams } from '../../common/pagination';
+import { EmailService } from './email.service';
+import { ProjectsService } from '../projects/projects.service';
+import { UsersService } from '../users/users.service';
+import { UserRole } from '../users/entities/user.entity';
 
 @Injectable()
 export class NotificationsService {
@@ -13,6 +17,9 @@ export class NotificationsService {
     @InjectRepository(Notification)
     private readonly notificationRepository: Repository<Notification>,
     private readonly notificationsGateway: NotificationsGateway,
+    private readonly emailService: EmailService,
+    private readonly projectsService: ProjectsService,
+    private readonly usersService: UsersService,
   ) {}
 
   async createNotification(
@@ -85,14 +92,26 @@ export class NotificationsService {
     );
   }
 
-  async notifySensorAlert(userId: string, projectId: string, alert: Record<string, unknown>) {
-    return this.createNotification(
+  async notifySensorAlert(userId: string, projectId: string, alert: Record<string, unknown>, emailAddress?: string) {
+    const notification = await this.createNotification(
       userId,
       NotificationType.SENSOR_ALERT,
       'Sensor Alert',
       this.buildSensorAlertMessage(projectId, alert),
       { projectId, alert },
     );
+
+    if (emailAddress) {
+      try {
+        const subject = `Water Credits Alert: Device ${alert.deviceId} Parameter Breach`;
+        const text = this.buildSensorAlertMessage(projectId, alert);
+        await this.emailService.sendMail(emailAddress, subject, text);
+      } catch (err) {
+        this.logger.error(`Failed to send email for sensor alert: ${(err as Error).message}`);
+      }
+    }
+
+    return notification;
   }
 
   private buildSensorAlertMessage(projectId: string, alert: Record<string, unknown>): string {
@@ -123,5 +142,24 @@ export class NotificationsService {
       `Successfully retired ${amount} credits for project ${projectId}.`,
       { projectId, amount },
     );
+  }
+
+  async notifyOracleMissedSubmissions(missedCount: number) {
+    const users = await this.usersService.findByRoles([UserRole.ADMIN, UserRole.ORACLE]);
+    for (const user of users) {
+      await this.createNotification(
+        user.id,
+        NotificationType.ORACLE_STATUS,
+        'Oracle Missed Submissions',
+        `Oracle node missed ${missedCount} consecutive submissions.`,
+        { missedCount },
+      );
+
+      if (user.email) {
+        const subject = `Water Credits System Alert: Oracle Missed Submissions`;
+        const text = `The oracle node has missed ${missedCount} consecutive submissions. Please check the oracle service health immediately.`;
+        await this.emailService.sendMail(user.email, subject, text);
+      }
+    }
   }
 }

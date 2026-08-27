@@ -26,8 +26,27 @@ export class GovernanceConfig {
   @Column({ name: 'timelock_period', type: 'int', default: 86400 })
   timelockPeriod: number;
 
+  /**
+   * Legacy absolute quorum: the minimum number of votes cast for a proposal to
+   * be decided. Retained as a fallback and used only when percentage-based
+   * quorum cannot apply — that is, when `quorumBasisPoints` is 0 (model
+   * disabled) or the eligible-voter population is 0 (bootstrap period). See
+   * `quorumBasisPoints` and GovernanceService's quorum evaluation.
+   */
   @Column({ type: 'int', default: 3 })
   quorum: number;
+
+  /**
+   * Percentage-of-eligible-voters quorum, in basis points (10000 = 100%).
+   * Default 2000 = 20%. A proposal reaches quorum when turnout
+   * (votes_for + votes_against) is at least this share of the eligible-voter
+   * population (active, KYC-verified users) at evaluation time.
+   *
+   * Set to 0 to disable the percentage model and fall back to the absolute
+   * `quorum` integer. Stored as SMALLINT since basis points never exceed 10000.
+   */
+  @Column({ name: 'quorum_basis_points', type: 'smallint', default: 2000 })
+  quorumBasisPoints: number;
 
   // ── Water-quality thresholds (used by oracle scoring) ──
 

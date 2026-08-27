@@ -13,11 +13,19 @@ function randomContractId(): string {
   return StrKey.encodeContract(randomBytes(32));
 }
 
+function randomAccountId(): string {
+  return StrKey.encodeEd25519PublicKey(randomBytes(32));
+}
+
 function makeConfigService(): ConfigService {
   return {
     get: jest.fn((key: string) => {
-      if (key === 'stellar.horizonUrl') return 'https://horizon-testnet.stellar.org';
-      if (key === 'stellar.passphrase') return 'Test SDF Network ; September 2015';
+      if (key === 'stellar.horizonUrl') {
+        return 'https://horizon-testnet.stellar.org';
+      }
+      if (key === 'stellar.passphrase') {
+        return 'Test SDF Network ; September 2015';
+      }
       return undefined;
     }),
   } as unknown as ConfigService;
@@ -109,9 +117,8 @@ describe('StellarService.submitReading', () => {
   beforeEach(() => {
     oracleContractId = randomContractId();
 
-    const { Keypair, Account } = jest.requireActual<typeof import('@stellar/stellar-sdk')>(
-      '@stellar/stellar-sdk',
-    );
+    const { Keypair, Account } =
+      jest.requireActual<typeof import('@stellar/stellar-sdk')>('@stellar/stellar-sdk');
 
     // A deterministic throw-away keypair for tests.
     const keypair = Keypair.random();
@@ -215,13 +222,13 @@ describe('StellarService.submitReading', () => {
 
   it('encodes all seven parameters in the correct positional order', async () => {
     const payload: OracleReadingPayload = {
-      ph: 7.2,          // pos 1 → 7200
-      turbidity: 12.4,  // pos 2 → 12400
+      ph: 7.2, // pos 1 → 7200
+      turbidity: 12.4, // pos 2 → 12400
       dissolvedOxygen: 6.8, // pos 3 → 6800
-      flowRate: 1.834,  // pos 4 → 1834
-      nitrogen: 2.45,   // pos 5 → 2450
-      phosphorus: 0.125,// pos 6 → 125
-      temperature: 18.5,// pos 7 → 18500
+      flowRate: 1.834, // pos 4 → 1834
+      nitrogen: 2.45, // pos 5 → 2450
+      phosphorus: 0.125, // pos 6 → 125
+      temperature: 18.5, // pos 7 → 18500
     };
 
     await service.submitReading(oracleContractId, 'proj-abc', payload, 42);
@@ -229,12 +236,12 @@ describe('StellarService.submitReading', () => {
     // args[0] = projectId
     expect(scValToNative(capturedArgs[0])).toBe('proj-abc');
     // args[1..7] = the seven parameters
-    expect(scValToNative(capturedArgs[1])).toBe(7200n);  // ph
+    expect(scValToNative(capturedArgs[1])).toBe(7200n); // ph
     expect(scValToNative(capturedArgs[2])).toBe(12400n); // turbidity
-    expect(scValToNative(capturedArgs[3])).toBe(6800n);  // dissolvedOxygen
-    expect(scValToNative(capturedArgs[4])).toBe(1834n);  // flowRate
-    expect(scValToNative(capturedArgs[5])).toBe(2450n);  // nitrogen
-    expect(scValToNative(capturedArgs[6])).toBe(125n);   // phosphorus
+    expect(scValToNative(capturedArgs[3])).toBe(6800n); // dissolvedOxygen
+    expect(scValToNative(capturedArgs[4])).toBe(1834n); // flowRate
+    expect(scValToNative(capturedArgs[5])).toBe(2450n); // nitrogen
+    expect(scValToNative(capturedArgs[6])).toBe(125n); // phosphorus
     expect(scValToNative(capturedArgs[7])).toBe(18500n); // temperature
     // args[8] = nonce (u32)
     expect(scValToNative(capturedArgs[8])).toBe(42);
@@ -275,5 +282,92 @@ describe('StellarService.submitReading', () => {
 
     const result = await service.submitReading(oracleContractId, 'proj-abc', payload, 1);
     expect(result.txHash).toBe('mock-tx-hash');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// batch ledger read tests
+// ---------------------------------------------------------------------------
+
+describe('StellarService batch ledger reads', () => {
+  let service: StellarService;
+  let getLedgerEntries: jest.Mock;
+
+  const ledgerEntry = (key: xdr.LedgerKey, value: bigint) => ({
+    key,
+    val: {
+      contractData: () => ({
+        val: () => nativeToScVal(value, { type: 'i128' }),
+      }),
+    },
+  });
+
+  beforeEach(() => {
+    getLedgerEntries = jest.fn();
+    service = new StellarService(makeConfigService(), {
+      getLedgerEntries,
+    } as unknown as StellarClient);
+  });
+
+  it('reads all token totals in one RPC call and defaults missing entries to zero', async () => {
+    getLedgerEntries.mockImplementation(async (...keys: xdr.LedgerKey[]) => ({
+      entries: [
+        ledgerEntry(keys[0], 1000n),
+        ledgerEntry(keys[1], 200n),
+        ledgerEntry(keys[2], 3000n),
+      ],
+      latestLedger: 1,
+    }));
+
+    const result = await service.batchGetTokenStats([randomContractId(), randomContractId()]);
+
+    expect(getLedgerEntries).toHaveBeenCalledTimes(1);
+    expect(getLedgerEntries.mock.calls[0]).toHaveLength(4);
+    expect(result.size).toBe(2);
+    const firstStats = [...result.values()][0];
+    expect(firstStats.totalSupply.toNumber()).toBe(1000);
+    expect(firstStats.totalRetired.toNumber()).toBe(200);
+    expect([...result.values()][1].totalSupply.toNumber()).toBe(3000);
+    expect([...result.values()][1].totalRetired.toNumber()).toBe(0);
+
+    const firstKey = getLedgerEntries.mock.calls[0][0] as xdr.LedgerKey;
+    expect(firstKey.contractData().key().sym()).toBe('TotalSupply');
+  });
+
+  it('reads a project balance and totals in one RPC call', async () => {
+    getLedgerEntries.mockImplementation(async (...keys: xdr.LedgerKey[]) => ({
+      entries: [ledgerEntry(keys[0], 50n), ledgerEntry(keys[1], 1000n), ledgerEntry(keys[2], 200n)],
+      latestLedger: 1,
+    }));
+
+    const tokenId = randomContractId();
+    const wallet = randomAccountId();
+    const result = await service.getTokenCreditDetails(tokenId, wallet);
+
+    expect(getLedgerEntries).toHaveBeenCalledTimes(1);
+    expect(getLedgerEntries.mock.calls[0]).toHaveLength(3);
+    expect(result.balance?.toNumber()).toBe(50);
+    expect(result.totalSupply.toNumber()).toBe(1000);
+    expect(result.totalRetired.toNumber()).toBe(200);
+
+    const balanceKey = getLedgerEntries.mock.calls[0][0] as xdr.LedgerKey;
+    const balanceParts = balanceKey.contractData().key().vec();
+    expect(balanceParts?.[0]?.sym()).toBe('Balance');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Security: removed server-unbound auth helpers
+// ---------------------------------------------------------------------------
+
+describe('StellarService — removed insecure auth helpers', () => {
+  it('does not expose generateChallenge', () => {
+    const service = new StellarService(makeConfigService(), {} as StellarClient);
+    expect((service as unknown as Record<string, unknown>).generateChallenge).toBeUndefined();
+  });
+
+  it('does not expose verifySignature', () => {
+    const service = new StellarService(makeConfigService(), {} as StellarClient);
+    expect((service as unknown as Record<string, unknown>).verifySignature).toBeUndefined();
   });
 });

@@ -47,6 +47,8 @@ export interface OracleHealth {
   last_scheduled_at: string | null;
   staleness_s: number | null;
   last_submission_count: number | null;
+  /** Signed drift (on-chain nonce − local nonce) from the last post-cycle check. `null` if no check has run or the RPC call failed. */
+  nonce_drift: number | null;
   detail?: string;
 }
 
@@ -233,6 +235,7 @@ export class HealthService {
       last_scheduled_at: null,
       staleness_s: null,
       last_submission_count: null,
+      nonce_drift: null,
     };
 
     if (!enabled) {
@@ -257,17 +260,26 @@ export class HealthService {
       (Date.now() - new Date(state.lastScheduledAt).getTime()) / 1000,
     );
     const stale = stalenessSeconds > thresholdSeconds;
+    const nonceDrift = state.lastNonceDrift ?? null;
+    const driftDegraded = nonceDrift !== null && Math.abs(nonceDrift) > 1;
+
+    const details: string[] = [];
+    if (stale) {
+      details.push(`last cycle was ${stalenessSeconds}s ago (threshold ${thresholdSeconds}s)`);
+    }
+    if (driftDegraded) {
+      details.push(`nonce drift=${nonceDrift}`);
+    }
 
     return {
-      status: stale ? 'degraded' : 'ok',
+      status: stale || driftDegraded ? 'degraded' : 'ok',
       enabled,
       cron,
       last_scheduled_at: new Date(state.lastScheduledAt).toISOString(),
       staleness_s: stalenessSeconds,
       last_submission_count: state.lastSubmissionCount,
-      ...(stale
-        ? { detail: `last cycle was ${stalenessSeconds}s ago (threshold ${thresholdSeconds}s)` }
-        : {}),
+      nonce_drift: nonceDrift,
+      ...(details.length > 0 ? { detail: details.join('; ') } : {}),
     };
   }
 

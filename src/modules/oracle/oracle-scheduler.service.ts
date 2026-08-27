@@ -10,6 +10,7 @@ import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { LessThan, MoreThan, Repository } from 'typeorm';
 import { OracleService } from './oracle.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import {
   GLOBAL_SCHEDULE_SCOPE,
   OracleScheduleState,
@@ -53,6 +54,31 @@ export function resolveCronExpression(): string {
   return raw;
 }
 
+/** Name the cron job is registered under in the SchedulerRegistry for reconciliation. */
+export const ORACLE_RECONCILIATION_CRON_NAME = 'oracle-reconciliation-cycle';
+
+/**
+ * Resolves the reconciliation cron expression at decoration time.
+ */
+export function resolveReconciliationCronExpression(): string {
+  const raw = (process.env.ORACLE_RECONCILIATION_INTERVAL_CRON || '').trim();
+  if (!raw) {
+    return '30 * * * *';
+  }
+
+  const fieldCount = raw.split(/\s+/).length;
+  if (fieldCount < 5 || fieldCount > 6) {
+    Logger.warn(
+      `Ignoring malformed ORACLE_RECONCILIATION_INTERVAL_CRON="${raw}" ` +
+        `(expected 5 or 6 fields); falling back to "30 * * * *"`,
+      'OracleSchedulerService',
+    );
+    return '30 * * * *';
+  }
+
+  return raw;
+}
+
 export interface SubmissionCycleResult {
   /** Number of ACTIVE projects inspected. */
   projectsScanned: number;
@@ -80,6 +106,8 @@ export class OracleSchedulerService implements OnModuleInit, OnApplicationShutdo
   /** Set on shutdown so an in-flight cycle stops between units of work. */
   private shuttingDown = false;
 
+  private consecutiveMisses = 0;
+
   constructor(
     private readonly oracleService: OracleService,
     private readonly configService: ConfigService,
@@ -90,6 +118,7 @@ export class OracleSchedulerService implements OnModuleInit, OnApplicationShutdo
     private readonly batchRepo: Repository<ReadingBatch>,
     @InjectRepository(OracleScheduleState)
     private readonly scheduleStateRepo: Repository<OracleScheduleState>,
+    private readonly notifications: NotificationsService,
   ) {}
 
   onModuleInit(): void {
@@ -99,6 +128,8 @@ export class OracleSchedulerService implements OnModuleInit, OnApplicationShutdo
     );
     if (this.isEnabled()) {
       this.logger.log(`Oracle submission cycle scheduled with cron "${expression}"`);
+      const reconExpression = resolveReconciliationCronExpression();
+      this.logger.log(`Oracle reconciliation cycle scheduled with cron "${reconExpression}"`);
     } else {
       this.logger.warn('Oracle submission cycle is DISABLED (ORACLE_SCHEDULER_ENABLED=false)');
     }
@@ -116,11 +147,22 @@ export class OracleSchedulerService implements OnModuleInit, OnApplicationShutdo
     } catch {
       // Job was never registered (e.g. ScheduleModule absent in a unit test).
     }
+    try {
+      this.schedulerRegistry.getCronJob(ORACLE_RECONCILIATION_CRON_NAME).stop();
+      this.logger.log(`Oracle reconciliation cron stopped (signal: ${signal ?? 'none'})`);
+    } catch {
+      // Job was never registered.
+    }
   }
 
   @Cron(resolveCronExpression(), { name: ORACLE_SUBMISSION_CRON_NAME })
   async handleCron(): Promise<SubmissionCycleResult> {
     return this.runSubmissionCycle();
+  }
+
+  @Cron(resolveReconciliationCronExpression(), { name: ORACLE_RECONCILIATION_CRON_NAME })
+  async handleReconciliationCron(): Promise<void> {
+    await this.runReconciliation();
   }
 
   /**
@@ -181,6 +223,25 @@ export class OracleSchedulerService implements OnModuleInit, OnApplicationShutdo
 
       await this.recordScheduleState(GLOBAL_SCHEDULE_SCOPE, startedAt, submitted);
 
+      // Post-cycle nonce-drift check — runs after all batches have been
+      // enqueued so it doesn't add latency to the submission hot-path.
+      // Requires ORACLE_CONTRACT_ID; silently skipped when unconfigured.
+      const oracleContractId = this.configService.get<string>('oracle.contractId', '');
+      if (oracleContractId) {
+        const drift = await this.oracleService.detectNonceDrift(oracleContractId, oracleAddress);
+        await this.recordNonceDrift(drift);
+      }
+
+      if (submitted === 0 && failed > 0) {
+        this.consecutiveMisses++;
+        const threshold = this.configService.get<number>('oracle.missedSubmissionsThreshold', 3);
+        if (this.consecutiveMisses >= threshold) {
+          await this.notifications.notifyOracleMissedSubmissions(this.consecutiveMisses);
+        }
+      } else if (submitted > 0) {
+        this.consecutiveMisses = 0;
+      }
+
       this.logger.log(
         `Oracle submission cycle finished: ${projects.length} active project(s), ` +
           `${submitted} submitted, ${failed} failed`,
@@ -234,6 +295,7 @@ export class OracleSchedulerService implements OnModuleInit, OnApplicationShutdo
         await this.oracleService.triggerSubmission({
           projectId,
           oracleAddress,
+          batchId: batch.id,
           readings: this.toReadingsSnapshot(aggregate),
         });
 
@@ -336,7 +398,49 @@ export class OracleSchedulerService implements OnModuleInit, OnApplicationShutdo
     }
   }
 
+  /**
+   * Persists the most recent nonce drift value on the global schedule-state
+   * row so `GET /health` can surface it without making a live RPC call.
+   *
+   * Errors are swallowed — drift bookkeeping must never fail a cycle.
+   */
+  private async recordNonceDrift(drift: number | null): Promise<void> {
+    try {
+      await this.scheduleStateRepo.upsert(
+        { scopeId: GLOBAL_SCHEDULE_SCOPE, lastNonceDrift: drift },
+        ['scopeId'],
+      );
+    } catch (error) {
+      this.logger.warn(`Could not record nonce drift: ${(error as Error).message}`);
+    }
+  }
+
   private isEnabled(): boolean {
     return this.configService.get<boolean>('oracle.schedulerEnabled', true);
+  }
+
+  async runReconciliation(): Promise<void> {
+    if (!this.isEnabled() || this.shuttingDown) {
+      return;
+    }
+
+    const oracleContractId = this.configService.get<string>('oracle.contractId');
+    if (!oracleContractId) {
+      this.logger.warn('Skipping scheduled reconciliation: oracle contract ID is not configured');
+      return;
+    }
+
+    const oracleAddresses = await this.oracleService.getUniqueOracleAddresses();
+    if (oracleAddresses.length === 0) {
+      return;
+    }
+
+    this.logger.log(`Starting oracle reconciliation cycle for ${oracleAddresses.length} oracle(s)`);
+    for (const oracleAddress of oracleAddresses) {
+      if (this.shuttingDown) {
+        break;
+      }
+      await this.oracleService.reconcile(oracleContractId, oracleAddress);
+    }
   }
 }

@@ -44,6 +44,7 @@
     "helmet": "^8.3.0",
     "ioredis": "^5.3.2",
     "nest-winston": "^1.10.2",
+    "nodemailer": "^9.0.5",
     "passport": "^0.7.0",
     "passport-jwt": "^4.0.1",
     "pg": "^8.11.3",
@@ -62,6 +63,7 @@
     "@types/jest": "^29.5.11",
     "@types/multer": "^1.4.11",
     "@types/node": "^20.10.0",
+    "@types/nodemailer": "^8.0.1",
     "@types/passport-jwt": "^4.0.0",
     "@typescript-eslint/eslint-plugin": "^8.61.1",
     "@typescript-eslint/parser": "^8.61.1",
@@ -87,7 +89,10 @@
     "rootDir": "src",
     "testRegex": ".*\\.spec\\.ts$",
     "transform": {
-      "^.+\\.(t|j)s$": "ts-jest"
+      "^.+\\.(t|j)s$": ["ts-jest", { "diagnostics": false }]
+    },
+    "moduleNameMapper": {
+      "^nodemailer$": "<rootDir>/../test/__mocks__/nodemailer.js"
     },
     "collectCoverageFrom": [
       "**/*.(t|j)s"

@@ -13,6 +13,7 @@ describe('CreditScoringService', () => {
     votingPeriod: 604800,
     timelockPeriod: 86400,
     quorum: 3,
+    quorumBasisPoints: 2000,
     phMin: 6.0,
     phMax: 9.0,
     doThreshold: 5.0,

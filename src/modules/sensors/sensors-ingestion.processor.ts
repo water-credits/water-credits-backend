@@ -251,9 +251,9 @@ export class SensorsIngestionProcessor {
     }
 
     try {
-      const userIds = await this.recipients.resolveRecipients(projectId);
+      const recipients = await this.recipients.resolveRecipients(projectId);
       await Promise.all(
-        userIds.map((userId) => this.notifications.notifySensorAlert(userId, projectId, alert)),
+        recipients.map((r) => this.notifications.notifySensorAlert(r.userId, projectId, alert, r.isOwner ? r.email : undefined)),
       );
     } catch (err) {
       this.logger.error(

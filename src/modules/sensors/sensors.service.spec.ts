@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { BadRequestException, NotFoundException, ForbiddenException } from '@nestjs/common';
+import { BadRequestException, NotFoundException, ForbiddenException, ConflictException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { getQueueToken } from '@nestjs/bull';
@@ -862,24 +862,6 @@ describe('SensorsService — registerDevice', () => {
     ).rejects.toThrow('already registered');
   });
 
-  it('filters devices by projectId', async () => {
-    const devices = [{ id: 'dev-1', projectId: 'proj-1' }] as SensorDevice[];
-    deviceRepo.find.mockResolvedValue(devices);
-
-    const result = await service.getDevices('proj-1', 'owner-1', 'farmer');
-    expect(result).toEqual(devices);
-    expect(deviceRepo.find).toHaveBeenCalledWith({ where: { projectId: 'proj-1' } });
-  });
-
-  it('returns all devices when no projectId is given', async () => {
-    const devices = [{ id: 'dev-1' }, { id: 'dev-2' }] as SensorDevice[];
-    deviceRepo.find.mockResolvedValue(devices);
-
-    const result = await service.getDevices(undefined, 'admin-1', 'admin');
-    expect(result).toHaveLength(2);
-    expect(deviceRepo.find).toHaveBeenCalledWith({ order: { createdAt: 'DESC' } });
-  });
-
   it('getDeviceById returns device when found', async () => {
     const device = {
       id: 'device-uuid-1',
@@ -1128,6 +1110,122 @@ describe('SensorsService — getReadings', () => {
   });
 });
 
+describe('SensorsService — getDevices', () => {
+  let service: SensorsService;
+  let deviceRepo: MockRepo;
+  let projectAccess: { assertProjectAccess: jest.Mock; requirePrivilegedRole: jest.Mock };
+
+  function makeQb() {
+    return {
+      andWhere: jest.fn().mockReturnThis(),
+      orderBy: jest.fn().mockReturnThis(),
+      addOrderBy: jest.fn().mockReturnThis(),
+      skip: jest.fn().mockReturnThis(),
+      take: jest.fn().mockReturnThis(),
+      getMany: jest.fn().mockResolvedValue([]),
+      getManyAndCount: jest.fn().mockResolvedValue([[], 0]),
+    };
+  }
+
+  beforeEach(async () => {
+    deviceRepo = makeMockRepo();
+    projectAccess = { assertProjectAccess: jest.fn(), requirePrivilegedRole: jest.fn() };
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        SensorsService,
+        { provide: getRepositoryToken(SensorDevice), useValue: deviceRepo },
+        { provide: getRepositoryToken(SensorReading), useValue: makeMockRepo() },
+        { provide: getRepositoryToken(ReadingBatch), useValue: makeMockRepo() },
+        { provide: getQueueToken('sensor-ingestion'), useValue: { add: jest.fn() } },
+        { provide: DataSource, useValue: makeMockDataSource() },
+        { provide: SensorProjectAccessService, useValue: projectAccess },
+        {
+          provide: ConfigService,
+          useValue: {
+            get: jest.fn((key: string) => {
+              const config: Record<string, number> = {
+                'sensor.maxAgeSeconds': 86400,
+                'sensor.futureOffsetSeconds': 300,
+              };
+              return config[key] || null;
+            }),
+          },
+        },
+      ],
+    }).compile();
+
+    service = module.get<SensorsService>(SensorsService);
+  });
+
+  it('filters by projectId and offset-paginates with the default limit', async () => {
+    const devices = [{ id: 'dev-1', projectId: 'proj-1', createdAt: new Date() }] as SensorDevice[];
+    const qb = makeQb();
+    qb.getManyAndCount.mockResolvedValue([devices, 1]);
+    deviceRepo.createQueryBuilder.mockReturnValue(qb);
+
+    const result = await service.getDevices('proj-1', 'owner-1', 'farmer');
+
+    expect(projectAccess.assertProjectAccess).toHaveBeenCalledWith('owner-1', 'farmer', 'proj-1');
+    expect(projectAccess.requirePrivilegedRole).not.toHaveBeenCalled();
+    expect(deviceRepo.createQueryBuilder).toHaveBeenCalledWith('device');
+    expect(qb.andWhere).toHaveBeenCalledWith('device.project_id = :projectId', {
+      projectId: 'proj-1',
+    });
+    expect(qb.orderBy).toHaveBeenCalledWith('device.created_at', 'DESC');
+    expect(qb.addOrderBy).toHaveBeenCalledWith('device.id', 'DESC');
+    expect(qb.skip).toHaveBeenCalledWith(0);
+    expect(qb.take).toHaveBeenCalledWith(20);
+    expect(deviceRepo.find).not.toHaveBeenCalled();
+    expect(result).toEqual({ data: devices, total: 1, page: 1, limit: 20 });
+  });
+
+  it('lists all devices for privileged callers without a project filter', async () => {
+    const devices = [{ id: 'dev-1' }, { id: 'dev-2' }] as SensorDevice[];
+    const qb = makeQb();
+    qb.getManyAndCount.mockResolvedValue([devices, 2]);
+    deviceRepo.createQueryBuilder.mockReturnValue(qb);
+
+    const result = await service.getDevices(undefined, 'admin-1', 'admin');
+
+    expect(projectAccess.requirePrivilegedRole).toHaveBeenCalledWith('admin');
+    expect(projectAccess.assertProjectAccess).not.toHaveBeenCalled();
+    expect(qb.andWhere).not.toHaveBeenCalled();
+    expect(qb.orderBy).toHaveBeenCalledWith('device.created_at', 'DESC');
+    expect(result.data).toHaveLength(2);
+    expect(result.limit).toBe(20);
+    expect(result.page).toBe(1);
+    expect(result.total).toBe(2);
+  });
+
+  it('uses keyset mode when a cursor is supplied', async () => {
+    const createdAt = new Date('2026-08-01T00:00:00Z');
+    const qb = makeQb();
+    qb.getMany.mockResolvedValue([
+      { id: 'd1', createdAt },
+      { id: 'd2', createdAt },
+      { id: 'd3', createdAt },
+    ]);
+    deviceRepo.createQueryBuilder.mockReturnValue(qb);
+
+    const cursor = Buffer.from(
+      JSON.stringify({ v: new Date('2026-09-01T00:00:00Z').toISOString(), id: 'seed' }),
+    ).toString('base64url');
+
+    const result = await service.getDevices(undefined, 'admin-1', 'admin', { cursor, limit: 2 });
+
+    expect(qb.getManyAndCount).not.toHaveBeenCalled();
+    expect(qb.skip).not.toHaveBeenCalled();
+    expect(qb.take).toHaveBeenCalledWith(3);
+    expect(qb.orderBy).toHaveBeenCalledWith('device.created_at', 'DESC');
+    expect(qb.addOrderBy).toHaveBeenCalledWith('device.id', 'DESC');
+    expect(result.data).toHaveLength(2);
+    expect(result.hasMore).toBe(true);
+    expect(result.nextCursor).toBeTruthy();
+    expect(result.total).toBeUndefined();
+  });
+});
+
 describe('SensorsService — getAggregatedSummary', () => {
   let service: SensorsService;
   let readingRepo: MockRepo;
@@ -1357,5 +1455,139 @@ describe('SensorsService — validateParameters unknown key', () => {
     } as CreateReadingDto);
 
     expect(result).toBeDefined();
+  });
+});
+
+describe('SensorsService — rotateDeviceApiKey', () => {
+  let service: SensorsService;
+  let deviceRepo: MockRepo;
+  let readingRepo: MockRepo;
+  let batchRepo: MockRepo;
+
+  beforeEach(async () => {
+    deviceRepo = makeMockRepo();
+    readingRepo = makeMockRepo();
+    batchRepo = makeMockRepo();
+
+    const mockProjectsService = {
+      findById: jest.fn().mockResolvedValue({ id: 'proj-1', ownerId: 'owner-1' }),
+    };
+    const projectAccessService = new SensorProjectAccessService(
+      mockProjectsService as unknown as import('../projects/projects.service').ProjectsService,
+    );
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        SensorsService,
+        { provide: getRepositoryToken(SensorDevice), useValue: deviceRepo },
+        { provide: getRepositoryToken(SensorReading), useValue: readingRepo },
+        { provide: getRepositoryToken(ReadingBatch), useValue: batchRepo },
+        { provide: getQueueToken('sensor-ingestion'), useValue: { add: jest.fn() } },
+        { provide: DataSource, useValue: makeMockDataSource() },
+        {
+          provide: SensorProjectAccessService,
+          useValue: projectAccessService,
+        },
+        {
+          provide: ConfigService,
+          useValue: {
+            get: jest.fn(),
+          },
+        },
+      ],
+    }).compile();
+
+    service = module.get<SensorsService>(SensorsService);
+  });
+
+  it('returns a new apiKeyPlaintext on successful rotation', async () => {
+    const device = {
+      id: 'device-uuid-1',
+      deviceId: 'dev-001',
+      projectId: 'proj-1',
+      apiKeyHash: 'old-hash',
+    } as SensorDevice;
+    deviceRepo.findOne.mockResolvedValue(device);
+    deviceRepo.update.mockResolvedValue(undefined);
+
+    const result = await service.rotateDeviceApiKey('device-uuid-1', 'owner-1', 'farmer');
+
+    expect(result.apiKeyPlaintext).toBeDefined();
+    expect(result.apiKeyPlaintext).toMatch(/^wc_dev-001_/);
+    expect(deviceRepo.update).toHaveBeenCalledWith('device-uuid-1', {
+      apiKeyHash: expect.any(String),
+    });
+  });
+
+  it('throws NotFoundException when device does not exist', async () => {
+    deviceRepo.findOne.mockResolvedValue(null);
+
+    await expect(
+      service.rotateDeviceApiKey('nonexistent', 'owner-1', 'farmer'),
+    ).rejects.toThrow(NotFoundException);
+  });
+
+  it('throws ForbiddenException when caller does not own the project', async () => {
+    const device = {
+      id: 'device-uuid-1',
+      deviceId: 'dev-001',
+      projectId: 'proj-1',
+      apiKeyHash: 'old-hash',
+    } as SensorDevice;
+    deviceRepo.findOne.mockResolvedValue(device);
+
+    await expect(
+      service.rotateDeviceApiKey('device-uuid-1', 'user-b', 'farmer'),
+    ).rejects.toThrow(ForbiddenException);
+  });
+
+  it('allows rotation when caller has a privileged role (admin)', async () => {
+    const device = {
+      id: 'device-uuid-1',
+      deviceId: 'dev-001',
+      projectId: 'proj-1',
+      apiKeyHash: 'old-hash',
+    } as SensorDevice;
+    deviceRepo.findOne.mockResolvedValue(device);
+    deviceRepo.update.mockResolvedValue(undefined);
+
+    const result = await service.rotateDeviceApiKey('device-uuid-1', 'other-user', 'admin');
+
+    expect(result.apiKeyPlaintext).toBeDefined();
+  });
+
+  it('replaces the old apiKeyHash with a new one', async () => {
+    const device = {
+      id: 'device-uuid-1',
+      deviceId: 'dev-001',
+      projectId: 'proj-1',
+      apiKeyHash: 'old-hash',
+    } as SensorDevice;
+    deviceRepo.findOne.mockResolvedValue(device);
+    deviceRepo.update.mockResolvedValue(undefined);
+
+    await service.rotateDeviceApiKey('device-uuid-1', 'owner-1', 'farmer');
+
+    const updateCall = deviceRepo.update.mock.calls[0];
+    const newHash = updateCall[1].apiKeyHash;
+    expect(newHash).not.toBe('old-hash');
+    expect(newHash).toBeDefined();
+  });
+
+  it('rate-limits rotation to once per 5 minutes per device', async () => {
+    const device = {
+      id: 'device-uuid-1',
+      deviceId: 'dev-001',
+      projectId: 'proj-1',
+      apiKeyHash: 'old-hash',
+    } as SensorDevice;
+    deviceRepo.findOne.mockResolvedValue(device);
+    deviceRepo.update.mockResolvedValue(undefined);
+
+    await service.rotateDeviceApiKey('device-uuid-1', 'owner-1', 'farmer');
+
+    await expect(
+      service.rotateDeviceApiKey('device-uuid-1', 'owner-1', 'farmer'),
+    ).rejects.toThrow(ConflictException);
   });
 });

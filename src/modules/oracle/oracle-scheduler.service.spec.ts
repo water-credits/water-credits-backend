@@ -6,6 +6,7 @@ import { getRepositoryToken } from '@nestjs/typeorm';
 import { getQueueToken } from '@nestjs/bull';
 import { DataSource, FindOperator } from 'typeorm';
 import { ORACLE_SUBMISSION_CRON_NAME, OracleSchedulerService } from './oracle-scheduler.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { OracleService, AggregatedReading } from './oracle.service';
 import { OracleSubmission } from './entities/oracle-submission.entity';
 import {
@@ -20,6 +21,8 @@ import {
 } from '../sensors/entities/reading-batch.entity';
 import { SensorReading } from '../sensors/entities/sensor-reading.entity';
 import { StellarService } from '../stellar/stellar.service';
+import { GovernanceConfig } from '../governance/entities/governance-config.entity';
+import { CreditScoringService } from './credit-scoring.service';
 
 // ── In-memory repositories ────────────────────────────────────────────────────
 //
@@ -125,6 +128,7 @@ interface Harness {
   projectRepo: { find: jest.Mock };
   triggerSubmission: jest.Mock;
   aggregateReadingsForBatch: jest.Mock;
+  detectNonceDrift: jest.Mock;
   cronJob: { stop: jest.Mock };
   module: TestingModule;
 }
@@ -152,6 +156,7 @@ async function buildHarness(options: HarnessOptions = {}): Promise<Harness> {
   const oracleService = {
     aggregateReadingsForBatch: jest.fn(async () => AGGREGATE),
     triggerSubmission,
+    detectNonceDrift: jest.fn(async () => 0),
     ...options.oracleService,
   };
 
@@ -159,6 +164,7 @@ async function buildHarness(options: HarnessOptions = {}): Promise<Harness> {
     'oracle.schedulerEnabled': true,
     'oracle.address': ORACLE_ADDRESS,
     'oracle.submissionIntervalCron': '0 * * * *',
+    'oracle.contractId': 'CORACLE_CONTRACT_ID',
     ...options.config,
   };
 
@@ -167,6 +173,7 @@ async function buildHarness(options: HarnessOptions = {}): Promise<Harness> {
   const module = await Test.createTestingModule({
     providers: [
       OracleSchedulerService,
+      { provide: NotificationsService, useValue: { notifyOracleMissedSubmissions: jest.fn() } },
       { provide: OracleService, useValue: oracleService },
       {
         provide: ConfigService,
@@ -190,6 +197,7 @@ async function buildHarness(options: HarnessOptions = {}): Promise<Harness> {
     projectRepo,
     triggerSubmission: oracleService.triggerSubmission as jest.Mock,
     aggregateReadingsForBatch: oracleService.aggregateReadingsForBatch as jest.Mock,
+    detectNonceDrift: oracleService.detectNonceDrift as jest.Mock,
     cronJob,
     module,
   };
@@ -220,6 +228,7 @@ describe('OracleSchedulerService', () => {
       expect(triggerSubmission).toHaveBeenCalledWith({
         projectId: 'project-active',
         oracleAddress: ORACLE_ADDRESS,
+        batchId: 'batch-closed',
         readings: {
           oracleCount: 5,
           ph: 7.1,
@@ -297,6 +306,7 @@ describe('OracleSchedulerService', () => {
       expect(result.projectsScanned).toBe(1);
       expect(triggerSubmission).toHaveBeenCalledTimes(1);
       expect(triggerSubmission.mock.calls[0][0].projectId).toBe('project-active');
+      expect(triggerSubmission.mock.calls[0][0].batchId).toBe('batch-active');
     });
 
     it('submits older batches first', async () => {
@@ -439,11 +449,13 @@ describe('OracleSchedulerService', () => {
 
       await scheduler.runSubmissionCycle();
 
+      // upsert calls: per-project, global (schedule state), global (nonce drift)
       const scopes = scheduleStateRepo.upsert.mock.calls.map((call) => call[0].scopeId);
-      expect(scopes).toEqual(['project-active', GLOBAL_SCHEDULE_SCOPE]);
-      const global = scheduleStateRepo.upsert.mock.calls.at(-1)?.[0];
-      expect(global.lastScheduledAt).toBeInstanceOf(Date);
-      expect(global.lastSubmissionCount).toBe(1);
+      expect(scopes).toEqual(['project-active', GLOBAL_SCHEDULE_SCOPE, GLOBAL_SCHEDULE_SCOPE]);
+      // The schedule-state upsert is the second-to-last call (before the drift upsert)
+      const scheduleStateCall = scheduleStateRepo.upsert.mock.calls.at(-2)?.[0];
+      expect(scheduleStateCall.lastScheduledAt).toBeInstanceOf(Date);
+      expect(scheduleStateCall.lastSubmissionCount).toBe(1);
     });
 
     it('records the global timestamp even when nothing was due', async () => {
@@ -451,7 +463,8 @@ describe('OracleSchedulerService', () => {
 
       await scheduler.runSubmissionCycle();
 
-      expect(scheduleStateRepo.upsert).toHaveBeenCalledTimes(1);
+      // 2 upserts: schedule state + nonce drift (both on global scope)
+      expect(scheduleStateRepo.upsert).toHaveBeenCalledTimes(2);
       expect(scheduleStateRepo.upsert.mock.calls[0][0]).toMatchObject({
         scopeId: GLOBAL_SCHEDULE_SCOPE,
         lastSubmissionCount: 0,
@@ -463,6 +476,80 @@ describe('OracleSchedulerService', () => {
         batches: [makeBatch({ id: 'batch-ok' })],
       });
       scheduleStateRepo.upsert.mockRejectedValue(new Error('table missing'));
+
+      await expect(scheduler.runSubmissionCycle()).resolves.toMatchObject({ submitted: 1 });
+      expect(triggerSubmission).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ── Acceptance: nonce-drift detection ──────────────────────────────────────
+
+  describe('nonce drift', () => {
+    it('calls detectNonceDrift once per cycle with the configured contract ID and oracle address', async () => {
+      const { scheduler, detectNonceDrift } = await buildHarness({
+        batches: [makeBatch({ id: 'batch-drift' })],
+      });
+
+      await scheduler.runSubmissionCycle();
+
+      expect(detectNonceDrift).toHaveBeenCalledTimes(1);
+      expect(detectNonceDrift).toHaveBeenCalledWith('CORACLE_CONTRACT_ID', ORACLE_ADDRESS);
+    });
+
+    it('persists the drift value returned by detectNonceDrift', async () => {
+      const { scheduler, scheduleStateRepo } = await buildHarness({
+        batches: [],
+        oracleService: { detectNonceDrift: jest.fn(async () => 3) } as unknown as Partial<OracleService>,
+      });
+
+      await scheduler.runSubmissionCycle();
+
+      const driftUpsert = scheduleStateRepo.upsert.mock.calls.find(
+        (call) => call[0].lastNonceDrift !== undefined,
+      );
+      expect(driftUpsert).toBeDefined();
+      expect(driftUpsert![0]).toMatchObject({
+        scopeId: GLOBAL_SCHEDULE_SCOPE,
+        lastNonceDrift: 3,
+      });
+    });
+
+    it('persists null when detectNonceDrift returns null (RPC failure)', async () => {
+      const { scheduler, scheduleStateRepo } = await buildHarness({
+        batches: [],
+        oracleService: { detectNonceDrift: jest.fn(async () => null) } as unknown as Partial<OracleService>,
+      });
+
+      await scheduler.runSubmissionCycle();
+
+      const driftUpsert = scheduleStateRepo.upsert.mock.calls.find(
+        (call) => call[0].lastNonceDrift !== undefined,
+      );
+      expect(driftUpsert![0].lastNonceDrift).toBeNull();
+    });
+
+    it('skips the drift check when oracle.contractId is not configured', async () => {
+      const { scheduler, detectNonceDrift } = await buildHarness({
+        batches: [],
+        config: { 'oracle.contractId': '' },
+      });
+
+      await scheduler.runSubmissionCycle();
+
+      expect(detectNonceDrift).not.toHaveBeenCalled();
+    });
+
+    it('does not fail the cycle when the drift upsert throws', async () => {
+      const { scheduler, scheduleStateRepo, triggerSubmission } = await buildHarness({
+        batches: [makeBatch({ id: 'batch-drift-error' })],
+      });
+      // Make only the drift upsert (the one carrying lastNonceDrift) throw.
+      scheduleStateRepo.upsert.mockImplementation(async (entity: Record<string, unknown>) => {
+        if (entity.lastNonceDrift !== undefined) {
+          throw new Error('column missing');
+        }
+        return { identifiers: [] };
+      });
 
       await expect(scheduler.runSubmissionCycle()).resolves.toMatchObject({ submitted: 1 });
       expect(triggerSubmission).toHaveBeenCalledTimes(1);
@@ -527,7 +614,7 @@ describe('OracleSchedulerService', () => {
 
       scheduler.onApplicationShutdown('SIGTERM');
 
-      expect(cronJob.stop).toHaveBeenCalledTimes(1);
+      expect(cronJob.stop).toHaveBeenCalled();
     });
 
     it('survives shutdown when no cron job was registered', async () => {
@@ -673,6 +760,7 @@ describe('OracleSchedulerService + manual POST /oracle/trigger (advisory lock)',
       providers: [
         OracleService,
         OracleSchedulerService,
+        { provide: NotificationsService, useValue: { notifyOracleMissedSubmissions: jest.fn() } },
         { provide: getRepositoryToken(OracleSubmission), useValue: { find: jest.fn() } },
         {
           provide: getRepositoryToken(SensorReading),
@@ -693,6 +781,8 @@ describe('OracleSchedulerService + manual POST /oracle/trigger (advisory lock)',
         },
         { provide: getRepositoryToken(ReadingBatch), useValue: batchRepo },
         { provide: getRepositoryToken(OracleScheduleState), useValue: { upsert: jest.fn() } },
+        { provide: getRepositoryToken(GovernanceConfig), useValue: { findOne: jest.fn() } },
+        { provide: CreditScoringService, useValue: { calculate: jest.fn() } },
         {
           provide: ConfigService,
           useValue: {

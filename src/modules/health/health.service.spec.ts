@@ -14,9 +14,11 @@ describe('HealthService checkStellar signing_ready', () => {
     signingReady: boolean;
     getLatestLedger?: () => Promise<{ sequence: number }>;
     authRedisPing?: () => Promise<void>;
+    scheduleState?: Partial<{ lastScheduledAt: Date; lastSubmissionCount: number; lastNonceDrift: number | null }> | null;
   }) {
     const getLatestLedger = opts.getLatestLedger ?? (async () => ({ sequence: 100 }));
     const authRedisPing = opts.authRedisPing ?? (async () => undefined);
+    const scheduleState = opts.scheduleState === undefined ? null : opts.scheduleState;
 
     const moduleRef = await Test.createTestingModule({
       providers: [
@@ -53,7 +55,7 @@ describe('HealthService checkStellar signing_ready', () => {
         },
         {
           provide: getRepositoryToken(OracleScheduleState),
-          useValue: { findOne: jest.fn().mockResolvedValue(null) },
+          useValue: { findOne: jest.fn().mockResolvedValue(scheduleState) },
         },
         {
           provide: ConfigService,
@@ -161,5 +163,107 @@ describe('HealthService checkStellar signing_ready', () => {
 
     expect(report.checks.redis.status).toBe('ok');
     expect(report.checks.authRedis.status).toBe('down');
+  });
+
+  // ── nonce_drift (#119) ───────────────────────────────────────────────
+
+  it('includes nonce_drift=null when no schedule state exists yet', async () => {
+    const service = await buildService({ signingReady: true });
+    const report = await service.getHealth();
+
+    expect(report.checks.oracle.nonce_drift).toBeNull();
+  });
+
+  it('includes nonce_drift=0 when drift is zero', async () => {
+    const service = await buildService({
+      signingReady: true,
+      scheduleState: {
+        lastScheduledAt: new Date(Date.now() - 30_000),
+        lastSubmissionCount: 1,
+        lastNonceDrift: 0,
+      },
+    });
+    const report = await service.getHealth();
+
+    expect(report.checks.oracle.nonce_drift).toBe(0);
+    expect(report.checks.oracle.status).toBe('ok');
+  });
+
+  it('sets oracle status=degraded and surfaces nonce_drift when drift > 1', async () => {
+    const service = await buildService({
+      signingReady: true,
+      scheduleState: {
+        lastScheduledAt: new Date(Date.now() - 30_000),
+        lastSubmissionCount: 2,
+        lastNonceDrift: 3,
+      },
+    });
+    const report = await service.getHealth();
+
+    expect(report.checks.oracle.nonce_drift).toBe(3);
+    expect(report.checks.oracle.status).toBe('degraded');
+    expect(report.checks.oracle.detail).toMatch(/nonce drift=3/);
+    expect(report.status).toBe('degraded');
+  });
+
+  it('sets oracle status=degraded for negative drift > 1 in magnitude', async () => {
+    const service = await buildService({
+      signingReady: true,
+      scheduleState: {
+        lastScheduledAt: new Date(Date.now() - 30_000),
+        lastSubmissionCount: 1,
+        lastNonceDrift: -2,
+      },
+    });
+    const report = await service.getHealth();
+
+    expect(report.checks.oracle.nonce_drift).toBe(-2);
+    expect(report.checks.oracle.status).toBe('degraded');
+  });
+
+  it('keeps oracle status=ok when drift is exactly 1', async () => {
+    const service = await buildService({
+      signingReady: true,
+      scheduleState: {
+        lastScheduledAt: new Date(Date.now() - 30_000),
+        lastSubmissionCount: 1,
+        lastNonceDrift: 1,
+      },
+    });
+    const report = await service.getHealth();
+
+    expect(report.checks.oracle.nonce_drift).toBe(1);
+    expect(report.checks.oracle.status).toBe('ok');
+  });
+
+  it('sets nonce_drift=null when lastNonceDrift is null (RPC failed during last cycle)', async () => {
+    const service = await buildService({
+      signingReady: true,
+      scheduleState: {
+        lastScheduledAt: new Date(Date.now() - 30_000),
+        lastSubmissionCount: 1,
+        lastNonceDrift: null,
+      },
+    });
+    const report = await service.getHealth();
+
+    expect(report.checks.oracle.nonce_drift).toBeNull();
+    expect(report.checks.oracle.status).toBe('ok');
+  });
+
+  it('combines staleness and drift degradation in the detail string', async () => {
+    const service = await buildService({
+      signingReady: true,
+      scheduleState: {
+        lastScheduledAt: new Date(Date.now() - 3 * 3600 * 1000), // 3h ago, default threshold 2h
+        lastSubmissionCount: 0,
+        lastNonceDrift: 5,
+      },
+    });
+    const report = await service.getHealth();
+
+    expect(report.checks.oracle.status).toBe('degraded');
+    expect(report.checks.oracle.detail).toMatch(/last cycle was/);
+    expect(report.checks.oracle.detail).toMatch(/nonce drift=5/);
   });
 });

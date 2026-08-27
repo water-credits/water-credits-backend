@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { AnalyticsService } from './analytics.service';
+import { RedisCacheService } from './redis-cache.service';
 import { Project, ProjectStatus } from '../projects/entities/project.entity';
 import { Retirement } from '../credits/entities/retirement.entity';
 import { ReadingBatch, BatchStatus } from '../sensors/entities/reading-batch.entity';
@@ -61,6 +62,22 @@ function makeUserRepo() {
   return {};
 }
 
+function makeRedisCacheService() {
+  const store = new Map<string, unknown>();
+  return {
+    get: jest.fn(async <T>(key: string): Promise<T | null> => {
+      return (store.get(key) as T) ?? null;
+    }),
+    set: jest.fn(async <T>(key: string, value: T): Promise<void> => {
+      store.set(key, value);
+    }),
+    clear: jest.fn(async (_pattern: string = 'analytics:*'): Promise<void> => {
+      store.clear();
+    }),
+    _store: store,
+  };
+}
+
 // ── Test suite ────────────────────────────────────────────────────────────────
 
 describe('AnalyticsService', () => {
@@ -68,11 +85,13 @@ describe('AnalyticsService', () => {
   let projectRepo: ReturnType<typeof makeProjectRepo>;
   let retirementRepo: ReturnType<typeof makeRetirementRepo>;
   let readingBatchRepo: ReturnType<typeof makeReadingBatchRepo>;
+  let cacheService: ReturnType<typeof makeRedisCacheService>;
 
   beforeEach(async () => {
     projectRepo = makeProjectRepo();
     retirementRepo = makeRetirementRepo();
     readingBatchRepo = makeReadingBatchRepo();
+    cacheService = makeRedisCacheService();
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -81,6 +100,7 @@ describe('AnalyticsService', () => {
         { provide: getRepositoryToken(Retirement), useValue: retirementRepo },
         { provide: getRepositoryToken(ReadingBatch), useValue: readingBatchRepo },
         { provide: getRepositoryToken(User), useValue: makeUserRepo() },
+        { provide: RedisCacheService, useValue: cacheService },
       ],
     }).compile();
 
@@ -94,8 +114,8 @@ describe('AnalyticsService', () => {
   // ── Cache behaviour ─────────────────────────────────────────────────────
 
   describe('caching', () => {
-    beforeEach(() => {
-      service.clearCache();
+    beforeEach(async () => {
+      await service.clearCache();
     });
 
     it('serves getOverview from cache on second call', async () => {
@@ -112,6 +132,7 @@ describe('AnalyticsService', () => {
 
       const first = await service.getOverview();
       expect(projectRepo.count).toHaveBeenCalledTimes(2);
+      expect(cacheService.set).toHaveBeenCalledWith('analytics:overview', first);
 
       const second = await service.getOverview();
       expect(second).toEqual(first);
@@ -134,7 +155,8 @@ describe('AnalyticsService', () => {
       await service.getOverview();
       expect(projectRepo.count).toHaveBeenCalledTimes(2);
 
-      service.clearCache();
+      await service.clearCache();
+      expect(cacheService.clear).toHaveBeenCalledWith('analytics:*');
 
       projectRepo.count.mockResolvedValueOnce(2);
       projectRepo.count.mockResolvedValueOnce(1);
@@ -151,6 +173,98 @@ describe('AnalyticsService', () => {
       expect(projectRepo.count).toHaveBeenCalledTimes(4);
       expect(fresh.totalProjects).toBe(2);
     });
+
+    it('serves getCreditsOverTime from cache on second call', async () => {
+      const batchQb = makeQueryBuilder();
+      batchQb.getRawMany.mockResolvedValue([{ month: '2026-01-01', amount: '100' }]);
+      readingBatchRepo.createQueryBuilder.mockReturnValueOnce(batchQb);
+
+      const retirementQb = makeQueryBuilder();
+      retirementQb.getRawMany.mockResolvedValue([{ month: '2026-01-01', amount: '50' }]);
+      retirementRepo.createQueryBuilder.mockReturnValueOnce(retirementQb);
+
+      const first = await service.getCreditsOverTime();
+      expect(readingBatchRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+
+      const second = await service.getCreditsOverTime();
+      expect(second).toEqual(first);
+      expect(readingBatchRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+    });
+
+    it('serves getProjectDistribution from cache on second call', async () => {
+      const statusQb = makeQueryBuilder();
+      statusQb.getRawMany.mockResolvedValue([{ status: 'active', count: '1' }]);
+      const methodologyQb = makeQueryBuilder();
+      methodologyQb.getRawMany.mockResolvedValue([{ methodology: 'VM0036', count: '1' }]);
+
+      projectRepo.createQueryBuilder
+        .mockReturnValueOnce(statusQb)
+        .mockReturnValueOnce(methodologyQb);
+
+      const first = await service.getProjectDistribution();
+      expect(projectRepo.createQueryBuilder).toHaveBeenCalledTimes(2);
+
+      const second = await service.getProjectDistribution();
+      expect(second).toEqual(first);
+      expect(projectRepo.createQueryBuilder).toHaveBeenCalledTimes(2);
+    });
+
+    it('serves getRetirementByPurpose from cache on second call', async () => {
+      const qb = makeQueryBuilder();
+      qb.getRawMany.mockResolvedValue([{ purpose: 'voluntary', amount: '1000' }]);
+      retirementRepo.createQueryBuilder.mockReturnValueOnce(qb);
+
+      const first = await service.getRetirementByPurpose();
+      expect(retirementRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+
+      const second = await service.getRetirementByPurpose();
+      expect(second).toEqual(first);
+      expect(retirementRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+    });
+
+    it('serves getTopProjects from cache on second call', async () => {
+      const qb = makeQueryBuilder();
+      qb.getRawMany.mockResolvedValue([{ id: 'p1', name: 'Proj', totalGenerated: '500' }]);
+      readingBatchRepo.createQueryBuilder.mockReturnValueOnce(qb);
+
+      const first = await service.getTopProjects(5);
+      expect(readingBatchRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+
+      const second = await service.getTopProjects(5);
+      expect(second).toEqual(first);
+      expect(readingBatchRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+    });
+
+    it('serves getTopRetirees from cache on second call', async () => {
+      const qb = makeQueryBuilder();
+      qb.getRawMany.mockResolvedValue([{ id: 'u1', name: 'User', totalRetired: '200' }]);
+      retirementRepo.createQueryBuilder.mockReturnValueOnce(qb);
+
+      const first = await service.getTopRetirees(5);
+      expect(retirementRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+
+      const second = await service.getTopRetirees(5);
+      expect(second).toEqual(first);
+      expect(retirementRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+    });
+
+    it('falls through to DB when cache get fails or returns null', async () => {
+      cacheService.get.mockResolvedValueOnce(null);
+      projectRepo.count.mockResolvedValueOnce(5);
+      projectRepo.count.mockResolvedValueOnce(2);
+
+      const batchQb = makeQueryBuilder();
+      batchQb.getRawOne.mockResolvedValue({ total: '100' });
+      readingBatchRepo.createQueryBuilder.mockReturnValueOnce(batchQb);
+
+      const retirementQb = makeQueryBuilder();
+      retirementQb.getRawOne.mockResolvedValue({ total: '50' });
+      retirementRepo.createQueryBuilder.mockReturnValueOnce(retirementQb);
+
+      const result = await service.getOverview();
+      expect(result.totalProjects).toBe(5);
+      expect(projectRepo.count).toHaveBeenCalledTimes(2);
+    });
   });
 
   // ── getOverview ──────────────────────────────────────────────────────────
@@ -158,6 +272,7 @@ describe('AnalyticsService', () => {
   describe('getOverview', () => {
     it('returns aggregated overview data', async () => {
       projectRepo.count.mockResolvedValueOnce(42);
+
       projectRepo.count.mockResolvedValueOnce(12);
 
       const batchQb = makeQueryBuilder();

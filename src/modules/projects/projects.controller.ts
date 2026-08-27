@@ -39,8 +39,8 @@ export class ProjectsController {
   @Public()
   @ApiOperation({ summary: 'List projects (filterable and paginated)' })
   async findAll(@Query() query: QueryProjectsDto): Promise<PaginatedResponseDto<Project>> {
-    const { data, total, page, limit } = await this.projectsService.findAll(query);
-    return PaginatedResponseDto.from(data, total, page, limit);
+    const result = await this.projectsService.findAll(query);
+    return PaginatedResponseDto.fromList(result);
   }
 
   @Get(':id')

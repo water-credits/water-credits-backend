@@ -6,12 +6,18 @@ import {
   ForbiddenException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, Brackets, SelectQueryBuilder } from 'typeorm';
+import { Repository, Brackets } from 'typeorm';
 import { Project, ProjectStatus } from './entities/project.entity';
 import { CreateProjectDto } from './dto/create-project.dto';
 import { UpdateProjectDto } from './dto/update-project.dto';
 import { QueryProjectsDto, SortOrder } from './dto/query-projects.dto';
 import { UserRole } from '../users/entities/user.entity';
+import {
+  paginate,
+  KeysetColumns,
+  PaginatedList,
+  SortDirection,
+} from '../../common/pagination/keyset-paginator';
 
 const VALID_TRANSITIONS: Record<ProjectStatus, ProjectStatus[]> = {
   [ProjectStatus.DRAFT]: [ProjectStatus.REGISTERED],
@@ -107,9 +113,7 @@ export class ProjectsService {
     return this.update(id, { status }, userId);
   }
 
-  async findAll(
-    query: QueryProjectsDto,
-  ): Promise<{ data: Project[]; total: number; page: number; limit: number }> {
+  async findAll(query: QueryProjectsDto): Promise<PaginatedList<Project>> {
     const qb = this.projectRepo.createQueryBuilder('project');
 
     if (query.status) {
@@ -150,32 +154,54 @@ export class ProjectsService {
       });
     }
 
-    this.applySorting(qb, query.sortBy, query.sortOrder);
+    const cols = this.resolveKeyset(query.sortBy, query.sortOrder);
 
-    qb.skip(query.skip).take(query.limit);
-
-    const [data, total] = await qb.getManyAndCount();
-    return { data, total, page: query.page ?? 1, limit: query.limit ?? 20 };
+    return paginate(qb, cols, {
+      cursor: query.cursor,
+      page: query.page,
+      limit: query.limit,
+    });
   }
 
-  private applySorting(
-    qb: SelectQueryBuilder<Project>,
-    sortBy?: string,
-    sortOrder?: SortOrder,
-  ): void {
-    const allowedSortColumns = [
-      'name',
-      'status',
-      'methodology',
-      'area_hectares',
-      'created_at',
-      'updated_at',
-      'latitude',
-      'longitude',
-    ];
-    const column = sortBy && allowedSortColumns.includes(sortBy) ? sortBy : 'created_at';
-    const order = sortOrder === SortOrder.ASC ? 'ASC' : 'DESC';
-    qb.orderBy(`project.${column}`, order);
+  /**
+   * Map a caller-supplied sort column (snake_case SQL name from the allowlist)
+   * to a {@link KeysetColumns} descriptor understood by the `paginate()` helper.
+   *
+   * The allowlist doubles as a validation guard — any unknown column silently
+   * falls back to `created_at` so that injection via the `sortBy` query
+   * parameter is impossible.
+   *
+   * `sortProperty` must be the *entity property name* (camelCase) that TypeORM
+   * reads back off a result row, because `paginate()` uses it to extract the
+   * cursor value from the last returned entity.
+   */
+  private resolveKeyset(sortBy?: string, sortOrder?: SortOrder): KeysetColumns<Project> {
+    /**
+     * Maps SQL column name (used in ORDER BY expressions) → entity property
+     * (used to read the cursor value off a result row).
+     */
+    const SORT_COLUMN_MAP: Record<string, keyof Project> = {
+      name: 'name',
+      status: 'status',
+      methodology: 'methodology',
+      area_hectares: 'areaHectares',
+      created_at: 'createdAt',
+      updated_at: 'updatedAt',
+      latitude: 'latitude',
+      longitude: 'longitude',
+    };
+
+    const sqlColumn =
+      sortBy !== undefined && sortBy in SORT_COLUMN_MAP ? sortBy : 'created_at';
+    const sortProperty = SORT_COLUMN_MAP[sqlColumn];
+    const direction: SortDirection = sortOrder === SortOrder.ASC ? 'ASC' : 'DESC';
+
+    return {
+      alias: 'project',
+      sortColumn: `project.${sqlColumn}`,
+      sortProperty,
+      direction,
+    };
   }
 
   async countByOwner(ownerId: string): Promise<number> {

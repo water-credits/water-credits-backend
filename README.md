@@ -1170,6 +1170,10 @@ REDIS_HOST=localhost
 REDIS_PORT=6379
 REDIS_PASSWORD=
 
+# WebSocket Redis adapter
+# Startup wait before SensorsGateway keeps the in-process adapter (milliseconds)
+WS_REDIS_CONNECT_TIMEOUT_MS=5000
+
 # ── Stellar Network ──
 STELLAR_NETWORK=testnet                   # testnet | public
 STELLAR_RPC_URL=https://soroban-testnet.stellar.org

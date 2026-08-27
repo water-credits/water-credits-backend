@@ -2,13 +2,17 @@ import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
-import { Repository, DataSource, MoreThan, SelectQueryBuilder } from 'typeorm';
+import { Repository, DataSource, MoreThan, SelectQueryBuilder, In, LessThanOrEqual } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { OracleSubmission, SubmissionStatus } from './entities/oracle-submission.entity';
 import { OracleQueryDto } from './dto/oracle-query.dto';
 import { TriggerSubmissionDto } from './dto/trigger-submission.dto';
 import { StellarService } from '../stellar/stellar.service';
 import { SensorReading } from '../sensors/entities/sensor-reading.entity';
+import { Project } from '../projects/entities/project.entity';
+import { GovernanceConfig } from '../governance/entities/governance-config.entity';
+import { ReadingBatch, BatchStatus } from '../sensors/entities/reading-batch.entity';
+import { CreditScoringService } from './credit-scoring.service';
 import { paginate, PaginatedList } from '../../common/pagination';
 
 export interface AggregatedReading {
@@ -54,6 +58,13 @@ export class OracleService {
     private readonly configService: ConfigService,
     private readonly dataSource: DataSource,
     private readonly stellarService: StellarService,
+    @InjectRepository(Project)
+    private readonly projectRepo: Repository<Project>,
+    @InjectRepository(GovernanceConfig)
+    private readonly governanceConfigRepo: Repository<GovernanceConfig>,
+    @InjectRepository(ReadingBatch)
+    private readonly batchRepo: Repository<ReadingBatch>,
+    private readonly creditScoringService: CreditScoringService,
   ) {}
 
   async getStatus(): Promise<{
@@ -135,6 +146,7 @@ export class OracleService {
 
       const submission = queryRunner.manager.create(OracleSubmission, {
         projectId: dto.projectId,
+        batchId: dto.batchId ?? null,
         oracleAddress: dto.oracleAddress,
         nonce,
         txHash: '',
@@ -156,6 +168,7 @@ export class OracleService {
       {
         submissionId: saved.id,
         projectId: dto.projectId,
+        batchId: saved.batchId,
         oracleAddress: dto.oracleAddress,
         nonce: saved.nonce,
       },
@@ -259,11 +272,14 @@ export class OracleService {
   // ── Nonce-gap detection ─────────────────────────────────────────────────
 
   /**
-   * Logs a warning when the local max confirmed nonce diverges from the
-   * on-chain oracle nonce by more than 1 (indicating a missed or desynced
-   * submission).
+   * Compares the local max confirmed nonce against the on-chain oracle nonce
+   * and returns the signed drift (`onChain - local`).
+   *
+   * Returns `null` when the RPC call fails (error is swallowed so a
+   * transient network blip never blocks a submission cycle). Logs a warning
+   * when `|diff| > 1`.
    */
-  async detectNonceDrift(oracleContractId: string, oracleAddress: string): Promise<void> {
+  async detectNonceDrift(oracleContractId: string, oracleAddress: string): Promise<number | null> {
     const localMax = await this.submissionRepo.findOne({
       where: { oracleAddress, status: SubmissionStatus.CONFIRMED },
       order: { nonce: 'DESC' },
@@ -275,7 +291,7 @@ export class OracleService {
       onChainNonce = await this.stellarService.getOracleNonce(oracleContractId, oracleAddress);
     } catch {
       this.logger.warn(`detectNonceDrift: could not read on-chain nonce for ${oracleAddress}`);
-      return;
+      return null;
     }
 
     const diff = onChainNonce - localNonce;
@@ -285,6 +301,7 @@ export class OracleService {
           `local=${localNonce} on-chain=${onChainNonce} diff=${diff}`,
       );
     }
+    return diff;
   }
 
   /**
@@ -314,5 +331,149 @@ export class OracleService {
 
   private nullableNumber(value: string | null): number | null {
     return value === null ? null : parseFloat(value);
+  }
+
+  async getUniqueOracleAddresses(): Promise<string[]> {
+    const result = await this.submissionRepo
+      .createQueryBuilder('submission')
+      .select('DISTINCT submission.oracle_address', 'oracleAddress')
+      .getRawMany<{ oracleAddress: string }>();
+    return result.map((r) => r.oracleAddress).filter(Boolean);
+  }
+
+  private async findSubmittedBatchForSubmission(
+    submission: OracleSubmission,
+  ): Promise<ReadingBatch | null> {
+    if (!submission.batchId) {
+      this.logger.warn(
+        `Oracle submission ${submission.id} has no batchId; skipping reconciliation batch credit update`,
+      );
+      return null;
+    }
+
+    const batch = await this.batchRepo.findOne({
+      where: {
+        id: submission.batchId,
+        projectId: submission.projectId,
+        status: BatchStatus.SUBMITTED,
+      },
+    });
+
+    if (!batch) {
+      this.logger.warn(
+        `Batch ${submission.batchId} for oracle submission ${submission.id} was not found in SUBMITTED status during reconciliation`,
+      );
+    }
+
+    return batch;
+  }
+
+  async reconcile(oracleContractId: string, oracleAddress: string): Promise<void> {
+    let onChainNonce: number;
+    try {
+      onChainNonce = await this.stellarService.getOracleNonce(oracleContractId, oracleAddress);
+    } catch (error) {
+      this.logger.error(
+        `reconcile: could not read on-chain nonce for ${oracleAddress}: ${(error as Error).message}`,
+      );
+      return;
+    }
+
+    await this.detectNonceDrift(oracleContractId, oracleAddress);
+
+    const staleSubmissions = await this.findStaleSubmissions(oracleContractId, oracleAddress);
+    if (staleSubmissions.length > 0) {
+      this.logger.log(
+        `Found ${staleSubmissions.length} stale submissions for oracle ${oracleAddress}`,
+      );
+
+      staleSubmissions.sort((a, b) => a.nonce - b.nonce);
+
+      let currentExpectedNonce = onChainNonce + 1;
+
+      for (let i = 0; i < staleSubmissions.length; i++) {
+        const sub = staleSubmissions[i];
+        sub.nonce = currentExpectedNonce;
+        sub.status = SubmissionStatus.PENDING;
+        await this.submissionRepo.save(sub);
+
+        await this.oracleQueue.add(
+          'oracle-submit-job',
+          {
+            submissionId: sub.id,
+            projectId: sub.projectId,
+            batchId: sub.batchId,
+            oracleAddress: sub.oracleAddress,
+            nonce: sub.nonce,
+          },
+          {
+            attempts: 3,
+            backoff: { type: 'fixed', delay: 10000 },
+            removeOnComplete: 50,
+            delay: i * 5000,
+          },
+        );
+
+        currentExpectedNonce++;
+      }
+    }
+
+    const gapSubmissions = await this.submissionRepo.find({
+      where: {
+        oracleAddress,
+        status: In([SubmissionStatus.PENDING, SubmissionStatus.FAILED]),
+        nonce: LessThanOrEqual(onChainNonce),
+      },
+      order: { nonce: 'ASC' },
+    });
+
+    if (gapSubmissions.length > 0) {
+      this.logger.log(
+        `Found ${gapSubmissions.length} gap/unconfirmed submissions for oracle ${oracleAddress}`,
+      );
+
+      for (const sub of gapSubmissions) {
+        sub.status = SubmissionStatus.CONFIRMED;
+        sub.txHash = sub.txHash || 'reconciled-on-chain';
+        sub.result = {
+          confirmed: true,
+          confirmedAt: new Date().toISOString(),
+          oracleAddress,
+          nonce: sub.nonce,
+          reconciled: true,
+        };
+        await this.submissionRepo.save(sub);
+
+        try {
+          const project = await this.projectRepo.findOne({ where: { id: sub.projectId } });
+          const config = await this.governanceConfigRepo.findOne({ order: { id: 'DESC' } });
+
+          if (project && config) {
+            const credits = this.creditScoringService.calculate(
+              sub.readingsSnapshot,
+              config,
+              Number(project.areaHectares),
+            );
+
+            const batch = await this.findSubmittedBatchForSubmission(sub);
+
+            if (batch) {
+              batch.status = BatchStatus.CONFIRMED;
+              batch.confirmedAt = new Date();
+              batch.creditsGenerated = credits.toNumber();
+              await this.batchRepo.save(batch);
+              this.logger.log(
+                `Calculated ${batch.creditsGenerated} credits for batch ${batch.id} during reconciliation`,
+              );
+            }
+          }
+        } catch (err) {
+          this.logger.error(
+            `Error calculating credits for submission ${sub.id} during reconciliation`,
+            err,
+          );
+        }
+      }
+    }
   }
 }

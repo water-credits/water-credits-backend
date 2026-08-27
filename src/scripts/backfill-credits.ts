@@ -73,21 +73,16 @@ async function run() {
       continue;
     }
 
-    // Find the latest confirmed submission for this project around or after
-    // the batch's creation time.
-    const submission = await submissionRepo
-      .createQueryBuilder('submission')
-      .where('submission.projectId = :projectId', {
+    const submission = await submissionRepo.findOne({
+      where: {
+        batchId: batch.id,
         projectId: batch.projectId,
-      })
-      .andWhere('submission.status = :status', {
         status: SubmissionStatus.CONFIRMED,
-      })
-      .orderBy('submission.createdAt', 'DESC')
-      .getOne();
+      },
+    });
 
     if (!submission) {
-      console.log(`  No confirmed submission found for batch ${batch.id} - skipping.`);
+      console.log(`  No confirmed submission linked to batch ${batch.id} - skipping.`);
       continue;
     }
 

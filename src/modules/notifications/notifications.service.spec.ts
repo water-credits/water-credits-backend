@@ -3,6 +3,9 @@ import { NotificationsService } from './notifications.service';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Notification } from './entities/notification.entity';
 import { NotificationsGateway } from './notifications.gateway';
+import { EmailService } from './email.service';
+import { ProjectsService } from '../projects/projects.service';
+import { UsersService } from '../users/users.service';
 
 // Chainable QueryBuilder mock covering the surface the `paginate()` helper uses.
 function makeQb() {
@@ -40,6 +43,18 @@ describe('NotificationsService', () => {
         {
           provide: getRepositoryToken(Notification),
           useValue: repo,
+        },
+        {
+          provide: EmailService,
+          useValue: { sendMail: jest.fn() },
+        },
+        {
+          provide: ProjectsService,
+          useValue: { findById: jest.fn() },
+        },
+        {
+          provide: UsersService,
+          useValue: { findById: jest.fn(), findByRoles: jest.fn() },
         },
         {
           provide: NotificationsGateway,

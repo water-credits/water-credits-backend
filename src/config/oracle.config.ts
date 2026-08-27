@@ -32,4 +32,5 @@ export default registerAs('oracle', () => ({
     process.env.ORACLE_STALENESS_THRESHOLD_S || `${DEFAULT_ORACLE_STALENESS_THRESHOLD_S}`,
     10,
   ),
+  missedSubmissionsThreshold: parseInt(process.env.ORACLE_MISSED_SUBMISSIONS_THRESHOLD || '3', 10),
 }));

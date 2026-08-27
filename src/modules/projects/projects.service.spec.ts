@@ -7,6 +7,8 @@ import { CreateProjectDto } from './dto/create-project.dto';
 import { UpdateProjectDto } from './dto/update-project.dto';
 import { QueryProjectsDto, SortOrder } from './dto/query-projects.dto';
 import { UserRole } from '../users/entities/user.entity';
+import * as keysetPaginator from '../../common/pagination/keyset-paginator';
+import { PaginatedList } from '../../common/pagination/keyset-paginator';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -58,8 +60,10 @@ function makeQueryBuilder(overrides: Partial<Record<string, jest.Mock>> = {}) {
   return {
     andWhere: jest.fn().mockReturnThis(),
     orderBy: jest.fn().mockReturnThis(),
+    addOrderBy: jest.fn().mockReturnThis(),
     skip: jest.fn().mockReturnThis(),
     take: jest.fn().mockReturnThis(),
+    getMany: jest.fn().mockResolvedValue([]),
     getManyAndCount: jest.fn().mockResolvedValue([[], 0]),
     ...overrides,
   };
@@ -326,107 +330,250 @@ describe('ProjectsService', () => {
         name: 'Alpha',
         methodology: 'VM001',
         status: ProjectStatus.ACTIVE,
+        createdAt: new Date('2026-06-01T00:00:00Z'),
       }),
       makeProject({
         id: 'proj-2',
         name: 'Beta',
         methodology: 'VM002',
         status: ProjectStatus.DRAFT,
+        createdAt: new Date('2026-05-01T00:00:00Z'),
       }),
     ];
 
-    it('returns paginated results with default sort (created_at DESC)', async () => {
-      const qb = makeQueryBuilder({
-        getManyAndCount: jest.fn().mockResolvedValue([projects, 2]),
-      });
-      projectRepo.createQueryBuilder.mockReturnValue(qb);
+    // Helper: build an offset-mode PaginatedList
+    function offsetList(
+      data: Project[],
+      total: number,
+      page = 1,
+      limit = 20,
+    ): PaginatedList<Project> {
+      return { data, total, page, limit };
+    }
 
-      const query = { page: 1, limit: 20, skip: 0 } as QueryProjectsDto;
+    // Helper: build a cursor-mode PaginatedList
+    function cursorList(
+      data: Project[],
+      nextCursor: string | null = null,
+      hasMore = false,
+      limit = 20,
+    ): PaginatedList<Project> {
+      return { data, limit, nextCursor, hasMore };
+    }
+
+    let paginateSpy: jest.SpyInstance;
+
+    beforeEach(() => {
+      // Spy on the real paginate() so we can control its output without needing
+      // a live DB. Individual tests override the resolved value as needed.
+      paginateSpy = jest
+        .spyOn(keysetPaginator, 'paginate')
+        .mockResolvedValue(offsetList([], 0));
+    });
+
+    afterEach(() => {
+      paginateSpy.mockRestore();
+    });
+
+    // ── offset mode ────────────────────────────────────────────────────────
+
+    it('returns a PaginatedList in offset mode (page + limit, no cursor)', async () => {
+      paginateSpy.mockResolvedValue(offsetList(projects, 2, 1, 20));
+      projectRepo.createQueryBuilder.mockReturnValue(makeQueryBuilder());
+
+      const query = { page: 1, limit: 20 } as QueryProjectsDto;
       const result = await service.findAll(query);
 
       expect(result.data).toEqual(projects);
       expect(result.total).toBe(2);
       expect(result.page).toBe(1);
       expect(result.limit).toBe(20);
-      expect(qb.orderBy).toHaveBeenCalledWith('project.created_at', 'DESC');
+      // Cursor fields must be absent in offset mode
+      expect(result.nextCursor).toBeUndefined();
+      expect(result.hasMore).toBeUndefined();
     });
 
-    it('filters by status', async () => {
+    it('passes page, limit, and no cursor to paginate() in offset mode', async () => {
+      projectRepo.createQueryBuilder.mockReturnValue(makeQueryBuilder());
+
+      const query = { page: 2, limit: 10 } as QueryProjectsDto;
+      await service.findAll(query);
+
+      expect(paginateSpy).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ alias: 'project' }),
+        { cursor: undefined, page: 2, limit: 10 },
+      );
+    });
+
+    it('uses defaults when page and limit are not provided', async () => {
+      paginateSpy.mockResolvedValue(offsetList([], 0, 1, 20));
+      projectRepo.createQueryBuilder.mockReturnValue(makeQueryBuilder());
+
+      await service.findAll({} as QueryProjectsDto);
+
+      expect(paginateSpy).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ page: undefined, limit: undefined }),
+      );
+    });
+
+    // ── cursor mode ────────────────────────────────────────────────────────
+
+    it('returns a PaginatedList in cursor mode when cursor is supplied', async () => {
+      const nextCursor = 'eyJ2IjoiMjAyNi0wNi0wMVQwMDowMDowMC4wMDBaIiwiaWQiOiJwcm9qLTEifQ';
+      paginateSpy.mockResolvedValue(cursorList([projects[0]], nextCursor, true, 1));
+      projectRepo.createQueryBuilder.mockReturnValue(makeQueryBuilder());
+
+      const query = { cursor: 'some-opaque-cursor', limit: 1 } as QueryProjectsDto;
+      const result = await service.findAll(query);
+
+      expect(result.data).toEqual([projects[0]]);
+      expect(result.nextCursor).toBe(nextCursor);
+      expect(result.hasMore).toBe(true);
+      // Offset fields must be absent in cursor mode
+      expect(result.total).toBeUndefined();
+      expect(result.page).toBeUndefined();
+    });
+
+    it('passes cursor to paginate() in cursor mode', async () => {
+      projectRepo.createQueryBuilder.mockReturnValue(makeQueryBuilder());
+
+      const opaqueCursor = 'eyJ2IjoiMjAyNi0wNi0wMVQwMDowMDowMC4wMDBaIiwiaWQiOiJwcm9qLTEifQ';
+      const query = { cursor: opaqueCursor, limit: 5 } as QueryProjectsDto;
+      await service.findAll(query);
+
+      expect(paginateSpy).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ alias: 'project' }),
+        { cursor: opaqueCursor, page: undefined, limit: 5 },
+      );
+    });
+
+    it('returns hasMore=false and nextCursor=null on the last cursor page', async () => {
+      paginateSpy.mockResolvedValue(cursorList([projects[1]], null, false, 20));
+      projectRepo.createQueryBuilder.mockReturnValue(makeQueryBuilder());
+
+      const result = await service.findAll({ cursor: 'any-cursor' } as QueryProjectsDto);
+
+      expect(result.hasMore).toBe(false);
+      expect(result.nextCursor).toBeNull();
+    });
+
+    // ── sort resolution ────────────────────────────────────────────────────
+
+    it('passes sortColumn=project.created_at and direction=DESC by default', async () => {
+      projectRepo.createQueryBuilder.mockReturnValue(makeQueryBuilder());
+
+      await service.findAll({} as QueryProjectsDto);
+
+      expect(paginateSpy).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          sortColumn: 'project.created_at',
+          sortProperty: 'createdAt',
+          direction: 'DESC',
+        }),
+        expect.anything(),
+      );
+    });
+
+    it('resolves sortBy=name to sortColumn=project.name and sortProperty=name', async () => {
+      projectRepo.createQueryBuilder.mockReturnValue(makeQueryBuilder());
+
+      await service.findAll({ sortBy: 'name', sortOrder: SortOrder.ASC } as QueryProjectsDto);
+
+      expect(paginateSpy).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          sortColumn: 'project.name',
+          sortProperty: 'name',
+          direction: 'ASC',
+        }),
+        expect.anything(),
+      );
+    });
+
+    it('resolves sortBy=area_hectares to sortProperty=areaHectares', async () => {
+      projectRepo.createQueryBuilder.mockReturnValue(makeQueryBuilder());
+
+      await service.findAll({ sortBy: 'area_hectares' } as QueryProjectsDto);
+
+      expect(paginateSpy).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          sortColumn: 'project.area_hectares',
+          sortProperty: 'areaHectares',
+        }),
+        expect.anything(),
+      );
+    });
+
+    it('falls back to created_at when sortBy is an unknown column', async () => {
+      projectRepo.createQueryBuilder.mockReturnValue(makeQueryBuilder());
+
+      await service.findAll({ sortBy: 'invalid_column' } as QueryProjectsDto);
+
+      expect(paginateSpy).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ sortColumn: 'project.created_at', sortProperty: 'createdAt' }),
+        expect.anything(),
+      );
+    });
+
+    // ── filters ────────────────────────────────────────────────────────────
+
+    it('applies status filter', async () => {
       const qb = makeQueryBuilder();
       projectRepo.createQueryBuilder.mockReturnValue(qb);
 
-      await service.findAll({
-        status: ProjectStatus.ACTIVE,
-        page: 1,
-        limit: 20,
-        skip: 0,
-      } as QueryProjectsDto);
+      await service.findAll({ status: ProjectStatus.ACTIVE } as QueryProjectsDto);
 
       expect(qb.andWhere).toHaveBeenCalledWith('project.status = :status', {
         status: ProjectStatus.ACTIVE,
       });
     });
 
-    it('filters by methodology', async () => {
+    it('applies methodology filter', async () => {
       const qb = makeQueryBuilder();
       projectRepo.createQueryBuilder.mockReturnValue(qb);
 
-      await service.findAll({
-        methodology: 'VM001',
-        page: 1,
-        limit: 20,
-        skip: 0,
-      } as QueryProjectsDto);
+      await service.findAll({ methodology: 'VM001' } as QueryProjectsDto);
 
       expect(qb.andWhere).toHaveBeenCalledWith('project.methodology = :methodology', {
         methodology: 'VM001',
       });
     });
 
-    it('filters by ownerId', async () => {
+    it('applies ownerId filter', async () => {
       const qb = makeQueryBuilder();
       projectRepo.createQueryBuilder.mockReturnValue(qb);
 
-      await service.findAll({
-        ownerId: 'user-uuid-1',
-        page: 1,
-        limit: 20,
-        skip: 0,
-      } as QueryProjectsDto);
+      await service.findAll({ ownerId: 'user-uuid-1' } as QueryProjectsDto);
 
       expect(qb.andWhere).toHaveBeenCalledWith('project.owner_id = :ownerId', {
         ownerId: 'user-uuid-1',
       });
     });
 
-    it('filters by search term (name and description via ILIKE)', async () => {
+    it('applies text search filter (Brackets with ILIKE)', async () => {
       const qb = makeQueryBuilder();
       projectRepo.createQueryBuilder.mockReturnValue(qb);
 
-      await service.findAll({
-        search: 'test',
-        page: 1,
-        limit: 20,
-        skip: 0,
-      } as QueryProjectsDto);
+      await service.findAll({ search: 'wetland' } as QueryProjectsDto);
 
       expect(qb.andWhere).toHaveBeenCalledTimes(1);
-      const arg = qb.andWhere.mock.calls[0][0];
+      // The argument is a Brackets instance, not a plain string
+      const [arg] = qb.andWhere.mock.calls[0];
       expect(arg).toHaveProperty('whereFactory');
     });
 
-    it('filters by geo bounding box', async () => {
+    it('applies geo bounding-box filter when lat, lng, and radius are all provided', async () => {
       const qb = makeQueryBuilder();
       projectRepo.createQueryBuilder.mockReturnValue(qb);
 
-      await service.findAll({
-        lat: 10,
-        lng: 20,
-        radius: 50,
-        page: 1,
-        limit: 20,
-        skip: 0,
-      } as QueryProjectsDto);
+      await service.findAll({ lat: 10, lng: 20, radius: 50 } as QueryProjectsDto);
 
       const kmPerDegree = 111.32;
       const latDelta = 50 / kmPerDegree;
@@ -442,63 +589,39 @@ describe('ProjectsService', () => {
       });
     });
 
-    it('applies custom sortBy and sortOrder', async () => {
+    it('does not apply geo filter when only some coordinates are provided', async () => {
       const qb = makeQueryBuilder();
       projectRepo.createQueryBuilder.mockReturnValue(qb);
 
-      await service.findAll({
-        sortBy: 'name',
-        sortOrder: SortOrder.ASC,
-        page: 1,
-        limit: 20,
-        skip: 0,
-      } as QueryProjectsDto);
+      await service.findAll({ lat: 10 } as QueryProjectsDto);
 
-      expect(qb.orderBy).toHaveBeenCalledWith('project.name', 'ASC');
-    });
-
-    it('falls back to default sort when sortBy is invalid', async () => {
-      const qb = makeQueryBuilder();
-      projectRepo.createQueryBuilder.mockReturnValue(qb);
-
-      await service.findAll({
-        sortBy: 'invalid_column',
-        page: 1,
-        limit: 20,
-        skip: 0,
-      } as QueryProjectsDto);
-
-      expect(qb.orderBy).toHaveBeenCalledWith('project.created_at', 'DESC');
-    });
-
-    it('uses defaults for page and limit when not provided', async () => {
-      const qb = makeQueryBuilder({
-        getManyAndCount: jest.fn().mockResolvedValue([projects, 2]),
-      });
-      projectRepo.createQueryBuilder.mockReturnValue(qb);
-
-      const result = await service.findAll({} as QueryProjectsDto);
-
-      expect(result.page).toBe(1);
-      expect(result.limit).toBe(20);
-    });
-
-    it('ignores geo filter when only some coordinates are provided', async () => {
-      const qb = makeQueryBuilder();
-      projectRepo.createQueryBuilder.mockReturnValue(qb);
-
-      await service.findAll({
-        lat: 10,
-        page: 1,
-        limit: 20,
-        skip: 0,
-      } as QueryProjectsDto);
-
-      // andWhere should NOT have been called with geo bounding-box clauses
       const geoCall = qb.andWhere.mock.calls.find(
-        ([clause]: string[]) => typeof clause === 'string' && clause.includes('BETWEEN'),
+        ([clause]: [unknown]) => typeof clause === 'string' && clause.includes('BETWEEN'),
       );
       expect(geoCall).toBeUndefined();
+    });
+
+    it('combines status filter with cursor pagination', async () => {
+      const nextCursor = 'some-cursor';
+      paginateSpy.mockResolvedValue(cursorList([projects[0]], nextCursor, true));
+      const qb = makeQueryBuilder();
+      projectRepo.createQueryBuilder.mockReturnValue(qb);
+
+      const result = await service.findAll({
+        status: ProjectStatus.ACTIVE,
+        cursor: 'prev-cursor',
+        limit: 10,
+      } as QueryProjectsDto);
+
+      expect(qb.andWhere).toHaveBeenCalledWith('project.status = :status', {
+        status: ProjectStatus.ACTIVE,
+      });
+      expect(paginateSpy).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ cursor: 'prev-cursor', limit: 10 }),
+      );
+      expect(result.nextCursor).toBe(nextCursor);
     });
   });
 

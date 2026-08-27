@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException, Logger } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ConflictException, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { InjectQueue } from '@nestjs/bull';
 import { ConfigService } from '@nestjs/config';
@@ -13,7 +13,7 @@ import { QueryReadingsDto } from './dto/query-readings.dto';
 import { RegisterDeviceDto } from './dto/register-device.dto';
 import { generateDeviceApiKey } from '../../common/utils/api-key.util';
 import { SensorProjectAccessService } from './sensor-project-access.service';
-import { paginate, PaginatedList } from '../../common/pagination';
+import { paginate, PaginatedList, PaginationParams } from '../../common/pagination';
 
 interface ParameterRange {
   min: number;
@@ -51,9 +51,15 @@ function buildReadingPayload(
   return parts.join('|');
 }
 
+/** Per-device rate-limit state for key rotation (5 min window). */
+const ROTATION_WINDOW_MS = 5 * 60 * 1000;
+
 @Injectable()
 export class SensorsService {
   private readonly logger = new Logger(SensorsService.name);
+
+  /** Tracks last rotation timestamp per device UUID to enforce rate limiting. */
+  private readonly lastRotationAt = new Map<string, number>();
 
   constructor(
     @InjectRepository(SensorDevice)
@@ -107,17 +113,66 @@ export class SensorsService {
     return Object.assign(saved, { apiKeyPlaintext: plaintext });
   }
 
+  async rotateDeviceApiKey(
+    deviceId: string,
+    userId: string,
+    role?: string,
+  ): Promise<{ apiKeyPlaintext: string }> {
+    const device = await this.deviceRepo.findOne({
+      where: { id: deviceId },
+      select: ['id', 'deviceId', 'projectId', 'apiKeyHash'],
+    });
+    if (!device) {
+      throw new NotFoundException('Sensor device not found');
+    }
+
+    await this.projectAccess.assertProjectAccess(userId, role, device.projectId);
+
+    const now = Date.now();
+    const lastRotation = this.lastRotationAt.get(device.id);
+    if (lastRotation && now - lastRotation < ROTATION_WINDOW_MS) {
+      const retryAfter = Math.ceil((ROTATION_WINDOW_MS - (now - lastRotation)) / 1000);
+      throw new ConflictException(
+        `Key rotation rate-limited. Try again in ${retryAfter} seconds.`,
+      );
+    }
+
+    const { plaintext, hash } = await generateDeviceApiKey(device.deviceId);
+
+    await this.deviceRepo.update(device.id, { apiKeyHash: hash });
+
+    this.lastRotationAt.set(device.id, now);
+
+    this.logger.log(`API key rotated for device ${device.deviceId} (${device.id})`);
+
+    return { apiKeyPlaintext: plaintext };
+  }
+
   async getDevices(
     projectId: string | undefined,
     userId: string,
     role: string | undefined,
-  ): Promise<SensorDevice[]> {
+    pagination: PaginationParams = {},
+  ): Promise<PaginatedList<SensorDevice>> {
     if (projectId) {
       await this.projectAccess.assertProjectAccess(userId, role, projectId);
-      return this.deviceRepo.find({ where: { projectId } });
+    } else {
+      this.projectAccess.requirePrivilegedRole(role);
     }
-    this.projectAccess.requirePrivilegedRole(role);
-    return this.deviceRepo.find({ order: { createdAt: 'DESC' } });
+
+    const qb = this.deviceRepo.createQueryBuilder('device');
+    if (projectId) {
+      qb.andWhere('device.project_id = :projectId', { projectId });
+    }
+
+    // Newest-first by createdAt (with id tiebreaker) so both the per-project
+    // and admin-all paths share the same keyset order already supported by
+    // paginate().
+    return paginate(
+      qb,
+      { alias: 'device', sortColumn: 'device.created_at', sortProperty: 'createdAt' },
+      pagination,
+    );
   }
 
   async getDeviceById(

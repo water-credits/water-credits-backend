@@ -8,6 +8,10 @@ import { OracleService, AggregatedReading } from './oracle.service';
 import { OracleSubmission, SubmissionStatus } from './entities/oracle-submission.entity';
 import { StellarService } from '../stellar/stellar.service';
 import { SensorReading } from '../sensors/entities/sensor-reading.entity';
+import { Project } from '../projects/entities/project.entity';
+import { GovernanceConfig } from '../governance/entities/governance-config.entity';
+import { BatchStatus, ReadingBatch } from '../sensors/entities/reading-batch.entity';
+import { CreditScoringService } from './credit-scoring.service';
 
 // ── Typed mock factory ────────────────────────────────────────────────────────
 
@@ -124,6 +128,7 @@ function makeSubmission(overrides: Partial<OracleSubmission> = {}): OracleSubmis
   return {
     id: 'sub-1',
     projectId: 'proj-1',
+    batchId: 'batch-1',
     oracleAddress: 'GABC123',
     nonce: 1,
     txHash: '',
@@ -133,6 +138,7 @@ function makeSubmission(overrides: Partial<OracleSubmission> = {}): OracleSubmis
     createdAt: new Date(),
     updatedAt: new Date(),
     project: undefined as never,
+    batch: undefined as never,
     ...overrides,
   };
 }
@@ -168,6 +174,13 @@ describe('OracleService', () => {
         { provide: ConfigService, useValue: { get: jest.fn() } },
         { provide: DataSource, useValue: dataSource },
         { provide: StellarService, useValue: stellarService },
+        { provide: getRepositoryToken(Project), useValue: { findOne: jest.fn() } },
+        { provide: getRepositoryToken(GovernanceConfig), useValue: { findOne: jest.fn() } },
+        {
+          provide: getRepositoryToken(ReadingBatch),
+          useValue: { findOne: jest.fn(), save: jest.fn() },
+        },
+        { provide: CreditScoringService, useValue: { calculate: jest.fn() } },
       ],
     }).compile();
 
@@ -220,6 +233,7 @@ describe('OracleService', () => {
       await service.triggerSubmission({
         projectId: 'proj-abc',
         oracleAddress: 'GORACLE',
+        batchId: 'batch-abc',
         readings: {},
       });
 
@@ -228,6 +242,7 @@ describe('OracleService', () => {
         expect.objectContaining({
           submissionId: 'sub-uuid-1',
           projectId: 'proj-abc',
+          batchId: 'batch-abc',
           oracleAddress: 'GORACLE',
           nonce: 1,
         }),
@@ -788,6 +803,110 @@ describe('OracleService', () => {
 
       const result = await service.findStaleSubmissions('contract-id', 'GABC');
       expect(result).toEqual([]);
+    });
+  });
+
+  // getUniqueOracleAddresses
+  describe('getUniqueOracleAddresses', () => {
+    it('returns unique oracle addresses from submissions', async () => {
+      const distinctMock = {
+        select: jest.fn().mockReturnThis(),
+        getRawMany: jest
+          .fn()
+          .mockResolvedValue([{ oracleAddress: 'GABC' }, { oracleAddress: 'GXYZ' }]),
+      };
+      submissionRepo.createQueryBuilder.mockReturnValue(distinctMock as any);
+
+      const result = await service.getUniqueOracleAddresses();
+      expect(result).toEqual(['GABC', 'GXYZ']);
+    });
+  });
+
+  // reconcile
+  describe('reconcile', () => {
+    it('heals stale submissions by re-sequencing and re-queueing them', async () => {
+      stellarService.getOracleNonce.mockResolvedValue(5);
+
+      const staleSubmissions = [
+        makeSubmission({ id: 'sub-stale-1', nonce: 7, projectId: 'proj-1', oracleAddress: 'GABC' }),
+        makeSubmission({ id: 'sub-stale-2', nonce: 8, projectId: 'proj-1', oracleAddress: 'GABC' }),
+      ];
+
+      submissionRepo.find
+        .mockResolvedValueOnce(staleSubmissions as never)
+        .mockResolvedValueOnce([] as never);
+
+      await service.reconcile('contract-id', 'GABC');
+
+      expect(staleSubmissions[0].nonce).toBe(6);
+      expect(staleSubmissions[0].status).toBe(SubmissionStatus.PENDING);
+      expect(staleSubmissions[1].nonce).toBe(7);
+      expect(staleSubmissions[1].status).toBe(SubmissionStatus.PENDING);
+
+      expect(oracleQueue.add).toHaveBeenCalledTimes(2);
+      expect(oracleQueue.add).toHaveBeenNthCalledWith(
+        1,
+        'oracle-submit-job',
+        expect.objectContaining({ submissionId: 'sub-stale-1', nonce: 6 }),
+        expect.objectContaining({ delay: 0 }),
+      );
+      expect(oracleQueue.add).toHaveBeenNthCalledWith(
+        2,
+        'oracle-submit-job',
+        expect.objectContaining({ submissionId: 'sub-stale-2', nonce: 7 }),
+        expect.objectContaining({ delay: 5000 }),
+      );
+    });
+
+    it('heals gap submissions by marking them CONFIRMED and calculating credits', async () => {
+      stellarService.getOracleNonce.mockResolvedValue(5);
+
+      const gapSub = makeSubmission({
+        id: 'sub-gap',
+        nonce: 4,
+        projectId: 'proj-1',
+        batchId: 'batch-1',
+        oracleAddress: 'GABC',
+      });
+
+      submissionRepo.find
+        .mockResolvedValueOnce([] as never)
+        .mockResolvedValueOnce([gapSub] as never);
+
+      const mockProject = { id: 'proj-1', areaHectares: 10 };
+      const mockConfig = { id: 1 };
+      const mockBatch = { id: 'batch-1', status: BatchStatus.SUBMITTED };
+
+      const projectRepo = service['projectRepo'];
+      const configRepo = service['governanceConfigRepo'];
+      const batchRepo = service['batchRepo'];
+      const creditScoringService = service['creditScoringService'];
+
+      jest.spyOn(projectRepo, 'findOne').mockResolvedValue(mockProject as any);
+      jest.spyOn(configRepo, 'findOne').mockResolvedValue(mockConfig as any);
+      jest.spyOn(batchRepo, 'findOne').mockResolvedValue(mockBatch as any);
+      jest.spyOn(creditScoringService, 'calculate').mockReturnValue({ toNumber: () => 150 } as any);
+
+      await service.reconcile('contract-id', 'GABC');
+
+      expect(gapSub.status).toBe(SubmissionStatus.CONFIRMED);
+      expect(gapSub.txHash).toBe('reconciled-on-chain');
+      expect(gapSub.result).toMatchObject({ reconciled: true });
+
+      expect(batchRepo.findOne).toHaveBeenCalledWith({
+        where: {
+          id: 'batch-1',
+          projectId: 'proj-1',
+          status: BatchStatus.SUBMITTED,
+        },
+      });
+      expect(batchRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: 'batch-1',
+          status: 'confirmed',
+          creditsGenerated: 150,
+        }),
+      );
     });
   });
 });
