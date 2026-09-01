@@ -176,10 +176,9 @@ export class AnalyticsService {
 
   async getTopProjects(limit: number = 5) {
     const cacheKey = `analytics:top-projects:${limit}`;
-    const cached =
-      await this.getFromCache<Array<{ id: string; name: string; totalGenerated: number }>>(
-        cacheKey,
-      );
+    const cached = await this.getFromCache<Array<{ id: string; name: string; totalGenerated: number }>>(
+      cacheKey,
+    );
     if (cached) {
       return cached;
     }
@@ -209,8 +208,7 @@ export class AnalyticsService {
 
   async getTopRetirees(limit: number = 5) {
     const cacheKey = `analytics:top-retirees:${limit}`;
-    const cached =
-      await this.getFromCache<Array<{ id: string; name: string; totalRetired: number }>>(cacheKey);
+    const cached = await this.getFromCache<Array<{ id: string; name: string; totalRetired: number }>>(cacheKey);
     if (cached) {
       return cached;
     }
