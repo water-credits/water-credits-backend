@@ -298,6 +298,11 @@ export class OracleProcessor {
       submission.result = { error: message };
       await this.submissionRepo.save(submission);
 
+      if (error && (error as Error).name === 'FeeLimitExceededError') {
+        this.logger.warn(`Fee limit exceeded for ${submissionId}, permanently failing.`);
+        return;
+      }
+
       // Re-throw so Bull records the failure and applies retry/backoff.
       throw error;
     }
