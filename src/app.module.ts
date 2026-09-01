@@ -27,6 +27,7 @@ import queueConfig from './config/queue.config';
 import oracleConfig from './config/oracle.config';
 import sensorConfig from './config/sensor.config';
 import emailConfig from './config/email.config';
+import ipfsConfig from './config/ipfs.config';
 
 @Module({
   imports: [
@@ -41,6 +42,7 @@ import emailConfig from './config/email.config';
         oracleConfig,
         sensorConfig,
         emailConfig,
+        ipfsConfig,
       ],
     }),
     TypeOrmModule.forRootAsync({

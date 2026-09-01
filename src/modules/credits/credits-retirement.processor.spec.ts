@@ -5,6 +5,7 @@ import { CreditsRetirementProcessor } from './credits-retirement.processor';
 import { Retirement } from './entities/retirement.entity';
 import { StellarService } from '../stellar/stellar.service';
 import { NotificationsService } from '../notifications/notifications.service';
+import { CertificateService } from './certificate.service';
 
 function makeRetirement(overrides: Partial<Retirement> = {}): Retirement {
   return {
@@ -61,6 +62,7 @@ describe('CreditsRetirementProcessor', () => {
   let saveMock: jest.Mock;
   let retireCreditsWithHashMock: jest.Mock;
   let notifyCreditRetiredMock: jest.Mock;
+  let uploadRetirementCertificateMock: jest.Mock;
 
   beforeEach(async () => {
     savedSnapshots = [];
@@ -71,6 +73,7 @@ describe('CreditsRetirementProcessor', () => {
     });
     retireCreditsWithHashMock = jest.fn();
     notifyCreditRetiredMock = jest.fn();
+    uploadRetirementCertificateMock = jest.fn().mockResolvedValue('ipfs://bafytest');
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -86,6 +89,10 @@ describe('CreditsRetirementProcessor', () => {
         {
           provide: NotificationsService,
           useValue: { notifyCreditRetired: notifyCreditRetiredMock },
+        },
+        {
+          provide: CertificateService,
+          useValue: { uploadRetirementCertificate: uploadRetirementCertificateMock },
         },
       ],
     }).compile();
@@ -193,5 +200,42 @@ describe('CreditsRetirementProcessor', () => {
     const cleared = savedSnapshots.find((s) => s.txHash === '');
     expect(cleared).toBeDefined();
     expect(notifyCreditRetiredMock).not.toHaveBeenCalled();
+  });
+
+  it('uploads the certificate and persists the returned URI on success', async () => {
+    findOneMock.mockResolvedValue(makeRetirement({ txHash: '' }));
+    retireCreditsWithHashMock.mockResolvedValue({
+      txHash: 'real-tx-hash-xyz',
+      response: SUCCESS_RESPONSE,
+    });
+    uploadRetirementCertificateMock.mockResolvedValue('ipfs://cert-hash-1');
+
+    await processor.processRetirement(makeJob());
+
+    expect(uploadRetirementCertificateMock).toHaveBeenCalledTimes(1);
+    expect(notifyCreditRetiredMock).toHaveBeenCalledTimes(1);
+
+    // The final persisted snapshot carries the IPFS URI.
+    const finalized = savedSnapshots[savedSnapshots.length - 1];
+    expect(finalized.certificateIpfsUri).toBe('ipfs://cert-hash-1');
+  });
+
+  it('keeps the retirement confirmed when certificate upload fails', async () => {
+    findOneMock.mockResolvedValue(makeRetirement({ txHash: '' }));
+    retireCreditsWithHashMock.mockResolvedValue({
+      txHash: 'real-tx-hash-xyz',
+      response: SUCCESS_RESPONSE,
+    });
+    uploadRetirementCertificateMock.mockResolvedValue(null);
+
+    await expect(processor.processRetirement(makeJob())).resolves.toBeUndefined();
+
+    // Notification still fired; retirement still confirmed (real txHash set).
+    expect(notifyCreditRetiredMock).toHaveBeenCalledTimes(1);
+
+    const confirmed = savedSnapshots.find((s) => s.txHash === 'real-tx-hash-xyz');
+    expect(confirmed).toBeDefined();
+    // The failed upload leaves the URI null — never re-thrown.
+    expect(confirmed?.certificateIpfsUri).toBeNull();
   });
 });

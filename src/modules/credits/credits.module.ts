@@ -4,14 +4,17 @@ import { BullModule } from '@nestjs/bull';
 import { CreditsController } from './credits.controller';
 import { CreditsService } from './credits.service';
 import { CreditsRetirementProcessor } from './credits-retirement.processor';
+import { CertificateService } from './certificate.service';
 import { Retirement } from './entities/retirement.entity';
+import { Project } from '../projects/entities/project.entity';
+import { User } from '../users/entities/user.entity';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { ProjectsModule } from '../projects/projects.module';
 import { UsersModule } from '../users/users.module';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Retirement]),
+    TypeOrmModule.forFeature([Retirement, Project, User]),
     BullModule.registerQueue({
       name: 'retirements',
       defaultJobOptions: {
@@ -30,7 +33,7 @@ import { UsersModule } from '../users/users.module';
     UsersModule,
   ],
   controllers: [CreditsController],
-  providers: [CreditsService, CreditsRetirementProcessor],
+  providers: [CreditsService, CreditsRetirementProcessor, CertificateService],
   exports: [CreditsService, TypeOrmModule],
 })
 export class CreditsModule {}
