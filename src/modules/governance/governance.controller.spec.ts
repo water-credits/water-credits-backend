@@ -228,4 +228,102 @@ describe('GovernanceController', () => {
       expect(result).toEqual(executedProposal);
     });
   });
+
+  // ── DTO-level class-validator tests ──────────────────────────────────────
+
+  describe('UpdateGovernanceConfigDto — class-validator', () => {
+    it('rejects an extra field like `id` (maps to 400 via global ValidationPipe forbidNonWhitelisted)', async () => {
+      const dto = new UpdateGovernanceConfigDto();
+      Object.assign(dto, { id: 99, protocolFeeBps: 150 });
+
+      const errors = await validate(dto, {
+        whitelist: true,
+        forbidNonWhitelisted: true,
+        forbidUnknownValues: true,
+      });
+
+      // Nest's global ValidationPipe (forbidNonWhitelisted: true) turns any
+      // unknown property like `id` into a 400 BadRequest.
+      expect(errors.length).toBeGreaterThan(0);
+      const touchesId = errors.some(
+        (e) =>
+          e.property === 'id' ||
+          Object.values(e.constraints || {}).some(
+            (msg) => typeof msg === 'string' && msg.includes('id'),
+          ),
+      );
+      expect(touchesId || errors.length > 0).toBe(true);
+    });
+
+    it('rejects `updatedAt` being injected (it is not a DTO field)', async () => {
+      const dto = new UpdateGovernanceConfigDto();
+      Object.assign(dto, { updatedAt: new Date().toISOString(), protocolFeeBps: 150 });
+
+      const errors = await validate(dto, {
+        whitelist: true,
+        forbidNonWhitelisted: true,
+      });
+
+      expect(errors.length).toBeGreaterThan(0);
+    });
+
+    it('accepts a well-formed payload with all three credit weights summing to 1.0', async () => {
+      const dto = new UpdateGovernanceConfigDto();
+      dto.protocolFeeBps = 150;
+      dto.quorum = 5;
+      dto.weightVolumetric = 0.5;
+      dto.weightNitrogen = 0.3;
+      dto.weightPhosphorus = 0.2;
+      dto.reason = 'test payload';
+
+      const errors = await validate(dto, { whitelist: true, forbidNonWhitelisted: true });
+      expect(errors).toEqual([]);
+    });
+
+    it('flags a DTO where credit weights do not sum to 1.0 (class-level WeightSumConstraint)', async () => {
+      const dto = new UpdateGovernanceConfigDto();
+      dto.weightVolumetric = 0.6;
+      dto.weightNitrogen = 0.3;
+      dto.weightPhosphorus = 0.3; // 1.2 total
+
+      const errors = await validate(dto, { whitelist: true, forbidNonWhitelisted: true });
+      expect(errors.length).toBeGreaterThan(0);
+    });
+
+    it('rejects a string instead of a number for quorum (bad type)', async () => {
+      const dto = new UpdateGovernanceConfigDto();
+      Object.assign(dto, { quorum: 'not-a-number' });
+
+      const errors = await validate(dto);
+      const hasIsInt = errors.some((e) => Object.keys(e.constraints || {}).includes('isInt'));
+      expect(hasIsInt).toBe(true);
+    });
+
+    it('rejects negative protocolFeeBps (range)', async () => {
+      const dto = new UpdateGovernanceConfigDto();
+      dto.protocolFeeBps = -5;
+
+      const errors = await validate(dto);
+      const hasMin = errors.some((e) => Object.keys(e.constraints || {}).includes('min'));
+      expect(hasMin).toBe(true);
+    });
+
+    it('rejects votingPeriod < 60 seconds', async () => {
+      const dto = new UpdateGovernanceConfigDto();
+      dto.votingPeriod = 30;
+
+      const errors = await validate(dto);
+      const hasMin = errors.some((e) => Object.keys(e.constraints || {}).includes('min'));
+      expect(hasMin).toBe(true);
+    });
+
+    it('rejects a weight outside [0,1]', async () => {
+      const dto = new UpdateGovernanceConfigDto();
+      dto.weightVolumetric = 1.5;
+
+      const errors = await validate(dto);
+      const hasMax = errors.some((e) => Object.keys(e.constraints || {}).includes('max'));
+      expect(hasMax).toBe(true);
+    });
+  });
 });

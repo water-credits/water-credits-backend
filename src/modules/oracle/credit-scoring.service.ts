@@ -23,8 +23,12 @@ export class CreditScoringService {
     areaHectares: number,
   ): BigNumber {
     const coerce = (v: unknown): number => {
-      if (typeof v === 'number') return v;
-      if (typeof v === 'string') return parseFloat(v) || 0;
+      if (typeof v === 'number') {
+        return v;
+      }
+      if (typeof v === 'string') {
+        return parseFloat(v) || 0;
+      }
       return 0;
     };
 

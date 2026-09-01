@@ -1,5 +1,5 @@
 import { NestFactory } from '@nestjs/core';
-import { ValidationPipe } from '@nestjs/common';
+import { BadRequestException, UnprocessableEntityException, ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import helmet from 'helmet';
@@ -47,6 +47,17 @@ async function bootstrap() {
       whitelist: true,
       forbidNonWhitelisted: true,
       transform: true,
+      exceptionFactory: (errors) => {
+        const hasWeightSumViolation = errors.some(
+          (error) =>
+            Object.prototype.hasOwnProperty.call(error.constraints ?? {}, 'WeightSumConstraint') ||
+            Object.prototype.hasOwnProperty.call(error.constraints ?? {}, 'ValidateCreditWeights'),
+        );
+
+        return hasWeightSumViolation
+          ? new UnprocessableEntityException(errors)
+          : new BadRequestException(errors);
+      },
     }),
   );
 

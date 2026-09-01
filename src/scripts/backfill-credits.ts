@@ -45,17 +45,19 @@ async function run() {
   const scoringService = new CreditScoringService();
 
   const config = await configRepo.findOne({ order: { id: 'DESC' } });
+
   if (!config) {
     console.error('❌ No GovernanceConfig found');
     process.exit(1);
   }
 
-  // Find all uncalculated batches
+  // Find all uncalculated batches.
   const uncalculatedBatches = await batchRepo
     .createQueryBuilder('batch')
     .where('batch.creditsGenerated IS NULL')
     // We only care about batches that might correspond to confirmed submissions.
-    // Let's just find ALL batches with creditsGenerated = null that have related confirmed submissions.
+    // Let's just find ALL batches with creditsGenerated = null that have related
+    // confirmed submissions.
     .getMany();
 
   console.log(`Found ${uncalculatedBatches.length} batches with no credits generated.`);
@@ -63,8 +65,13 @@ async function run() {
   let updatedCount = 0;
 
   for (const batch of uncalculatedBatches) {
-    const project = await projectRepo.findOne({ where: { id: batch.projectId } });
-    if (!project) continue;
+    const project = await projectRepo.findOne({
+      where: { id: batch.projectId },
+    });
+
+    if (!project) {
+      continue;
+    }
 
     const submission = await submissionRepo.findOne({
       where: {
@@ -87,12 +94,14 @@ async function run() {
 
     batch.creditsGenerated = credits.toNumber();
     batch.status = BatchStatus.CONFIRMED;
+
     if (!batch.confirmedAt) {
       batch.confirmedAt = new Date();
     }
 
     await batchRepo.save(batch);
     updatedCount++;
+
     console.log(`  Batch ${batch.id}: calculated ${batch.creditsGenerated} credits.`);
   }
 

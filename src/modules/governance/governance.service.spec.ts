@@ -1673,4 +1673,260 @@ describe('GovernanceService', () => {
       expect(second.status).toBe(ProposalStatus.EXPIRED);
     });
   });
+
+  // ── AC: valid emergencyConfigUpdate writes updatedBy + config_updated event ──
+
+  describe('emergencyConfigUpdate — valid update', () => {
+    let proposalRepo: jest.Mocked<Record<string, jest.Mock>>;
+    let voteRepo: jest.Mocked<Record<string, jest.Mock>>;
+    let configRepo: jest.Mocked<Record<string, jest.Mock>>;
+    let configChangeRepo: jest.Mocked<Record<string, jest.Mock>>;
+    let dataSource: { createQueryRunner: jest.Mock; query: jest.Mock };
+    let stellarService: { execute: jest.Mock };
+    let configService: { get: jest.Mock };
+    let service: GovernanceService;
+
+    beforeEach(async () => {
+      proposalRepo = {
+        find: jest.fn(),
+        findOne: jest.fn(),
+        create: jest.fn(),
+        save: jest.fn(),
+        createQueryBuilder: jest.fn(),
+      } as never;
+      voteRepo = { findOne: jest.fn(), create: jest.fn(), save: jest.fn() } as never;
+      configRepo = {
+        findOne: jest.fn().mockResolvedValue(makeConfig()),
+        create: jest.fn(),
+        save: jest.fn().mockImplementation((cfg: unknown) => Promise.resolve(cfg)),
+      } as never;
+      configChangeRepo = {
+        find: jest.fn().mockResolvedValue([]),
+        findOne: jest.fn().mockResolvedValue(null),
+        create: jest
+          .fn()
+          .mockImplementation((v: unknown) => ({ id: 'change-uuid', ...(v as object) })),
+        save: jest.fn().mockImplementation((v: unknown) => Promise.resolve(v)),
+      } as never;
+      dataSource = {
+        createQueryRunner: jest.fn(),
+        query: jest.fn().mockResolvedValue(undefined),
+      };
+      stellarService = { execute: jest.fn() };
+      configService = { get: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          GovernanceService,
+          { provide: getRepositoryToken(Proposal), useValue: proposalRepo },
+          { provide: getRepositoryToken(ProposalVote), useValue: voteRepo },
+          { provide: getRepositoryToken(GovernanceConfig), useValue: configRepo },
+          { provide: getRepositoryToken(GovernanceConfigChange), useValue: configChangeRepo },
+          { provide: ConfigService, useValue: configService },
+          { provide: DataSource, useValue: dataSource },
+          { provide: StellarService, useValue: stellarService },
+        ],
+      }).compile();
+
+      service = module.get<GovernanceService>(GovernanceService);
+    });
+
+    it('sets updatedBy to the actor wallet and writes a config_updated governance event', async () => {
+      const actor = 'GADMIN123';
+      const updates = { protocolFeeBps: 150, quorum: 5 };
+
+      const result = await service.emergencyConfigUpdate(actor, updates as never);
+
+      // updatedBy must be the actor's wallet
+      expect(configRepo.save).toHaveBeenCalled();
+      const savedConfig = configRepo.save.mock.calls[0][0] as GovernanceConfig;
+      expect(savedConfig.updatedBy).toBe(actor);
+      expect(result.updatedBy).toBe(actor);
+
+      // The values should actually be changed
+      expect(savedConfig.protocolFeeBps).toBe(150);
+      expect(savedConfig.quorum).toBe(5);
+
+      // A 'config_updated' audit row should be inserted via raw SQL
+      const eventCalls = (dataSource.query as jest.Mock).mock.calls.filter(
+        (call) => Array.isArray(call[1]) && (call[1] as unknown[])[0] === 'config_updated',
+      );
+      expect(eventCalls.length).toBeGreaterThanOrEqual(1);
+      const payloadJson = (eventCalls[eventCalls.length - 1][1] as unknown[])[2] as string;
+      const payload = JSON.parse(payloadJson);
+      expect(payload).toHaveProperty('diffs');
+      expect(payload).toHaveProperty('oldValues');
+      expect(payload).toHaveProperty('newValues');
+      expect(Array.isArray(payload.diffs)).toBe(true);
+      const diffFields = payload.diffs.map((d: { field: string }) => d.field);
+      expect(diffFields).toContain('protocolFeeBps');
+      expect(diffFields).toContain('quorum');
+    });
+
+    it('rejects with 422 UnprocessableEntityException when credit weights do not sum to 1.0', async () => {
+      const { UnprocessableEntityException } = await import('@nestjs/common');
+      const actor = 'GADMIN123';
+      const updates = {
+        weightVolumetric: 0.6,
+        weightNitrogen: 0.3,
+        weightPhosphorus: 0.3, // sum = 1.2 → invalid
+      };
+
+      await expect(service.emergencyConfigUpdate(actor, updates as never)).rejects.toThrow(
+        UnprocessableEntityException,
+      );
+
+      // Ensure nothing was persisted
+      expect(configRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('accepts a valid credit-weight update where weights sum exactly to 1.0', async () => {
+      const actor = 'GADMIN123';
+      const updates = {
+        weightVolumetric: 0.45,
+        weightNitrogen: 0.35,
+        weightPhosphorus: 0.2, // sum = 1.0 ✓
+      };
+
+      await expect(service.emergencyConfigUpdate(actor, updates as never)).resolves.toBeDefined();
+
+      const savedConfig = configRepo.save.mock.calls[0][0] as GovernanceConfig;
+      expect(savedConfig.weightVolumetric).toBe(0.45);
+      expect(savedConfig.weightNitrogen).toBe(0.35);
+      expect(savedConfig.weightPhosphorus).toBe(0.2);
+      expect(savedConfig.updatedBy).toBe(actor);
+
+      // config_updated event written
+      const eventCalls = (dataSource.query as jest.Mock).mock.calls.filter(
+        (call) => Array.isArray(call[1]) && (call[1] as unknown[])[0] === 'config_updated',
+      );
+      expect(eventCalls.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('throws BadRequest when updates produce no field changes (idempotent values)', async () => {
+      const actor = 'GADMIN123';
+      const updates = {
+        protocolFeeBps: 100,
+        quorum: 3,
+      };
+
+      await expect(service.emergencyConfigUpdate(actor, updates as never)).rejects.toThrow(
+        BadRequestException,
+      );
+    });
+  });
+
+  // ── AC: proposeConfigChange — weight sum violations return 422 ──
+
+  describe('proposeConfigChange — weight-sum invariant (422)', () => {
+    let proposalRepo: jest.Mocked<Record<string, jest.Mock>>;
+    let voteRepo: jest.Mocked<Record<string, jest.Mock>>;
+    let configRepo: jest.Mocked<Record<string, jest.Mock>>;
+    let configChangeRepo: jest.Mocked<Record<string, jest.Mock>>;
+    let dataSource: { createQueryRunner: jest.Mock; query: jest.Mock };
+    let stellarService: { execute: jest.Mock };
+    let configService: { get: jest.Mock };
+    let service: GovernanceService;
+
+    beforeEach(async () => {
+      proposalRepo = {
+        find: jest.fn(),
+        findOne: jest.fn(),
+        create: jest.fn(),
+        save: jest.fn(),
+        createQueryBuilder: jest.fn(),
+      } as never;
+      voteRepo = { findOne: jest.fn(), create: jest.fn(), save: jest.fn() } as never;
+      configRepo = {
+        findOne: jest.fn().mockResolvedValue(makeConfig({ timelockPeriod: 86400 })),
+        create: jest.fn(),
+        save: jest.fn(),
+      } as never;
+      configChangeRepo = {
+        find: jest.fn().mockResolvedValue([]),
+        findOne: jest.fn().mockResolvedValue(null),
+        create: jest.fn(),
+        save: jest.fn(),
+      } as never;
+      dataSource = {
+        createQueryRunner: jest.fn(),
+        query: jest.fn().mockResolvedValue(undefined),
+      };
+      stellarService = { execute: jest.fn() };
+      configService = { get: jest.fn() };
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          GovernanceService,
+          { provide: getRepositoryToken(Proposal), useValue: proposalRepo },
+          { provide: getRepositoryToken(ProposalVote), useValue: voteRepo },
+          { provide: getRepositoryToken(GovernanceConfig), useValue: configRepo },
+          { provide: getRepositoryToken(GovernanceConfigChange), useValue: configChangeRepo },
+          { provide: ConfigService, useValue: configService },
+          { provide: DataSource, useValue: dataSource },
+          { provide: StellarService, useValue: stellarService },
+        ],
+      }).compile();
+
+      service = module.get<GovernanceService>(GovernanceService);
+    });
+
+    it('rejects with 422 when partial weight update causes post-apply sum ≠ 1.0', async () => {
+      const { UnprocessableEntityException } = await import('@nestjs/common');
+      const actor = 'GADMIN';
+      // Current: 0.5 + 0.3 + 0.2 = 1.0.
+      // Changing only weightVolumetric to 0.7 → effective sum = 0.7 + 0.3 + 0.2 = 1.2
+      const updates = { weightVolumetric: 0.7 };
+
+      await expect(service.proposeConfigChange(actor, updates as never)).rejects.toThrow(
+        UnprocessableEntityException,
+      );
+
+      expect(configChangeRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('accepts a valid weight update proposal where all three are supplied and sum to 1.0', async () => {
+      const actor = 'GADMIN';
+      const pendingChange = {
+        id: 'change-uuid-1',
+        configId: 1,
+        proposedValues: {
+          weightVolumetric: 0.4,
+          weightNitrogen: 0.4,
+          weightPhosphorus: 0.2,
+        },
+        proposedBy: actor,
+        effectiveAt: new Date(Date.now() + 86400_000),
+        status: ConfigChangeStatus.PENDING,
+        appliedAt: null,
+        appliedBy: null,
+        cancelledAt: null,
+        cancelledBy: null,
+        reason: null,
+        createdAt: new Date(),
+      };
+      configChangeRepo.create.mockReturnValue(pendingChange);
+      configChangeRepo.save.mockResolvedValue(pendingChange);
+
+      const updates = {
+        weightVolumetric: 0.4,
+        weightNitrogen: 0.4,
+        weightPhosphorus: 0.2, // sum = 1.0
+      };
+
+      const result = await service.proposeConfigChange(actor, updates as never);
+
+      expect(result.status).toBe(ConfigChangeStatus.PENDING);
+      expect(configChangeRepo.save).toHaveBeenCalled();
+
+      // Should have written a config_change_proposed event with projectedDiffs
+      const proposedCalls = (dataSource.query as jest.Mock).mock.calls.filter(
+        (call) => Array.isArray(call[1]) && (call[1] as unknown[])[0] === 'config_change_proposed',
+      );
+      expect(proposedCalls.length).toBe(1);
+      const payload = JSON.parse((proposedCalls[0][1] as unknown[])[2] as string);
+      expect(payload).toHaveProperty('projectedDiffs');
+      expect(Array.isArray(payload.projectedDiffs)).toBe(true);
+    });
+  });
 });
