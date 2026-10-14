@@ -1,11 +1,9 @@
 node_modules/
 dist/
-.env
 *.log
 coverage/
 
 # IDE
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -21,3 +19,4 @@ test/**/*.js
 
 # Build artifacts
 *.tsbuildinfo
+config.bat
