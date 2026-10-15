@@ -85,6 +85,11 @@ export class CreditsRetirementProcessor {
       retirement.txHash = '';
       await this.retirementRepo.save(retirement);
 
+      if (error && (error as Error).name === 'FeeLimitExceededError') {
+        this.logger.warn(`Fee limit exceeded for ${retirementId}, permanently failing.`);
+        return;
+      }
+
       throw error;
     }
 
