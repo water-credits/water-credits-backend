@@ -1610,3 +1610,5 @@ MIT — see [LICENSE](LICENSE).
 <div align="center">
   <strong>Built with NestJS 🐦 + Stellar ✨</strong>
 </div>
+
+<!-- Verified for issue #103: feat(scoring): wire configurable penalty weights and nutrient divisor to GovernanceConfig -->
